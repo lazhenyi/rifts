@@ -1,0 +1,23 @@
+[package]
+name = "rift"
+version = "0.1.0"
+edition = "2024"
+description = "Rift Realtime Protocol / 1.0 — server-side implementation"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.24", features = ["url"] }
+futures-util = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ciborium = "0.2"
+uuid = { version = "1", features = ["v4", "v7"] }
+ulid = "1"
+parking_lot = "0.12"
+dashmap = "6"
+thiserror = "1"
+tracing = "0.1"
+async-trait = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
