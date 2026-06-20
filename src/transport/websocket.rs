@@ -185,9 +185,14 @@ pub fn decode_binary_frame(buf: &[u8]) -> Result<Frame> {
     let codec = FrameCodec::from_tag(buf[1])
         .ok_or_else(|| RiftError::Frame(FrameReject::FrameInvalid("unknown codec tag".into())))?;
     let flags = u16::from_be_bytes([buf[2], buf[3]]);
-    let frame_id = u64::from_be_bytes(buf[4..12].try_into().unwrap());
-    let timestamp = i64::from_be_bytes(buf[12..20].try_into().unwrap());
-    let payload_len = u32::from_be_bytes(buf[20..24].try_into().unwrap()) as usize;
+    // Safety: buf length is at least 24 (checked above), so these slices are valid.
+    let frame_id = u64::from_be_bytes([
+        buf[4], buf[5], buf[6], buf[7], buf[8], buf[9], buf[10], buf[11],
+    ]);
+    let timestamp = i64::from_be_bytes([
+        buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+    ]);
+    let payload_len = u32::from_be_bytes([buf[20], buf[21], buf[22], buf[23]]) as usize;
     if buf.len() < 24 + payload_len {
         return Err(RiftError::Frame(FrameReject::FrameInvalid(format!(
             "payload truncated: want {}, have {}",

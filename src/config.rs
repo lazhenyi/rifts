@@ -3,8 +3,6 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-
 use crate::protocol::heartbeat::HeartbeatPolicy;
 
 /// Server-side configuration.
@@ -100,12 +98,5 @@ impl Default for DefaultTopicProfile {
             replay_enabled: true,
             snapshot_enabled: true,
         }
-    }
-}
-
-impl ServerConfig {
-    /// Returns the configured payload limit as a `Bytes` value for convenience.
-    pub fn max_payload(&self) -> Bytes {
-        Bytes::from(self.max_payload_bytes.to_be_bytes().to_vec())
     }
 }

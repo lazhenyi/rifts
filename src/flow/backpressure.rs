@@ -5,9 +5,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::frame::Priority;
 
 /// Backpressure strategy applied when the send queue is full.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackpressureStrategy {
     /// Wait until the queue drains.
+    #[default]
     Pause,
     /// Drop the lowest-priority messages first.
     DropVolatile,
@@ -19,13 +20,6 @@ pub enum BackpressureStrategy {
     Disconnect,
     /// Switch to snapshot polling.
     SnapshotLater,
-}
-
-impl Default for BackpressureStrategy {
-    fn default() -> Self {
-        // spec §18.1 — start by pausing, escalate on continued overload.
-        BackpressureStrategy::Pause
-    }
 }
 
 /// State of a single connection's outbound queue.

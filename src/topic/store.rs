@@ -110,7 +110,10 @@ impl TopicEntry {
     }
 
     /// Append a new log entry, enforcing retention policy.
-    pub fn append(&self, entry: LogEntry) {
+    pub fn append(&self, mut entry: LogEntry) {
+        if entry.timestamp == 0 {
+            entry.timestamp = epoch_now_ms();
+        }
         let profile = self.profile.read().clone();
         let mut log = self.log.write();
         log.push(entry.clone());
@@ -134,7 +137,7 @@ impl TopicEntry {
                 }
             }
             RetentionPolicy::Ttl(ttl) => {
-                let now = chrono_now_ms();
+                let now = epoch_now_ms();
                 log.retain(|e| now - e.timestamp <= ttl.as_millis() as i64);
             }
             RetentionPolicy::Latest => {
@@ -165,7 +168,7 @@ impl TopicEntry {
     }
 }
 
-fn chrono_now_ms() -> i64 {
+fn epoch_now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,16 +198,12 @@ impl TopicStore {
         default_profile: TopicProfile,
     ) -> Result<Arc<TopicEntry>> {
         validate_name(name)?;
-        if let Some(e) = self.inner.get(name) {
-            return Ok(e.clone());
-        }
-        let entry = Arc::new(TopicEntry::new(name.to_string(), default_profile));
-        // Another thread may have raced — use entry API to avoid clobbering.
-        if let Some(existing) = self.inner.get(name) {
-            return Ok(existing.clone());
-        }
-        self.inner.insert(name.to_string(), entry.clone());
-        Ok(entry)
+        Ok(self
+            .inner
+            .entry(name.to_string())
+            .or_insert_with(|| Arc::new(TopicEntry::new(name.to_string(), default_profile)))
+            .value()
+            .clone())
     }
 
     /// Look up a topic by name; returns `None` if it does not exist.

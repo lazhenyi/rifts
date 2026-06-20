@@ -74,6 +74,7 @@ pub struct InMemoryBroker {
     pub fanout: FanoutEngine,
     pub router: Mutex<Box<dyn TopicRouter>>,
     pub dedupe_window: Duration,
+    pub max_payload_bytes: usize,
 }
 
 impl std::fmt::Debug for InMemoryBroker {
@@ -90,7 +91,11 @@ impl std::fmt::Debug for InMemoryBroker {
 }
 
 impl InMemoryBroker {
-    pub fn new(default_profile: crate::topic::TopicProfile, dedupe_window: Duration) -> Self {
+    pub fn new(
+        default_profile: crate::topic::TopicProfile,
+        dedupe_window: Duration,
+        max_payload_bytes: usize,
+    ) -> Self {
         let store = TopicStore::new();
         let router: Box<dyn TopicRouter> = Box::new(LocalRouter::new(
             store.clone(),
@@ -104,6 +109,7 @@ impl InMemoryBroker {
             fanout: FanoutEngine::new(),
             router: Mutex::new(router),
             dedupe_window,
+            max_payload_bytes,
         }
     }
 
@@ -119,13 +125,14 @@ impl InMemoryBroker {
                 crate::error::FrameReject::RequiredFieldMissing("message_id"),
             ));
         }
-        if let Some(payload) = frame.payload.as_ref() {
-            if payload.len() > 16 * 1024 * 1024 {
-                return Err(RiftError::Message(MessageReject::TooLarge {
-                    actual: payload.len(),
-                    max: 16 * 1024 * 1024,
-                }));
-            }
+        let max = self.max_payload_bytes;
+        if let Some(payload) = frame.payload.as_ref()
+            && payload.len() > max
+        {
+            return Err(RiftError::Message(MessageReject::TooLarge {
+                actual: payload.len(),
+                max,
+            }));
         }
         Ok(())
     }
@@ -145,16 +152,13 @@ impl Broker for InMemoryBroker {
                 .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.clone())))?
         };
 
-        // Dedupe check.
+        // Dedupe check: message_id is the primary dedupe key.
         let mut duplicate = false;
-        if let Some(dk) = frame
-            .payload
-            .as_ref()
-            .and_then(|_| Some(message_id.as_str()))
+        if !self
+            .dedupe
+            .check_and_record(topic, message_id, self.dedupe_window)
         {
-            if !self.dedupe.check_and_record(topic, dk, self.dedupe_window) {
-                duplicate = true;
-            }
+            duplicate = true;
         }
 
         let offset = self.offsets.alloc(topic);
@@ -287,9 +291,11 @@ mod tests {
         }
     }
 
+    const PAYLOAD_LIMIT: usize = 65_536;
+
     #[test]
     fn publish_assigns_offset() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let out = b.publish(&make_frame("t", "m1", b"hello")).unwrap();
         assert_eq!(out.offset, 1);
         let out2 = b.publish(&make_frame("t", "m2", b"world")).unwrap();
@@ -298,7 +304,7 @@ mod tests {
 
     #[test]
     fn publish_requires_topic_and_message_id() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let mut f = make_frame("t", "m1", b"x");
         f.topic = None;
         assert!(b.publish(&f).is_err());
@@ -309,7 +315,7 @@ mod tests {
 
     #[test]
     fn publish_fans_out_to_subscribers() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
             .unwrap();
@@ -319,7 +325,7 @@ mod tests {
 
     #[test]
     fn publish_dedupes_within_window() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
             .unwrap();
@@ -336,7 +342,7 @@ mod tests {
             retention: RetentionPolicy::Count(100),
             ..TopicProfile::default()
         };
-        let b = InMemoryBroker::new(profile, Duration::from_secs(60));
+        let b = InMemoryBroker::new(profile, Duration::from_secs(60), PAYLOAD_LIMIT);
         for i in 1..=5 {
             b.publish(&make_frame("t", &format!("m{i}"), b"x")).unwrap();
         }
@@ -346,7 +352,7 @@ mod tests {
 
     #[test]
     fn subscribe_and_unsubscribe() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let s = Arc::new(CountingSink::new(1));
         let id = b.subscribe("t", SubscribeIntent::Live, s.clone()).unwrap();
         assert!(b.unsubscribe(id).unwrap());
@@ -356,7 +362,7 @@ mod tests {
 
     #[test]
     fn drop_sink_removes_all_subs() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60));
+        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let s = Arc::new(CountingSink::new(7));
         b.subscribe("a", SubscribeIntent::Live, s.clone()).unwrap();
         b.subscribe("b", SubscribeIntent::Live, s.clone()).unwrap();

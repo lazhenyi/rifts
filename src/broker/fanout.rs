@@ -11,8 +11,6 @@ use dashmap::DashMap;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-use crate::topic::TopicEntry;
-
 /// Identifies a single (connection, topic) subscription.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(pub u64);
@@ -298,8 +296,3 @@ mod tests {
         assert_ne!(a, b);
     }
 }
-
-// Reference TopicEntry so the `by_topic` API remains consistent when
-// extended to read from the topic entry.
-#[allow(dead_code)]
-fn _ensure_link(_: &TopicEntry) {}

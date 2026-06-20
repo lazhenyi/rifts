@@ -27,23 +27,16 @@ pub struct RiftServerBuilder {
     metrics: Option<Arc<Metrics>>,
 }
 
+type ListenerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>>;
+
 trait TransportFactory: Send + Sync {
-    fn build(
-        &self,
-        addr: SocketAddr,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>,
-    >;
+    fn build(&self, addr: SocketAddr) -> ListenerFuture;
 }
 
 struct WebSocketFactory;
 impl TransportFactory for WebSocketFactory {
-    fn build(
-        &self,
-        addr: SocketAddr,
-    ) -> std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>,
-    > {
+    fn build(&self, addr: SocketAddr) -> ListenerFuture {
         Box::pin(async move { WebSocketTransport::new().bind(addr).await })
     }
 }
@@ -86,12 +79,14 @@ impl RiftServerBuilder {
 
     pub fn build(self) -> Result<RiftServer> {
         let metrics = self.metrics.unwrap_or_else(|| Arc::new(Metrics::new()));
+        let config_max_payload = self.config.max_payload_bytes;
         let broker = self.broker.unwrap_or_else(|| {
-            let profile = DefaultTopicProfile::default();
-            let topic_profile: crate::topic::TopicProfile = profile.into();
+            let topic_profile: crate::topic::TopicProfile =
+                self.config.default_topic_profile.clone().into();
             Arc::new(InMemoryBroker::new(
                 topic_profile,
                 self.config.dedupe_window,
+                config_max_payload,
             ))
         });
         let auth = self

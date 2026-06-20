@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 /// How long messages on a topic are kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RetentionPolicy {
     /// No retention — messages are not kept after fanout.
     None,
@@ -16,13 +16,8 @@ pub enum RetentionPolicy {
     /// External durable storage controls retention.
     Durable,
     /// Only the latest value per state key is kept.
+    #[default]
     Latest,
-}
-
-impl Default for RetentionPolicy {
-    fn default() -> Self {
-        RetentionPolicy::Latest
-    }
 }
 
 #[cfg(test)]

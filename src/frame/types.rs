@@ -94,12 +94,13 @@ impl fmt::Display for Codec {
 
 /// Message priority (spec §18.3). Used to order transmission and to
 /// decide what gets dropped under backpressure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 #[repr(u8)]
 pub enum Priority {
     Background = 0,
     Volatile = 1,
     Low = 2,
+    #[default]
     Normal = 3,
     High = 4,
     Critical = 5,
@@ -120,12 +121,6 @@ impl Priority {
 
     pub fn as_u8(self) -> u8 {
         self as u8
-    }
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
     }
 }
 

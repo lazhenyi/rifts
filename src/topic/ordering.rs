@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// How messages within a topic are ordered.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum OrderingPolicy {
     /// No ordering guarantee.
     None,
@@ -12,17 +12,12 @@ pub enum OrderingPolicy {
     /// Ordered within a single publisher.
     Publisher,
     /// Globally ordered within a topic.
+    #[default]
     Topic,
     /// Ordered by `ordering_key`.
     Key,
     /// Causally ordered (requires vector metadata).
     Causal,
-}
-
-impl Default for OrderingPolicy {
-    fn default() -> Self {
-        OrderingPolicy::Topic
-    }
 }
 
 impl fmt::Display for OrderingPolicy {

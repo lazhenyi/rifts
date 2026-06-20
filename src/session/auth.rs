@@ -91,12 +91,7 @@ impl AuthProvider for TokenAuth {
 }
 
 fn rand_suffix() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("{:x}", nanos)
+    ulid::Ulid::new().to_string()
 }
 
 /// A no-op auth provider for tests.

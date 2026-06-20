@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod offset_tracker;
 pub mod resume;
+#[allow(clippy::module_inception)]
 pub mod session;
 
 pub use auth::{AllowAllAuth, AuthContext, AuthHints, AuthProvider, TokenAuth};

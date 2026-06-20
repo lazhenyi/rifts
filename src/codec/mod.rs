@@ -5,6 +5,7 @@
 //! encodings.
 
 pub mod cbor;
+#[allow(clippy::module_inception)]
 pub mod codec;
 pub mod json;
 

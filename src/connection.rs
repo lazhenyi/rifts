@@ -2,7 +2,7 @@
 //! lifecycle (spec §5).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::Bytes;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -18,7 +18,7 @@ use crate::flow::BackpressureController;
 use crate::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
 use crate::metrics::Metrics;
 use crate::protocol::close::CloseCode;
-use crate::protocol::hello::{AuthMode, Hello, Ready};
+use crate::protocol::hello::{AuthMode, Hello};
 use crate::session::resume::ResumeManager;
 use crate::session::{AuthProvider, Session, SessionId, SessionState};
 use crate::transport::TransportConnection;
@@ -30,6 +30,7 @@ struct ConnSink {
     in_flight_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     metrics: Arc<Metrics>,
+    sink_id: u64,
 }
 
 impl FanoutSink for ConnSink {
@@ -62,7 +63,7 @@ impl FanoutSink for ConnSink {
         }
     }
     fn id(&self) -> u64 {
-        0
+        self.sink_id
     }
 }
 
@@ -119,6 +120,7 @@ impl Connection {
             in_flight_bytes: self.in_flight_bytes.clone(),
             max_bytes: self.backpressure.max_bytes(),
             metrics: self.metrics.clone(),
+            sink_id: self.sink_id,
         })
     }
 
@@ -246,7 +248,7 @@ impl Connection {
                 format!("unknown protocol: {}", hello.protocol),
             )));
         }
-        let client_major = (hello.version >> 8) as u16;
+        let client_major = hello.version >> 8;
         if crate::protocol::version::negotiate_major(client_major).is_none() {
             return Err(RiftError::Frame(
                 crate::error::FrameReject::ProtocolVersionUnsupported {
@@ -265,33 +267,41 @@ impl Connection {
             .first()
             .copied()
             .unwrap_or(AuthMode::Anonymous);
-        let token = token.or_else(|| {
-            hello_frame
-                .payload
-                .as_ref()
-                .and_then(|p| std::str::from_utf8(p).ok())
-                .and_then(|s| extract_token(s, auth_mode))
-        });
         let auth_ctx = self.auth.authenticate(auth_mode, token.as_deref()).await?;
         let client_id = auth_ctx.client_id.clone();
 
         let session = Arc::new(Session::new(SessionId::new(), client_id));
 
+        // Build server-side topic offsets for resume evaluation.
         let last_offsets: std::collections::HashMap<String, i64> = hello
             .last_offsets
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        let _ = self
-            .resume
-            .evaluate(
-                &session,
-                session.current_epoch(),
-                &last_offsets,
-                &Default::default(),
-            )
-            .unwrap_or(crate::session::resume::ResumeOutcome::ColdStart);
-        self.metrics.inc(&self.metrics.resume_success_total);
+        let mut topic_offsets = std::collections::HashMap::new();
+        for topic in last_offsets.keys() {
+            topic_offsets.insert(topic.clone(), self.broker.head_offset(topic));
+        }
+        match self.resume.evaluate(
+            &session,
+            session.current_epoch(),
+            &last_offsets,
+            &topic_offsets,
+        ) {
+            Ok(outcome) => match outcome {
+                crate::session::resume::ResumeOutcome::Resumed
+                | crate::session::resume::ResumeOutcome::Partial
+                | crate::session::resume::ResumeOutcome::Replaying => {
+                    self.metrics.inc(&self.metrics.resume_success_total);
+                }
+                _ => {
+                    self.metrics.inc(&self.metrics.resume_failed_total);
+                }
+            },
+            Err(_) => {
+                self.metrics.inc(&self.metrics.resume_failed_total);
+            }
+        }
 
         session.set_state(SessionState::Ready);
 
@@ -404,7 +414,7 @@ async fn reader_task(
             }
             FrameType::Ack => {
                 let msg = frame.message_id.as_deref().unwrap_or("");
-                let _ = ack_manager.complete(&session.id.as_str(), msg);
+                let _ = ack_manager.complete(session.id.as_str(), msg);
             }
             FrameType::Flow => {
                 debug!(conn = conn_id, "flow frame: {:?}", frame.payload);
@@ -430,58 +440,62 @@ async fn handle_control(
         .and_then(|p| std::str::from_utf8(p).ok())
         .unwrap_or("{}");
 
-    if body.contains("\"ping\"") {
-        let pong = Frame {
-            frame_type: FrameType::Control,
-            codec: codec.frame_codec(),
-            ..Frame::default()
-        };
-        out_tx
-            .try_send(pong)
-            .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
-        return Ok(());
-    }
-    if body.contains("\"subscribe\"") {
-        let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-            RiftError::Frame(crate::error::FrameReject::FrameInvalid(e.to_string()))
-        })?;
-        let topic = v
-            .get("topic")
-            .and_then(|x| x.as_str())
-            .ok_or_else(|| {
-                RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("topic"))
-            })?
-            .to_string();
-        // Subscribe a test sink for fanout. In a real impl, the
-        // connection's outbound mpsc would be wrapped in a
-        // FanoutSink. For the minimal broker, we subscribe a sink
-        // that writes to our out_tx.
-        let sink: Arc<dyn FanoutSink> = Arc::new(MpscSink { tx: out_tx.clone() });
-        broker.subscribe(&topic, SubscribeIntent::Live, sink)?;
-        let reply = serde_json::json!({
-            "type": "subscribe_ack",
-            "topic": topic,
-            "result": "accepted",
-        });
-        out_tx
-            .try_send(Frame {
+    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    let ctrl_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
+
+    match ctrl_type {
+        "ping" => {
+            let pong = Frame {
                 frame_type: FrameType::Control,
                 codec: codec.frame_codec(),
                 correlation_id: frame.correlation_id.clone(),
-                payload: Some(Bytes::from(reply.to_string())),
                 ..Frame::default()
-            })
-            .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
-        return Ok(());
+            };
+            out_tx
+                .try_send(pong)
+                .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
+            Ok(())
+        }
+        "subscribe" => {
+            let topic = v
+                .get("topic")
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| {
+                    RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("topic"))
+                })?
+                .to_string();
+            let sink: Arc<dyn FanoutSink> = Arc::new(MpscSink {
+                tx: out_tx.clone(),
+                id: crate::broker::fanout::new_sink_id(),
+            });
+            broker.subscribe(&topic, SubscribeIntent::Live, sink)?;
+            let reply = serde_json::json!({
+                "type": "subscribe_ack",
+                "topic": topic,
+                "result": "accepted",
+            });
+            out_tx
+                .try_send(Frame {
+                    frame_type: FrameType::Control,
+                    codec: codec.frame_codec(),
+                    correlation_id: frame.correlation_id.clone(),
+                    payload: Some(Bytes::from(reply.to_string())),
+                    ..Frame::default()
+                })
+                .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
+            Ok(())
+        }
+        "unsubscribe" => Ok(()),
+        _ => {
+            warn!("unknown control type: {}", ctrl_type);
+            Ok(())
+        }
     }
-    if body.contains("\"unsubscribe\"") {
-        return Ok(());
-    }
-    Ok(())
 }
 
 struct MpscSink {
     tx: mpsc::Sender<Frame>,
+    id: u64,
 }
 
 impl FanoutSink for MpscSink {
@@ -502,7 +516,7 @@ impl FanoutSink for MpscSink {
         })
     }
     fn id(&self) -> u64 {
-        0
+        self.id
     }
 }
 
@@ -511,8 +525,9 @@ async fn send_error_frame(
     original: &Frame,
     err: RiftError,
 ) -> Result<()> {
+    let code = rift_error_to_code(&err);
     let body = serde_json::json!({
-        "code": "RIFT_SYSTEM_INTERNAL",
+        "code": code,
         "message": err.to_string(),
         "correlation_id": original.correlation_id,
     });
@@ -525,6 +540,85 @@ async fn send_error_frame(
             ..Frame::default()
         })
         .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))
+}
+
+/// Map a `RiftError` variant to the closest `ErrorCode` wire identifier.
+fn rift_error_to_code(err: &RiftError) -> &'static str {
+    use crate::protocol::error_code::ErrorCode;
+    match err {
+        RiftError::Frame(fe) => match fe {
+            crate::error::FrameReject::ProtocolVersionUnsupported { .. } => {
+                ErrorCode::ProtocolVersionUnsupported.as_str()
+            }
+            crate::error::FrameReject::FrameInvalid(_) => ErrorCode::ProtocolFrameInvalid.as_str(),
+            crate::error::FrameReject::CodecUnsupported(_) => {
+                ErrorCode::ProtocolCodecUnsupported.as_str()
+            }
+            crate::error::FrameReject::PayloadTooLarge { .. } => {
+                ErrorCode::ProtocolPayloadTooLarge.as_str()
+            }
+            crate::error::FrameReject::RequiredFieldMissing(_) => {
+                ErrorCode::ProtocolRequiredFieldMissing.as_str()
+            }
+            crate::error::FrameReject::SchemaMismatch(_) => {
+                ErrorCode::ProtocolSchemaMismatch.as_str()
+            }
+            crate::error::FrameReject::OrderViolation(_) => {
+                ErrorCode::ProtocolOrderViolation.as_str()
+            }
+        },
+        RiftError::Session(se) => match se {
+            crate::error::SessionReject::NotFound(_) => ErrorCode::SessionNotFound.as_str(),
+            crate::error::SessionReject::Expired => ErrorCode::SessionExpired.as_str(),
+            crate::error::SessionReject::Conflict { .. } => ErrorCode::SessionConflict.as_str(),
+            crate::error::SessionReject::ResumeRejected(_) => ErrorCode::ResumeRejected.as_str(),
+            crate::error::SessionReject::ReplayOffsetExpired { .. } => {
+                ErrorCode::ReplayOffsetExpired.as_str()
+            }
+            crate::error::SessionReject::SnapshotRequired(_) => {
+                ErrorCode::SnapshotRequired.as_str()
+            }
+        },
+        RiftError::Topic(te) => match te {
+            crate::error::TopicReject::NotFound(_) => ErrorCode::TopicNotFound.as_str(),
+            crate::error::TopicReject::Closed(_) => ErrorCode::TopicClosed.as_str(),
+            crate::error::TopicReject::Overloaded(_) => ErrorCode::TopicOverloaded.as_str(),
+            crate::error::TopicReject::SubscriberLimit(_) => {
+                ErrorCode::TopicSubscriberLimit.as_str()
+            }
+            crate::error::TopicReject::PublisherLimit(_) => ErrorCode::TopicPublisherLimit.as_str(),
+            crate::error::TopicReject::Forbidden(_) => ErrorCode::TopicForbidden.as_str(),
+            crate::error::TopicReject::RateLimited(_) => ErrorCode::TopicRateLimited.as_str(),
+            crate::error::TopicReject::InvalidName(_) => ErrorCode::ProtocolFrameInvalid.as_str(),
+        },
+        RiftError::Auth(ae) => match ae {
+            crate::error::AuthReject::Required => ErrorCode::AuthRequired.as_str(),
+            crate::error::AuthReject::Invalid(_) => ErrorCode::AuthInvalid.as_str(),
+            crate::error::AuthReject::Expired => ErrorCode::AuthExpired.as_str(),
+            crate::error::AuthReject::Revoked => ErrorCode::AuthRevoked.as_str(),
+            crate::error::AuthReject::Denied(_) => ErrorCode::PermissionDenied.as_str(),
+        },
+        RiftError::Message(me) => match me {
+            crate::error::MessageReject::Duplicate(_) => ErrorCode::MessageDuplicate.as_str(),
+            crate::error::MessageReject::Expired => ErrorCode::MessageExpired.as_str(),
+            crate::error::MessageReject::Rejected(_) => ErrorCode::MessageRejected.as_str(),
+            crate::error::MessageReject::TooLarge { .. } => ErrorCode::MessageTooLarge.as_str(),
+            crate::error::MessageReject::AckTimeout(_) => ErrorCode::MessageAckTimeout.as_str(),
+            crate::error::MessageReject::DeliveryFailed(_) => {
+                ErrorCode::MessageDeliveryFailed.as_str()
+            }
+        },
+        RiftError::System(se) => match se {
+            crate::error::SystemReject::Overloaded => ErrorCode::SystemOverloaded.as_str(),
+            crate::error::SystemReject::Maintenance => ErrorCode::SystemMaintenance.as_str(),
+            crate::error::SystemReject::ShardMoved(_) => ErrorCode::SystemShardMoved.as_str(),
+            crate::error::SystemReject::RegionUnavailable(_) => {
+                ErrorCode::SystemRegionUnavailable.as_str()
+            }
+            crate::error::SystemReject::Internal(_) => ErrorCode::SystemInternal.as_str(),
+        },
+        _ => ErrorCode::SystemInternal.as_str(),
+    }
 }
 
 async fn send_ack_frame(
@@ -603,22 +697,24 @@ fn decode_hello_payload(payload: &Option<Bytes>) -> Result<(Hello, Option<String
             "hello must be object".into(),
         ))
     })?;
-    let mut h = Hello::default();
-    h.protocol = obj
-        .get("protocol")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .to_string();
-    h.version = obj.get("version").and_then(|x| x.as_u64()).unwrap_or(0) as u16;
-    h.client_id = obj
-        .get("client_id")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    h.session_id = obj
-        .get("session_id")
-        .and_then(|x| x.as_str())
-        .map(String::from);
-    h.epoch = obj.get("epoch").and_then(|x| x.as_u64()).map(|x| x as u32);
+    let mut h = Hello {
+        protocol: obj
+            .get("protocol")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+        version: obj.get("version").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+        client_id: obj
+            .get("client_id")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        session_id: obj
+            .get("session_id")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        epoch: obj.get("epoch").and_then(|x| x.as_u64()).map(|x| x as u32),
+        ..Hello::default()
+    };
     if let Some(arr) = obj.get("codecs").and_then(|x| x.as_array()) {
         for c in arr {
             match c.as_str() {
@@ -651,25 +747,9 @@ fn decode_hello_payload(payload: &Option<Bytes>) -> Result<(Hello, Option<String
     Ok((h, token))
 }
 
-fn extract_token(body: &str, mode: AuthMode) -> Option<String> {
-    match mode {
-        AuthMode::Bearer => {
-            if let Some(rest) = body.strip_prefix("Bearer ") {
-                Some(rest.trim().to_string())
-            } else {
-                Some(body.trim().to_string())
-            }
-        }
-        _ => Some(body.trim().to_string()),
-    }
-}
-
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
-
-#[allow(dead_code)]
-fn _suppress_unused(_: Ready, _: AtomicU64) {}

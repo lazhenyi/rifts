@@ -1,5 +1,6 @@
 //! Broker — spec §22.
 
+#[allow(clippy::module_inception)]
 pub mod broker;
 pub mod dedupe;
 pub mod fanout;
