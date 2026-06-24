@@ -13,7 +13,7 @@ use rift::codec::JsonCodec;
 use rift::codec::codec::CodecExt;
 use rift::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
 use rift::session::TokenAuth;
-use rift::transport::websocket::{decode_binary_frame, encode_frame};
+use rift::transport::frame_codec::{decode_binary_frame, encode_frame};
 use rift::{SessionId, SubscribeIntent, TopicStore};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 

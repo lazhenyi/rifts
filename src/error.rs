@@ -206,6 +206,7 @@ impl From<ciborium::de::Error<std::io::Error>> for RiftError {
     }
 }
 
+#[cfg(feature = "websocket")]
 impl From<tokio_tungstenite::tungstenite::Error> for RiftError {
     fn from(e: tokio_tungstenite::tungstenite::Error) -> Self {
         Self::WebSocket(BoxedStdError(Box::new(e)))

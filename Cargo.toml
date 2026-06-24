@@ -5,10 +5,27 @@ edition = "2024"
 description = "Rift Realtime Protocol / 1.0 — server-side implementation"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["websocket"]
+
+# Standalone WebSocket transport (default).
+websocket = ["dep:tokio-tungstenite", "dep:futures-util"]
+
+# Framework adapters — each enables a TransportConnection impl for
+# the framework's WebSocket type.
+axum = ["dep:axum"]
+actix-web = ["dep:actix-web", "dep:actix-ws", "dep:futures-util"]
+warp = ["dep:warp", "dep:futures-util"]
+ntex = ["dep:ntex", "dep:futures-util"]
+
+# Composite shortcuts.
+tokio-frameworks = ["axum", "warp"]
+all-frameworks = ["axum", "actix-web", "warp", "ntex"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.24", features = ["url"] }
-futures-util = "0.3"
+tokio-tungstenite = { version = "0.24", features = ["url"], optional = true }
+futures-util = { version = "0.3", optional = true }
 bytes = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,3 +38,10 @@ thiserror = "1"
 tracing = "0.1"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt"] }
+
+# Framework adapters (optional, gated by features).
+axum = { version = "0.8", optional = true, features = ["ws"] }
+actix-web = { version = "4", optional = true }
+actix-ws = { version = "0.3", optional = true }
+warp = { version = "0.3", optional = true }
+ntex = { version = "2", optional = true, features = ["ws"] }

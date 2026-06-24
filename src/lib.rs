@@ -53,5 +53,7 @@ pub use session::{
     SessionId, SessionState, TokenAuth,
 };
 pub use topic::{OrderingPolicy, RetentionPolicy, TopicProfile, TopicStore};
+pub use transport::frame_codec::{decode_binary_frame, decode_text_frame, encode_frame};
+#[cfg(feature = "websocket")]
 pub use transport::websocket::WebSocketTransport;
 pub use transport::{Transport, TransportConnection, TransportListener};

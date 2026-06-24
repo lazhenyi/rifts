@@ -1,44 +1,60 @@
 //! Rift/1 server entry point.
 
+#[cfg(feature = "websocket")]
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
-use tokio::sync::Notify;
-use tracing::{error, info};
+use tracing::error;
+#[cfg(feature = "websocket")]
+use tracing::info;
 
 use crate::ack::{AckManager, SharedAckManager};
 use crate::broker::{Broker, InMemoryBroker};
 use crate::config::{DefaultTopicProfile, ServerConfig};
 use crate::connection::Connection;
 use crate::error::Result;
+#[cfg(feature = "websocket")]
+use crate::error::{ConfigError, RiftError};
 use crate::metrics::Metrics;
 use crate::session::AuthProvider;
 use crate::session::resume::ResumeManager;
-use crate::transport::websocket::WebSocketTransport;
+use crate::transport::TransportConnection;
+#[cfg(feature = "websocket")]
 use crate::transport::{Transport, TransportListener};
+
+// --- standalone transport support (feature = "websocket") ---
+
+#[cfg(feature = "websocket")]
+use crate::transport::websocket::WebSocketTransport;
+
+#[cfg(feature = "websocket")]
+type ListenerFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>>;
+
+#[cfg(feature = "websocket")]
+trait TransportFactory: Send + Sync {
+    fn build(&self, addr: SocketAddr) -> ListenerFuture;
+}
+
+#[cfg(feature = "websocket")]
+struct WebSocketFactory;
+
+#[cfg(feature = "websocket")]
+impl TransportFactory for WebSocketFactory {
+    fn build(&self, addr: SocketAddr) -> ListenerFuture {
+        Box::pin(async move { WebSocketTransport::new().bind(addr).await })
+    }
+}
 
 /// Builder for a `RiftServer`.
 pub struct RiftServerBuilder {
     config: ServerConfig,
     auth: Option<Arc<dyn AuthProvider>>,
     broker: Option<Arc<dyn Broker>>,
+    #[cfg(feature = "websocket")]
     transport: Option<Box<dyn TransportFactory>>,
     metrics: Option<Arc<Metrics>>,
-}
-
-type ListenerFuture =
-    std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>>;
-
-trait TransportFactory: Send + Sync {
-    fn build(&self, addr: SocketAddr) -> ListenerFuture;
-}
-
-struct WebSocketFactory;
-impl TransportFactory for WebSocketFactory {
-    fn build(&self, addr: SocketAddr) -> ListenerFuture {
-        Box::pin(async move { WebSocketTransport::new().bind(addr).await })
-    }
 }
 
 impl RiftServerBuilder {
@@ -47,6 +63,7 @@ impl RiftServerBuilder {
             config: ServerConfig::default(),
             auth: None,
             broker: None,
+            #[cfg(feature = "websocket")]
             transport: None,
             metrics: None,
         }
@@ -67,6 +84,9 @@ impl RiftServerBuilder {
         self
     }
 
+    /// Set WebSocket as the standalone transport (requires feature
+    /// `websocket`).
+    #[cfg(feature = "websocket")]
     pub fn websocket_transport(mut self) -> Self {
         self.transport = Some(Box::new(WebSocketFactory));
         self
@@ -92,18 +112,18 @@ impl RiftServerBuilder {
         let auth = self
             .auth
             .unwrap_or_else(|| Arc::new(crate::session::TokenAuth::new()));
-        let transport = self.transport.ok_or_else(|| {
-            crate::error::RiftError::Config(crate::error::ConfigError::Invalid {
-                field: "transport",
-                message: "transport is required".to_string(),
-            })
-        })?;
         Ok(RiftServer {
             config: self.config,
             auth,
             broker,
             metrics,
-            transport: Arc::new(transport),
+            #[cfg(feature = "websocket")]
+            transport: self.transport.map(Arc::new).ok_or_else(|| {
+                RiftError::Config(ConfigError::Invalid {
+                    field: "transport",
+                    message: "transport is required for standalone mode".to_string(),
+                })
+            })?,
             next_conn_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -121,6 +141,7 @@ pub struct RiftServer {
     auth: Arc<dyn AuthProvider>,
     broker: Arc<dyn Broker>,
     metrics: Arc<Metrics>,
+    #[cfg(feature = "websocket")]
     transport: Arc<Box<dyn TransportFactory>>,
     next_conn_id: Arc<AtomicU64>,
 }
@@ -130,8 +151,10 @@ impl RiftServer {
         RiftServerBuilder::new()
     }
 
-    /// Bind and run the server, blocking until `shutdown` is notified.
-    pub async fn run(&self, addr: SocketAddr, shutdown: Arc<Notify>) -> Result<()> {
+    /// Bind and run the server in standalone mode, blocking until
+    /// `shutdown` is notified. Requires feature `websocket`.
+    #[cfg(feature = "websocket")]
+    pub async fn run(&self, addr: SocketAddr, shutdown: Arc<tokio::sync::Notify>) -> Result<()> {
         let mut listener = self.transport.build(addr).await?;
         info!(addr = ?listener.local_addr()?, "rift server listening");
 
@@ -144,25 +167,7 @@ impl RiftServer {
                 res = listener.accept() => {
                     match res {
                         Ok(conn) => {
-                            let id = self
-                                .next_conn_id
-                                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                            let ack_manager: SharedAckManager = Arc::new(AckManager::new());
-                            let resume = Arc::new(ResumeManager::new());
-                            let connection = Connection::new(
-                                id,
-                                self.broker.clone(),
-                                self.auth.clone(),
-                                self.config.clone(),
-                                self.metrics.clone(),
-                                ack_manager,
-                                resume,
-                            );
-                            tokio::spawn(async move {
-                                if let Err(e) = connection.run(conn).await {
-                                    error!(conn = id, "connection ended with error: {}", e);
-                                }
-                            });
+                            self.spawn_connection(conn);
                         }
                         Err(e) => {
                             error!("accept error: {}", e);
@@ -171,6 +176,35 @@ impl RiftServer {
                 }
             }
         }
+    }
+
+    /// Accept a single transport connection and spawn the Rift
+    /// protocol handler onto the tokio runtime. This is the entry
+    /// point for framework integrations.
+    pub fn accept_and_spawn(&self, transport: Box<dyn TransportConnection>) {
+        self.spawn_connection(transport);
+    }
+
+    fn spawn_connection(&self, transport: Box<dyn TransportConnection>) {
+        let id = self
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let ack_manager: SharedAckManager = Arc::new(AckManager::new());
+        let resume = Arc::new(ResumeManager::new());
+        let connection = Connection::new(
+            id,
+            self.broker.clone(),
+            self.auth.clone(),
+            self.config.clone(),
+            self.metrics.clone(),
+            ack_manager,
+            resume,
+        );
+        tokio::spawn(async move {
+            if let Err(e) = connection.run(transport).await {
+                error!(conn = id, "connection ended with error: {}", e);
+            }
+        });
     }
 }
 

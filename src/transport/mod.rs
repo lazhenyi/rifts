@@ -1,5 +1,20 @@
 //! Transport abstraction.
 
+pub mod frame_codec;
+
+// Channel bridge for non-Send WS types (actix-web, ntex).
+#[cfg(any(feature = "actix-web", feature = "ntex"))]
+pub mod bridge;
+
+#[cfg(feature = "actix-web")]
+pub mod actix;
+#[cfg(feature = "axum")]
+pub mod axum;
+#[cfg(feature = "ntex")]
+pub mod ntex;
+#[cfg(feature = "warp")]
+pub mod warp;
+#[cfg(feature = "websocket")]
 pub mod websocket;
 
 use async_trait::async_trait;
