@@ -9,12 +9,12 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use rift::codec::JsonCodec;
-use rift::codec::codec::CodecExt;
-use rift::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
-use rift::session::TokenAuth;
-use rift::transport::frame_codec::{decode_binary_frame, encode_frame};
-use rift::{SessionId, SubscribeIntent, TopicStore};
+use rifts::codec::JsonCodec;
+use rifts::codec::codec::CodecExt;
+use rifts::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
+use rifts::session::TokenAuth;
+use rifts::transport::frame_codec::{decode_binary_frame, encode_frame};
+use rifts::{SessionId, SubscribeIntent, TopicStore};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 #[test]
