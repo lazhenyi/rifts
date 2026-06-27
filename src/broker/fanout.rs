@@ -21,7 +21,10 @@ pub enum SubscribeIntent {
     /// New messages after subscription.
     Live,
     /// From a specific offset.
-    Replay { from: i64 },
+    Replay {
+        /// Starting offset for replay.
+        from: i64,
+    },
     /// Snapshot then live.
     SnapshotThenLive,
     /// Only the latest state.
@@ -35,8 +38,11 @@ pub enum SubscribeIntent {
 /// A registered subscription.
 #[derive(Debug, Clone)]
 pub struct Subscription {
+    /// Unique subscription id.
     pub id: SubscriptionId,
+    /// Topic name.
     pub topic: String,
+    /// What this subscriber wants.
     pub intent: SubscribeIntent,
     /// `true` if the subscription has been told to stop.
     pub cancelled: bool,
@@ -48,17 +54,24 @@ pub type ConnectionSink = Arc<dyn FanoutSink>;
 /// Sink trait — implemented by the connection to receive fanned-out
 /// frames. The fanout engine does not know the transport type.
 pub trait FanoutSink: Send + Sync {
+    /// Deliver a serialized frame to this sink.
     fn deliver(&self, frame: bytes::Bytes) -> Result<(), FanoutError>;
+    /// Unique identifier for this sink.
     fn id(&self) -> u64;
 }
 
+/// Errors that can occur during fanout delivery.
 #[derive(Debug, thiserror::Error)]
 pub enum FanoutError {
+    /// The sink has been closed and should be removed.
     #[error("sink closed")]
     Closed,
+    /// The sink's send queue is full.
     #[error("sink backpressured: queue={queue_bytes}, max={max_bytes}")]
     Backpressured {
+        /// Current queue depth in bytes.
         queue_bytes: usize,
+        /// Maximum queue capacity in bytes.
         max_bytes: usize,
     },
 }
@@ -87,6 +100,7 @@ impl Default for FanoutEngine {
 }
 
 impl FanoutEngine {
+    /// Create an empty fanout engine.
     pub fn new() -> Self {
         Self {
             by_topic: DashMap::new(),
@@ -99,7 +113,7 @@ impl FanoutEngine {
     pub fn subscribe(
         &self,
         topic: &str,
-        intent: SubscribeIntent,
+        _intent: SubscribeIntent,
         sink: ConnectionSink,
     ) -> SubscriptionId {
         let mut seq = self.seq.lock();
@@ -111,30 +125,26 @@ impl FanoutEngine {
             .or_default()
             .push((id, sink.clone()));
         self.by_id.insert(id, (topic.to_string(), sink));
-        Subscription {
-            id,
-            topic: topic.to_string(),
-            intent,
-            cancelled: false,
-        }
-        .id
+        id
     }
 
-    /// Remove a subscription.
-    pub fn unsubscribe(&self, id: SubscriptionId) -> bool {
+    /// Remove a subscription. Returns `Some(topic_name)` if the
+    /// subscription existed, so the caller can adjust per-topic
+    /// counters.
+    pub fn unsubscribe(&self, id: SubscriptionId) -> Option<String> {
         if let Some((_, (topic, _sink))) = self.by_id.remove(&id) {
             if let Some(mut list) = self.by_topic.get_mut(&topic) {
                 list.retain(|(sid, _)| *sid != id);
             }
-            true
+            Some(topic)
         } else {
-            false
+            None
         }
     }
 
     /// Drop all subscriptions owned by `sink_id`.
-    pub fn drop_sink(&self, sink_id: u64) -> usize {
-        let mut removed = 0;
+    pub fn drop_sink(&self, sink_id: u64) -> Vec<String> {
+        let mut topics = Vec::new();
         let ids: Vec<SubscriptionId> = self
             .by_id
             .iter()
@@ -142,11 +152,11 @@ impl FanoutEngine {
             .map(|kv| *kv.key())
             .collect();
         for id in ids {
-            if self.unsubscribe(id) {
-                removed += 1;
+            if let Some(topic) = self.unsubscribe(id) {
+                topics.push(topic);
             }
         }
-        removed
+        topics
     }
 
     /// Deliver a single serialized frame to all subscribers of `topic`
@@ -192,6 +202,7 @@ pub mod test_sink {
 
     use super::{FanoutError, FanoutSink};
 
+    /// A test sink that counts deliveries and records messages.
     pub struct CountingSink {
         id: u64,
         delivered: AtomicU64,
@@ -199,6 +210,7 @@ pub mod test_sink {
     }
 
     impl CountingSink {
+        /// Create a new counting sink with the given id.
         pub fn new(id: u64) -> Self {
             Self {
                 id,
@@ -206,9 +218,11 @@ pub mod test_sink {
                 log: Mutex::new(Vec::new()),
             }
         }
+        /// Number of messages delivered.
         pub fn count(&self) -> u64 {
             self.delivered.load(Ordering::SeqCst)
         }
+        /// Snapshot of delivered messages.
         pub fn messages(&self) -> Vec<Vec<u8>> {
             self.log.lock().clone()
         }
@@ -250,23 +264,26 @@ mod tests {
     }
 
     #[test]
-    fn unsubscribe() {
+    fn unsubscribe_returns_topic() {
         let fan = FanoutEngine::new();
         let s = Arc::new(CountingSink::new(1));
         let id = fan.subscribe("t", SubscribeIntent::Live, s.clone());
-        assert!(fan.unsubscribe(id));
+        let topic = fan.unsubscribe(id);
+        assert_eq!(topic, Some("t".to_string()));
         assert_eq!(fan.deliver("t", bytes::Bytes::from_static(b"x")), 0);
     }
 
     #[test]
-    fn drop_sink() {
+    fn drop_sink_returns_topics() {
         let fan = FanoutEngine::new();
         let s1 = Arc::new(CountingSink::new(7));
         let s2 = Arc::new(CountingSink::new(7));
         fan.subscribe("t", SubscribeIntent::Live, s1.clone());
         fan.subscribe("u", SubscribeIntent::Live, s2.clone());
-        let n = fan.drop_sink(7);
-        assert_eq!(n, 2);
+        let topics = fan.drop_sink(7);
+        assert_eq!(topics.len(), 2);
+        assert!(topics.contains(&"t".to_string()));
+        assert!(topics.contains(&"u".to_string()));
         assert_eq!(fan.subscription_count(), 0);
     }
 
@@ -288,7 +305,6 @@ mod tests {
         assert_eq!(s.messages(), vec![b"abc".to_vec()]);
     }
 
-    // Touch the entry point so it remains referenced.
     #[test]
     fn sink_id_is_unique() {
         let a = new_sink_id();

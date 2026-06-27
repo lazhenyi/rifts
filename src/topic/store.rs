@@ -1,18 +1,19 @@
 //! In-memory topic store — spec §9.
 //!
 //! Topics are stored in a `DashMap` for concurrent access from many
-//! connections. Each entry keeps the `TopicProfile`, the current
-//! monotonic offset, a bounded replay log (when retention allows),
-//! the latest snapshot (when supported), and a subscriber set.
+//! connections. Each entry keeps the `TopicProfile`, a bounded replay
+//! log (when retention allows), the latest snapshot (when supported),
+//! and a subscriber set.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
 use crate::error::{Result, RiftError, TopicReject};
+use crate::now_ms;
 use crate::topic::profile::TopicProfile;
 use crate::topic::retention::RetentionPolicy;
 
@@ -56,12 +57,19 @@ pub struct SubscriberId(pub u64);
 /// A replay log entry. Stores the offset and a serialized payload.
 #[derive(Debug, Clone)]
 pub struct LogEntry {
+    /// The offset assigned by the broker.
     pub offset: i64,
+    /// The publisher's session id, if known.
     pub publisher_session: Option<String>,
+    /// The message id.
     pub message_id: String,
+    /// The message class (event, state, etc.).
     pub class: String,
+    /// The event name, if any.
     pub event: Option<String>,
+    /// The serialized payload.
     pub payload: Bytes,
+    /// The sender timestamp in ms since epoch.
     pub timestamp: i64,
 }
 
@@ -70,16 +78,17 @@ use bytes::Bytes;
 /// Internal state of a single topic.
 #[derive(Debug)]
 pub struct TopicEntry {
+    /// Topic name.
     pub name: String,
+    /// Topic profile (retention, ordering, limits, etc.).
     pub profile: RwLock<TopicProfile>,
+    /// Whether the topic has been closed.
     pub closed: parking_lot::Mutex<bool>,
-    /// Monotonic offset cursor — next offset to assign.
-    pub next_offset: AtomicI64,
     /// Replay log (sorted by offset). Bounded by `profile.retention`.
     pub log: RwLock<Vec<LogEntry>>,
     /// Current subscriber count.
     pub subscriber_count: AtomicU64,
-    /// Publisher count.
+    /// Publisher count (active publishers).
     pub publisher_count: AtomicU64,
     /// Latest snapshot payload (if any).
     pub latest_snapshot: RwLock<Option<LogEntry>>,
@@ -91,7 +100,6 @@ impl TopicEntry {
             name,
             profile: RwLock::new(profile),
             closed: parking_lot::Mutex::new(false),
-            next_offset: AtomicI64::new(1),
             log: RwLock::new(Vec::new()),
             subscriber_count: AtomicU64::new(0),
             publisher_count: AtomicU64::new(0),
@@ -99,20 +107,56 @@ impl TopicEntry {
         }
     }
 
-    /// Allocate the next offset for this topic.
-    pub fn alloc_offset(&self) -> i64 {
-        self.next_offset.fetch_add(1, Ordering::SeqCst)
+    /// Return the highest offset stored in the log, or 0 if empty.
+    /// The authoritative offset sequence is managed by `OffsetStore`;
+    /// this is derived from the actual log entries.
+    pub fn head_offset(&self) -> i64 {
+        self.log
+            .read()
+            .last()
+            .map(|e| e.offset)
+            .unwrap_or(0)
     }
 
-    /// Current highest offset (0 if no messages yet).
-    pub fn head_offset(&self) -> i64 {
-        self.next_offset.load(Ordering::SeqCst) - 1
+    /// Check whether the topic can accept another subscriber.
+    pub fn can_subscribe(&self) -> bool {
+        let limit = self.profile.read().max_subscribers;
+        self.subscriber_count.load(Ordering::Relaxed) < limit as u64
+    }
+
+    /// Check whether the topic can accept another publisher.
+    pub fn can_publish(&self) -> bool {
+        let limit = self.profile.read().max_publishers;
+        self.publisher_count.load(Ordering::Relaxed) < limit as u64
+    }
+
+    /// Atomically increment subscriber count.
+    pub fn inc_subscriber(&self) {
+        self.subscriber_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically decrement subscriber count (saturating at 0).
+    pub fn dec_subscriber(&self) {
+        self.subscriber_count.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Atomically increment publisher count.
+    pub fn inc_publisher(&self) {
+        self.publisher_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Atomically decrement publisher count (saturating at 0).
+    pub fn dec_publisher(&self) {
+        self.publisher_count.fetch_sub(1, Ordering::Relaxed);
     }
 
     /// Append a new log entry, enforcing retention policy.
+    ///
+    /// The `entry.offset` is assigned by `OffsetStore`; this method
+    /// only manages the log storage and eviction.
     pub fn append(&self, mut entry: LogEntry) {
         if entry.timestamp == 0 {
-            entry.timestamp = epoch_now_ms();
+            entry.timestamp = now_ms();
         }
         let profile = self.profile.read().clone();
         let mut log = self.log.write();
@@ -137,7 +181,7 @@ impl TopicEntry {
                 }
             }
             RetentionPolicy::Ttl(ttl) => {
-                let now = epoch_now_ms();
+                let now = now_ms();
                 log.retain(|e| now - e.timestamp <= ttl.as_millis() as i64);
             }
             RetentionPolicy::Latest => {
@@ -168,14 +212,6 @@ impl TopicEntry {
     }
 }
 
-fn epoch_now_ms() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 /// Topic store — a process-wide map of topic name → entry.
 ///
 /// Internally the `DashMap` is wrapped in an `Arc` so that cloning a
@@ -187,6 +223,7 @@ pub struct TopicStore {
 }
 
 impl TopicStore {
+    /// Create an empty topic store.
     pub fn new() -> Self {
         Self::default()
     }
@@ -235,8 +272,8 @@ impl TopicStore {
                 (
                     kv.key().clone(),
                     (
-                        e.subscriber_count.load(Ordering::SeqCst),
-                        e.publisher_count.load(Ordering::SeqCst),
+                        e.subscriber_count.load(Ordering::Relaxed),
+                        e.publisher_count.load(Ordering::Relaxed),
                         e.head_offset(),
                     ),
                 )
@@ -345,17 +382,6 @@ mod tests {
     }
 
     #[test]
-    fn offset_monotonic() {
-        let store = TopicStore::new();
-        let entry = store.get_or_create("t1", TopicProfile::default()).unwrap();
-        let a = entry.alloc_offset();
-        let b = entry.alloc_offset();
-        let c = entry.alloc_offset();
-        assert_eq!((a, b, c), (1, 2, 3));
-        assert_eq!(entry.head_offset(), 3);
-    }
-
-    #[test]
     fn snapshot_keeps_latest() {
         let store = TopicStore::new();
         let entry = store
@@ -372,5 +398,59 @@ mod tests {
         entry.append(sample_entry(2, b"b"));
         let s = entry.snapshot().unwrap();
         assert_eq!(s.offset, 2);
+    }
+
+    #[test]
+    fn head_offset_reflects_log() {
+        let store = TopicStore::new();
+        let entry = store
+            .get_or_create(
+                "t1",
+                TopicProfile {
+                    retention: RetentionPolicy::Count(100),
+                    ..TopicProfile::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(entry.head_offset(), 0);
+        entry.append(sample_entry(1, b"a"));
+        assert_eq!(entry.head_offset(), 1);
+        entry.append(sample_entry(5, b"b"));
+        assert_eq!(entry.head_offset(), 5);
+    }
+
+    #[test]
+    fn subscriber_limit_check() {
+        let store = TopicStore::new();
+        let entry = store
+            .get_or_create(
+                "t1",
+                TopicProfile {
+                    max_subscribers: 2,
+                    ..TopicProfile::default()
+                },
+            )
+            .unwrap();
+        assert!(entry.can_subscribe());
+        entry.inc_subscriber();
+        entry.inc_subscriber();
+        assert!(!entry.can_subscribe());
+    }
+
+    #[test]
+    fn publisher_limit_check() {
+        let store = TopicStore::new();
+        let entry = store
+            .get_or_create(
+                "t1",
+                TopicProfile {
+                    max_publishers: 1,
+                    ..TopicProfile::default()
+                },
+            )
+            .unwrap();
+        assert!(entry.can_publish());
+        entry.inc_publisher();
+        assert!(!entry.can_publish());
     }
 }

@@ -4,24 +4,35 @@
 //! Keyed by `(topic, dedupe_key)`. A background sweep evicts old
 //! entries; a read returns whether the key has been seen.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 
+use crate::now_ms;
+
+/// In-memory deduplication store.
+///
+/// Each entry is keyed by `(topic, dedupe_key)` and stores the epoch
+/// millisecond at which it expires.  `check_and_record` is the main
+/// entry point: it atomically checks and records, returning `true` if
+/// the message should be processed (fresh) or `false` if it is a
+/// duplicate.
 #[derive(Debug, Default)]
 pub struct DedupeStore {
     inner: DashMap<(String, String), i64>,
-    sweep_cursor: Mutex<Vec<(String, String, i64)>>,
 }
 
 impl DedupeStore {
+    /// Create an empty dedupe store.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Returns `true` if the key is fresh (i.e. the message should be
     /// processed); `false` if it has been seen within the window.
+    ///
+    /// If the key exists but its previous entry has already expired,
+    /// the entry is renewed and the message is treated as fresh.
     pub fn check_and_record(&self, topic: &str, key: &str, window: Duration) -> bool {
         let now = now_ms();
         let expires = now + window.as_millis() as i64;
@@ -29,37 +40,34 @@ impl DedupeStore {
         if let Some(mut entry) = self.inner.get_mut(&k) {
             if *entry.value() <= now {
                 *entry.value_mut() = expires;
-                self.sweep_cursor
-                    .lock()
-                    .push((k.0.clone(), k.1.clone(), expires));
                 true
             } else {
                 false
             }
         } else {
-            self.inner.insert(k.clone(), expires);
-            self.sweep_cursor.lock().push((k.0, k.1, expires));
+            self.inner.insert(k, expires);
             true
         }
     }
 
     /// Drop expired entries. Returns number of removed entries.
+    ///
+    /// Should be called periodically from a background task to bound
+    /// memory usage.
     pub fn sweep(&self) -> usize {
         let now = now_ms();
-        let mut removed = 0;
-        // Collect keys to remove (can't hold a DashMap iterator while mutating).
         let expired: Vec<(String, String)> = self
             .inner
             .iter()
             .filter(|kv| *kv.value() <= now)
             .map(|kv| (kv.key().0.clone(), kv.key().1.clone()))
             .collect();
+        let mut removed = 0;
         for k in expired {
             if self.inner.remove(&k).is_some() {
                 removed += 1;
             }
         }
-        self.sweep_cursor.lock().retain(|(_, _, exp)| *exp > now);
         removed
     }
 
@@ -68,16 +76,10 @@ impl DedupeStore {
         self.inner.len()
     }
 
+    /// Returns `true` if the store is empty.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

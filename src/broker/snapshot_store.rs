@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::now_ms;
 
 use parking_lot::RwLock;
 use uuid::Uuid;
@@ -69,8 +71,15 @@ impl SnapshotStore {
         Some(stored)
     }
 
+    /// Get a snapshot, returning `None` if it has expired.
     pub fn get(&self, topic: &str) -> Option<StoredSnapshot> {
-        self.inner.read().get(topic).cloned()
+        let snap = self.inner.read().get(topic).cloned()?;
+        if let Some(expires) = snap.expires_at {
+            if now_ms() > expires {
+                return None;
+            }
+        }
+        Some(snap)
     }
 
     pub fn remove(&self, topic: &str) -> Option<StoredSnapshot> {
@@ -80,13 +89,6 @@ impl SnapshotStore {
     pub fn list(&self) -> Vec<StoredSnapshot> {
         self.inner.read().values().cloned().collect()
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Shared snapshot store.
@@ -127,5 +129,37 @@ mod tests {
         assert_eq!(s.payload.as_ref(), b"hello");
         let got = snaps.get("t").unwrap();
         assert_eq!(got.snapshot_id, s.snapshot_id);
+    }
+
+    #[test]
+    fn expired_snapshot_returns_none() {
+        let store = TopicStore::new();
+        let entry = store
+            .get_or_create(
+                "t",
+                TopicProfile {
+                    retention: crate::topic::retention::RetentionPolicy::Count(10),
+                    snapshot_enabled: true,
+                    ..TopicProfile::default()
+                },
+            )
+            .unwrap();
+        entry.append(crate::topic::store::LogEntry {
+            offset: 1,
+            publisher_session: None,
+            message_id: "m1".into(),
+            class: "event".into(),
+            event: Some("e".into()),
+            payload: bytes::Bytes::from_static(b"hello"),
+            timestamp: 0,
+        });
+        let snaps = SnapshotStore::new();
+        // Capture with 0-ms TTL → expires immediately.
+        snaps.capture("t", &store, Some(Duration::from_millis(0)));
+        // Manually set expires_at to 0.
+        if let Some(mut snap) = snaps.inner.write().get_mut("t") {
+            snap.expires_at = Some(0);
+        }
+        assert!(snaps.get("t").is_none());
     }
 }

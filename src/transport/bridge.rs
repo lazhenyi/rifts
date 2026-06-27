@@ -6,7 +6,6 @@
 //! (actix-rt) and the tokio runtime where `Connection::run()` lives.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use async_trait::async_trait;
 use tokio::sync::mpsc;
@@ -23,7 +22,7 @@ use crate::transport::frame_codec::{decode_binary_frame, decode_text_frame, enco
 /// reader/writer tasks that stay on the framework's runtime.
 pub struct BridgeConnection {
     /// Frames received from the framework WS (read path).
-    inbox: Arc<tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>>,
+    inbox: tokio::sync::Mutex<mpsc::Receiver<Vec<u8>>>,
     /// Frames to send to the framework WS (write path).
     outbox: mpsc::Sender<Vec<u8>>,
     peer: Option<SocketAddr>,
@@ -44,7 +43,7 @@ pub fn spawn_bridge(
     spawn_writer(outbox_rx);
 
     Box::new(BridgeConnection {
-        inbox: Arc::new(tokio::sync::Mutex::new(inbox_rx)),
+        inbox: tokio::sync::Mutex::new(inbox_rx),
         outbox: outbox_tx,
         peer,
     })
@@ -66,7 +65,7 @@ pub fn spawn_bridge_local(
     spawn_writer(outbox_rx);
 
     Box::new(BridgeConnection {
-        inbox: Arc::new(tokio::sync::Mutex::new(inbox_rx)),
+        inbox: tokio::sync::Mutex::new(inbox_rx),
         outbox: outbox_tx,
         peer,
     })

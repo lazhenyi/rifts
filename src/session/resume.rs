@@ -135,11 +135,32 @@ mod tests {
 
     #[test]
     fn topic_offsets_from_store() {
+        use crate::broker::offset_store::OffsetStore;
         let m = ResumeManager::new();
         let store = TopicStore::new();
+        let offsets = OffsetStore::new();
         let entry = store.get_or_create("t", TopicProfile::default()).unwrap();
-        entry.alloc_offset();
-        entry.alloc_offset();
+        // Use OffsetStore for authoritative offsets.
+        let o1 = offsets.alloc("t");
+        let o2 = offsets.alloc("t");
+        entry.append(crate::topic::store::LogEntry {
+            offset: o1,
+            publisher_session: None,
+            message_id: "m1".into(),
+            class: "event".into(),
+            event: Some("e".into()),
+            payload: bytes::Bytes::from_static(b"x"),
+            timestamp: 0,
+        });
+        entry.append(crate::topic::store::LogEntry {
+            offset: o2,
+            publisher_session: None,
+            message_id: "m2".into(),
+            class: "event".into(),
+            event: Some("e".into()),
+            payload: bytes::Bytes::from_static(b"x"),
+            timestamp: 0,
+        });
         let heads = m.topic_offsets(&store, &["t".to_string()]);
         assert_eq!(heads.get("t").copied(), Some(2));
     }

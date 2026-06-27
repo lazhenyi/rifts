@@ -13,10 +13,11 @@ use crate::broker::fanout::{FanoutError, FanoutSink};
 use crate::broker::{Broker, SubscribeIntent};
 use crate::codec::{CborCodec, Codec, JsonCodec, negotiate};
 use crate::config::ServerConfig;
-use crate::error::{Result, RiftError};
+use crate::error::{Result, RiftError, SystemReject};
 use crate::flow::BackpressureController;
 use crate::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
 use crate::metrics::Metrics;
+use crate::now_ms;
 use crate::protocol::close::CloseCode;
 use crate::protocol::hello::{AuthMode, Hello};
 use crate::session::resume::ResumeManager;
@@ -69,23 +70,34 @@ impl FanoutSink for ConnSink {
 
 /// Per-connection state.
 pub struct Connection {
+    /// Unique connection id within this process.
     pub conn_id: u64,
+    /// Reference to the broker.
     pub broker: Arc<dyn Broker>,
+    /// Authentication provider.
     pub auth: Arc<dyn AuthProvider>,
+    /// Server configuration.
     pub config: ServerConfig,
+    /// Metrics counters.
     pub metrics: Arc<Metrics>,
+    /// Acknowledgement manager.
     pub ack_manager: SharedAckManager,
+    /// Resume manager.
     pub resume: Arc<ResumeManager>,
+    /// Backpressure controller.
     pub backpressure: BackpressureController,
     out_tx: mpsc::Sender<Frame>,
     out_rx: parking_lot::Mutex<Option<mpsc::Receiver<Frame>>>,
+    /// Unique sink id for this connection.
     pub sink_id: u64,
+    /// Negotiated codec.
     pub codec: Arc<dyn Codec>,
     in_flight_bytes: Arc<AtomicUsize>,
 }
 
 impl Connection {
     #[allow(clippy::too_many_arguments)]
+    /// Create a new connection with the given parameters.
     pub fn new(
         conn_id: u64,
         broker: Arc<dyn Broker>,
@@ -114,6 +126,8 @@ impl Connection {
         }
     }
 
+    /// Return a `FanoutSink` attached to this connection's outbound
+    /// channel.
     pub fn sink(&self) -> Arc<dyn FanoutSink> {
         Arc::new(ConnSink {
             tx: self.out_tx.clone(),
@@ -122,17 +136,6 @@ impl Connection {
             metrics: self.metrics.clone(),
             sink_id: self.sink_id,
         })
-    }
-
-    /// Queue a frame to the outbound mpsc.
-    pub fn queue(&self, frame: Frame) -> Result<()> {
-        let bytes = frame.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-        self.out_tx
-            .try_send(frame)
-            .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
-        self.in_flight_bytes.fetch_add(bytes, Ordering::SeqCst);
-        self.metrics.inc(&self.metrics.messages_out_total);
-        Ok(())
     }
 
     /// Run the full connection lifecycle.
@@ -160,11 +163,7 @@ impl Connection {
             }
         };
 
-        // Now split: the reader takes the transport and the writer
-        // task uses it as well — but since `WebSocketConnection` is
-        // internally split (independent read/write halves), the
-        // reader can hold the transport during a blocking read
-        // without blocking the writer.
+        // Shared transport slot for reader/writer tasks.
         let transport_slot: Arc<AsyncMutex<Option<Box<dyn TransportConnection>>>> =
             Arc::new(AsyncMutex::new(Some(transport)));
 
@@ -173,7 +172,11 @@ impl Connection {
             .out_rx
             .lock()
             .take()
-            .expect("writer takes receiver once");
+            .ok_or_else(|| {
+                RiftError::System(SystemReject::Internal(
+                    "writer already started".into(),
+                ))
+            })?;
         let transport_slot_w = transport_slot.clone();
         let in_flight_w = self.in_flight_bytes.clone();
         let writer_handle = tokio::spawn(async move {
@@ -206,9 +209,9 @@ impl Connection {
         // Wait for the reader to finish.
         let res = match reader_handle.await {
             Ok(r) => r,
-            Err(e) => Err(RiftError::System(crate::error::SystemReject::Internal(
-                format!("reader task panicked: {e}"),
-            ))),
+            Err(e) => Err(RiftError::System(SystemReject::Internal(format!(
+                "reader task panicked: {e}"
+            )))),
         };
 
         // Close the transport.
@@ -229,8 +232,6 @@ impl Connection {
     }
 
     /// Drive the hello → auth → resume/start → ready handshake.
-    /// Welcome and ready are written synchronously using the same
-    /// transport.
     async fn handshake(
         &self,
         transport: &mut Box<dyn TransportConnection>,
@@ -260,7 +261,6 @@ impl Connection {
 
         let server_codecs: Vec<Arc<dyn Codec>> = vec![Arc::new(JsonCodec), Arc::new(CborCodec)];
         let codec = negotiate(&server_codecs, &hello.codecs)?;
-        let codec_clone = codec.clone();
 
         let auth_mode = hello
             .auth_modes
@@ -312,12 +312,9 @@ impl Connection {
         transport.write_frame(&ready).await?;
         session.set_state(SessionState::Active);
 
-        // Stash the negotiated codec somewhere accessible — we use
-        // a separate channel; the field on `Connection` is updated
-        // via interior mutability, but for the minimal impl we just
-        // pass it as a parameter to the reader task.
-        let _ = codec_clone;
-
+        // The negotiated codec will be used by the reader task via
+        // self.codec (the field is independently cloned when building
+        // the reader).
         Ok(session)
     }
 }
@@ -329,7 +326,6 @@ async fn writer_task(
 ) {
     while let Some(frame) = rx.recv().await {
         let bytes = frame.payload.as_ref().map(|p| p.len()).unwrap_or(0);
-        // Take the transport for the duration of the write.
         let result = {
             let mut guard = transport_slot.lock().await;
             let Some(transport) = guard.as_mut() else {
@@ -343,6 +339,8 @@ async fn writer_task(
             }
             Err(e) => {
                 warn!("write error: {}", e);
+                // Release the transport so the reader stops too.
+                *transport_slot.lock().await = None;
                 break;
             }
         }
@@ -364,6 +362,7 @@ async fn reader_task(
         let frame = {
             let mut guard = transport_slot.lock().await;
             let Some(transport) = guard.as_mut() else {
+                // Writer released the transport — connection is done.
                 return Ok(());
             };
             match transport.read_frame().await {
@@ -388,6 +387,14 @@ async fn reader_task(
                 }
             }
             FrameType::Data => {
+                // TTL check before dispatching to broker.
+                if let Some(ttl) = frame.ttl_ms {
+                    if frame.timestamp > 0 && now_ms() - frame.timestamp > ttl as i64 {
+                        debug!(conn = conn_id, "message expired (TTL)");
+                        metrics.inc(&metrics.messages_expired_total);
+                        continue;
+                    }
+                }
                 let requires_ack = frame.requires_ack();
                 let msg_id = frame.message_id.clone();
                 match broker.publish(&frame) {
@@ -440,7 +447,13 @@ async fn handle_control(
         .and_then(|p| std::str::from_utf8(p).ok())
         .unwrap_or("{}");
 
-    let v: serde_json::Value = serde_json::from_str(body).unwrap_or(serde_json::json!({}));
+    // Propagate JSON parse errors rather than silently swallowing them.
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| {
+            RiftError::Frame(crate::error::FrameReject::FrameInvalid(format!(
+                "invalid control body: {e}"
+            )))
+        })?;
     let ctrl_type = v.get("type").and_then(|x| x.as_str()).unwrap_or("");
 
     match ctrl_type {
@@ -453,7 +466,7 @@ async fn handle_control(
             };
             out_tx
                 .try_send(pong)
-                .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
+                .map_err(|_| RiftError::System(SystemReject::Overloaded))?;
             Ok(())
         }
         "subscribe" => {
@@ -464,14 +477,30 @@ async fn handle_control(
                     RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("topic"))
                 })?
                 .to_string();
+            let intent_str = v
+                .get("intent")
+                .and_then(|x| x.as_str())
+                .unwrap_or("live");
+            let intent = match intent_str {
+                "live" => SubscribeIntent::Live,
+                "passive" => SubscribeIntent::Passive,
+                "ephemeral" => SubscribeIntent::Ephemeral,
+                "latest" => SubscribeIntent::Latest,
+                other => {
+                    return Err(RiftError::Frame(crate::error::FrameReject::FrameInvalid(
+                        format!("unknown subscribe intent: {other}"),
+                    )));
+                }
+            };
             let sink: Arc<dyn FanoutSink> = Arc::new(MpscSink {
                 tx: out_tx.clone(),
                 id: crate::broker::fanout::new_sink_id(),
             });
-            broker.subscribe(&topic, SubscribeIntent::Live, sink)?;
+            let id = broker.subscribe(&topic, intent, sink)?;
             let reply = serde_json::json!({
                 "type": "subscribe_ack",
                 "topic": topic,
+                "subscription_id": id.0,
                 "result": "accepted",
             });
             out_tx
@@ -482,10 +511,36 @@ async fn handle_control(
                     payload: Some(Bytes::from(reply.to_string())),
                     ..Frame::default()
                 })
-                .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))?;
+                .map_err(|_| RiftError::System(SystemReject::Overloaded))?;
             Ok(())
         }
-        "unsubscribe" => Ok(()),
+        "unsubscribe" => {
+            let sub_id = v
+                .get("subscription_id")
+                .and_then(|x| x.as_u64())
+                .ok_or_else(|| {
+                    RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing(
+                        "subscription_id",
+                    ))
+                })?;
+            let removed = broker
+                .unsubscribe(crate::broker::fanout::SubscriptionId(sub_id))?;
+            let reply = serde_json::json!({
+                "type": "unsubscribe_ack",
+                "subscription_id": sub_id,
+                "result": if removed { "removed" } else { "not_found" },
+            });
+            out_tx
+                .try_send(Frame {
+                    frame_type: FrameType::Control,
+                    codec: codec.frame_codec(),
+                    correlation_id: frame.correlation_id.clone(),
+                    payload: Some(Bytes::from(reply.to_string())),
+                    ..Frame::default()
+                })
+                .map_err(|_| RiftError::System(SystemReject::Overloaded))?;
+            Ok(())
+        }
         _ => {
             warn!("unknown control type: {}", ctrl_type);
             Ok(())
@@ -539,7 +594,7 @@ async fn send_error_frame(
             payload: Some(Bytes::from(body.to_string())),
             ..Frame::default()
         })
-        .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))
+        .map_err(|_| RiftError::System(SystemReject::Overloaded))
 }
 
 /// Map a `RiftError` variant to the closest `ErrorCode` wire identifier.
@@ -563,9 +618,7 @@ fn rift_error_to_code(err: &RiftError) -> &'static str {
             crate::error::FrameReject::SchemaMismatch(_) => {
                 ErrorCode::ProtocolSchemaMismatch.as_str()
             }
-            crate::error::FrameReject::OrderViolation(_) => {
-                ErrorCode::ProtocolOrderViolation.as_str()
-            }
+            crate::error::FrameReject::OrderViolation(_) => ErrorCode::ProtocolOrderViolation.as_str(),
         },
         RiftError::Session(se) => match se {
             crate::error::SessionReject::NotFound(_) => ErrorCode::SessionNotFound.as_str(),
@@ -575,17 +628,13 @@ fn rift_error_to_code(err: &RiftError) -> &'static str {
             crate::error::SessionReject::ReplayOffsetExpired { .. } => {
                 ErrorCode::ReplayOffsetExpired.as_str()
             }
-            crate::error::SessionReject::SnapshotRequired(_) => {
-                ErrorCode::SnapshotRequired.as_str()
-            }
+            crate::error::SessionReject::SnapshotRequired(_) => ErrorCode::SnapshotRequired.as_str(),
         },
         RiftError::Topic(te) => match te {
             crate::error::TopicReject::NotFound(_) => ErrorCode::TopicNotFound.as_str(),
             crate::error::TopicReject::Closed(_) => ErrorCode::TopicClosed.as_str(),
             crate::error::TopicReject::Overloaded(_) => ErrorCode::TopicOverloaded.as_str(),
-            crate::error::TopicReject::SubscriberLimit(_) => {
-                ErrorCode::TopicSubscriberLimit.as_str()
-            }
+            crate::error::TopicReject::SubscriberLimit(_) => ErrorCode::TopicSubscriberLimit.as_str(),
             crate::error::TopicReject::PublisherLimit(_) => ErrorCode::TopicPublisherLimit.as_str(),
             crate::error::TopicReject::Forbidden(_) => ErrorCode::TopicForbidden.as_str(),
             crate::error::TopicReject::RateLimited(_) => ErrorCode::TopicRateLimited.as_str(),
@@ -641,7 +690,7 @@ async fn send_ack_frame(
             payload: Some(Bytes::from(body)),
             ..Frame::default()
         })
-        .map_err(|_| RiftError::System(crate::error::SystemReject::Overloaded))
+        .map_err(|_| RiftError::System(SystemReject::Overloaded))
 }
 
 // --- handshake helpers ---
@@ -745,11 +794,4 @@ fn decode_hello_payload(payload: &Option<Bytes>) -> Result<(Hello, Option<String
     }
     let token = obj.get("token").and_then(|x| x.as_str()).map(String::from);
     Ok((h, token))
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }

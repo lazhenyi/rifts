@@ -2,7 +2,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::now_ms;
 
 use parking_lot::Mutex;
 use uuid::Uuid;
@@ -149,13 +151,6 @@ impl AckManager {
     pub fn forget(&self, session_id: &str) {
         self.outstanding.lock().remove(session_id);
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// Shared ack manager.

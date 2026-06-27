@@ -2,7 +2,9 @@
 //! transport connection (spec §5.4, §13).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
+
+use crate::now_ms;
 
 use ulid::Ulid;
 
@@ -118,13 +120,6 @@ impl Session {
         let last = self.last_active.load(Ordering::SeqCst) as i64;
         Duration::from_millis((now_ms() - last).max(0) as u64)
     }
-}
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

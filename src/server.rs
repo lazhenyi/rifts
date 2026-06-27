@@ -38,12 +38,15 @@ trait TransportFactory: Send + Sync {
 }
 
 #[cfg(feature = "websocket")]
-struct WebSocketFactory;
+struct WebSocketFactory {
+    max_message_size: usize,
+}
 
 #[cfg(feature = "websocket")]
 impl TransportFactory for WebSocketFactory {
     fn build(&self, addr: SocketAddr) -> ListenerFuture {
-        Box::pin(async move { WebSocketTransport::new().bind(addr).await })
+        let transport = WebSocketTransport::new().with_max_message_size(self.max_message_size);
+        Box::pin(async move { transport.bind(addr).await })
     }
 }
 
@@ -58,6 +61,7 @@ pub struct RiftServerBuilder {
 }
 
 impl RiftServerBuilder {
+    /// Create a new builder with defaults.
     pub fn new() -> Self {
         Self {
             config: ServerConfig::default(),
@@ -69,16 +73,19 @@ impl RiftServerBuilder {
         }
     }
 
+    /// Set server configuration.
     pub fn config(mut self, config: ServerConfig) -> Self {
         self.config = config;
         self
     }
 
+    /// Set authentication provider.
     pub fn auth(mut self, auth: Arc<dyn AuthProvider>) -> Self {
         self.auth = Some(auth);
         self
     }
 
+    /// Set custom broker.
     pub fn broker(mut self, broker: Arc<dyn Broker>) -> Self {
         self.broker = Some(broker);
         self
@@ -88,15 +95,20 @@ impl RiftServerBuilder {
     /// `websocket`).
     #[cfg(feature = "websocket")]
     pub fn websocket_transport(mut self) -> Self {
-        self.transport = Some(Box::new(WebSocketFactory));
+        let max_msg = self.config.max_payload_bytes;
+        self.transport = Some(Box::new(WebSocketFactory {
+            max_message_size: max_msg,
+        }));
         self
     }
 
+    /// Set metrics collector.
     pub fn metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
+    /// Build the server.
     pub fn build(self) -> Result<RiftServer> {
         let metrics = self.metrics.unwrap_or_else(|| Arc::new(Metrics::new()));
         let config_max_payload = self.config.max_payload_bytes;
@@ -118,12 +130,12 @@ impl RiftServerBuilder {
             broker,
             metrics,
             #[cfg(feature = "websocket")]
-            transport: self.transport.map(Arc::new).ok_or_else(|| {
+            transport: Arc::from(self.transport.ok_or_else(|| {
                 RiftError::Config(ConfigError::Invalid {
                     field: "transport",
                     message: "transport is required for standalone mode".to_string(),
                 })
-            })?,
+            })?),
             next_conn_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -137,16 +149,18 @@ impl Default for RiftServerBuilder {
 
 /// The Rift/1 server.
 pub struct RiftServer {
-    config: ServerConfig,
+    /// Server configuration.
+    pub config: ServerConfig,
     auth: Arc<dyn AuthProvider>,
     broker: Arc<dyn Broker>,
     metrics: Arc<Metrics>,
     #[cfg(feature = "websocket")]
-    transport: Arc<Box<dyn TransportFactory>>,
+    transport: Arc<dyn TransportFactory>,
     next_conn_id: Arc<AtomicU64>,
 }
 
 impl RiftServer {
+    /// Create a new builder.
     pub fn builder() -> RiftServerBuilder {
         RiftServerBuilder::new()
     }

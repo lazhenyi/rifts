@@ -9,15 +9,18 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 
-use crate::error::Result;
+use crate::error::{Result, RiftError};
 use crate::protocol::hello::AuthMode;
 use crate::session::session::ClientId;
 
 /// Authenticated principal returned to the server.
 #[derive(Debug, Clone)]
 pub struct AuthContext {
+    /// Unique client identifier.
     pub client_id: ClientId,
+    /// Arbitrary claims from the IdP.
     pub claims: serde_json::Value,
+    /// The authentication mode used.
     pub mode: AuthMode,
     /// Free-form region/device/risk hints (spec §17.2).
     pub hints: AuthHints,
@@ -26,8 +29,11 @@ pub struct AuthContext {
 /// Optional authorization context hints.
 #[derive(Debug, Clone, Default)]
 pub struct AuthHints {
+    /// Geographic or cloud region.
     pub region: Option<String>,
+    /// Device identifier.
     pub device: Option<String>,
+    /// Risk score (0-100, higher = riskier).
     pub risk: Option<u32>,
 }
 
@@ -46,18 +52,29 @@ pub trait AuthProvider: Send + Sync {
 /// IdP.
 pub struct TokenAuth {
     tokens: RwLock<HashMap<String, AuthContext>>,
+    /// Reverse index: client_id → set of active tokens.
+    by_client: RwLock<HashMap<String, Vec<String>>>,
 }
 
 impl TokenAuth {
+    /// Create an empty token store.
     pub fn new() -> Self {
         Self {
             tokens: RwLock::new(HashMap::new()),
+            by_client: RwLock::new(HashMap::new()),
         }
     }
 
     /// Register a token → context mapping.
     pub fn register(&self, token: impl Into<String>, ctx: AuthContext) {
-        self.tokens.write().insert(token.into(), ctx);
+        let token = token.into();
+        let client_id = ctx.client_id.0.clone();
+        self.by_client
+            .write()
+            .entry(client_id)
+            .or_default()
+            .push(token.clone());
+        self.tokens.write().insert(token, ctx);
     }
 }
 
@@ -79,13 +96,21 @@ impl AuthProvider for TokenAuth {
             });
         }
         let token = token
-            .ok_or_else(|| crate::error::RiftError::Auth(crate::error::AuthReject::Required))?;
+            .ok_or_else(|| RiftError::Auth(crate::error::AuthReject::Required))?;
         self.tokens.read().get(token).cloned().ok_or_else(|| {
-            crate::error::RiftError::Auth(crate::error::AuthReject::Invalid("unknown token".into()))
+            RiftError::Auth(crate::error::AuthReject::Invalid("unknown token".into()))
         })
     }
 
-    async fn revoke(&self, _client_id: &ClientId) -> Result<()> {
+    async fn revoke(&self, client_id: &ClientId) -> Result<()> {
+        let tokens = {
+            let mut bc = self.by_client.write();
+            bc.remove(client_id.as_str()).unwrap_or_default()
+        };
+        let mut t = self.tokens.write();
+        for token in &tokens {
+            t.remove(token);
+        }
         Ok(())
     }
 }
@@ -151,5 +176,29 @@ mod tests {
         let auth = TokenAuth::new();
         let ctx = auth.authenticate(AuthMode::Anonymous, None).await.unwrap();
         assert_eq!(ctx.mode, AuthMode::Anonymous);
+    }
+
+    #[tokio::test]
+    async fn revoke_removes_ability_to_authenticate() {
+        let auth = TokenAuth::new();
+        let client = ClientId::new("user-1");
+        auth.register(
+            "tok-1",
+            AuthContext {
+                client_id: client.clone(),
+                claims: serde_json::json!({}),
+                mode: AuthMode::Bearer,
+                hints: AuthHints::default(),
+            },
+        );
+        assert!(auth
+            .authenticate(AuthMode::Bearer, Some("tok-1"))
+            .await
+            .is_ok());
+        auth.revoke(&client).await.unwrap();
+        assert!(auth
+            .authenticate(AuthMode::Bearer, Some("tok-1"))
+            .await
+            .is_err());
     }
 }

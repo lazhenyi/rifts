@@ -17,6 +17,7 @@ use crate::broker::snapshot_store::{SharedSnapshotStore, SnapshotStore};
 use crate::error::{MessageReject, Result, RiftError, TopicReject};
 use crate::frame::Frame;
 use crate::message::MessageClass;
+use crate::now_ms;
 use crate::topic::store::LogEntry;
 use crate::topic::{RetentionPolicy, TopicProfile, TopicStore};
 
@@ -67,13 +68,21 @@ pub trait Broker: Send + Sync {
 
 /// Single-process broker.
 pub struct InMemoryBroker {
+    /// In-memory topic store.
     pub store: TopicStore,
+    /// Deduplication store.
     pub dedupe: DedupeStore,
+    /// Per-topic offset allocator.
     pub offsets: OffsetStore,
+    /// Snapshot store.
     pub snapshots: SharedSnapshotStore,
+    /// Fanout engine.
     pub fanout: FanoutEngine,
+    /// Topic router.
     pub router: Mutex<Box<dyn TopicRouter>>,
+    /// Deduplication window duration.
     pub dedupe_window: Duration,
+    /// Maximum payload bytes allowed.
     pub max_payload_bytes: usize,
 }
 
@@ -91,6 +100,8 @@ impl std::fmt::Debug for InMemoryBroker {
 }
 
 impl InMemoryBroker {
+    /// Create a new in-memory broker with the given default topic
+    /// profile, dedupe window, and max payload size.
     pub fn new(
         default_profile: crate::topic::TopicProfile,
         dedupe_window: Duration,
@@ -114,17 +125,16 @@ impl InMemoryBroker {
     }
 
     /// Validate that a frame carries the minimum fields for a publish.
-    fn validate_publish(&self, frame: &Frame) -> Result<()> {
-        if frame.topic.is_none() {
-            return Err(RiftError::Frame(
-                crate::error::FrameReject::RequiredFieldMissing("topic"),
-            ));
-        }
-        if frame.message_id.is_none() {
-            return Err(RiftError::Frame(
-                crate::error::FrameReject::RequiredFieldMissing("message_id"),
-            ));
-        }
+    /// Returns the validated topic and message_id references on success.
+    fn validate_publish<'a>(&self, frame: &'a Frame) -> Result<(&'a str, &'a str)> {
+        let topic = frame
+            .topic
+            .as_deref()
+            .ok_or_else(|| RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("topic")))?;
+        let message_id = frame
+            .message_id
+            .as_deref()
+            .ok_or_else(|| RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("message_id")))?;
         let max = self.max_payload_bytes;
         if let Some(payload) = frame.payload.as_ref()
             && payload.len() > max
@@ -134,23 +144,33 @@ impl InMemoryBroker {
                 max,
             }));
         }
-        Ok(())
+        // Check message TTL.
+        if let Some(ttl) = frame.ttl_ms {
+            if frame.timestamp > 0 && now_ms() - frame.timestamp > ttl as i64 {
+                return Err(RiftError::Message(MessageReject::Expired));
+            }
+        }
+        Ok((topic, message_id))
     }
 }
 
 impl Broker for InMemoryBroker {
     fn publish(&self, frame: &Frame) -> Result<PublishOutcome> {
-        self.validate_publish(frame)?;
-        let topic = frame.topic.as_ref().unwrap();
-        let message_id = frame.message_id.as_ref().unwrap();
+        let (topic, message_id) = self.validate_publish(frame)?;
         crate::topic::store::validate_name(topic)?;
 
         let route: Route = {
             let router = self.router.lock();
             router
                 .route(topic, None)
-                .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.clone())))?
+                .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.to_string())))?
         };
+
+        // Check publisher limit.
+        if !route.entry.can_publish() {
+            return Err(RiftError::Topic(TopicReject::PublisherLimit(topic.to_string())));
+        }
+        route.entry.inc_publisher();
 
         // Dedupe check: message_id is the primary dedupe key.
         let mut duplicate = false;
@@ -165,7 +185,7 @@ impl Broker for InMemoryBroker {
         let entry = LogEntry {
             offset,
             publisher_session: frame.session_id.clone(),
-            message_id: message_id.clone(),
+            message_id: message_id.to_string(),
             class: frame
                 .event
                 .clone()
@@ -195,26 +215,46 @@ impl Broker for InMemoryBroker {
         // Ensure the topic exists; profile is created via router.
         {
             let router = self.router.lock();
-            router
+            let route = router
                 .route(topic, None)
-                .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.into())))?;
+                .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.to_string())))?;
+            if !route.entry.can_subscribe() {
+                return Err(RiftError::Topic(TopicReject::SubscriberLimit(
+                    topic.to_string(),
+                )));
+            }
+            route.entry.inc_subscriber();
         }
         Ok(self.fanout.subscribe(topic, intent, sink))
     }
 
     fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
-        Ok(self.fanout.unsubscribe(id))
+        if let Some(topic) = self.fanout.unsubscribe(id) {
+            if let Some(entry) = self.store.get(&topic) {
+                entry.dec_subscriber();
+            }
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     fn drop_sink(&self, sink_id: u64) -> usize {
-        self.fanout.drop_sink(sink_id)
+        let topics = self.fanout.drop_sink(sink_id);
+        let count = topics.len();
+        for topic in topics {
+            if let Some(entry) = self.store.get(&topic) {
+                entry.dec_subscriber();
+            }
+        }
+        count
     }
 
     fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {
         let entry = self
             .store
             .get(topic)
-            .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.into())))?;
+            .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.to_string())))?;
         Ok(entry
             .range(from, to)
             .into_iter()
@@ -248,10 +288,6 @@ impl InMemoryBroker {
 /// Helper: produce a serialized frame for fanout, stamping the
 /// assigned offset.
 pub fn serialize_frame_for_fanout(frame: &Frame, offset: i64) -> Bytes {
-    // We don't have a generic frame serializer here (the codec lives
-    // at the transport layer); in this minimal broker we pass the raw
-    // payload through and let the transport write it as a data frame
-    // with the offset and `replayed` flag.
     let mut buf = Vec::with_capacity(16 + frame.payload.as_ref().map(|p| p.len()).unwrap_or(0));
     buf.extend_from_slice(b"OFF:");
     buf.extend_from_slice(&offset.to_be_bytes());
@@ -295,7 +331,7 @@ mod tests {
 
     #[test]
     fn publish_assigns_offset() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let out = b.publish(&make_frame("t", "m1", b"hello")).unwrap();
         assert_eq!(out.offset, 1);
         let out2 = b.publish(&make_frame("t", "m2", b"world")).unwrap();
@@ -304,7 +340,7 @@ mod tests {
 
     #[test]
     fn publish_requires_topic_and_message_id() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let mut f = make_frame("t", "m1", b"x");
         f.topic = None;
         assert!(b.publish(&f).is_err());
@@ -315,7 +351,7 @@ mod tests {
 
     #[test]
     fn publish_fans_out_to_subscribers() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
             .unwrap();
@@ -325,7 +361,7 @@ mod tests {
 
     #[test]
     fn publish_dedupes_within_window() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
             .unwrap();
@@ -352,7 +388,7 @@ mod tests {
 
     #[test]
     fn subscribe_and_unsubscribe() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let s = Arc::new(CountingSink::new(1));
         let id = b.subscribe("t", SubscribeIntent::Live, s.clone()).unwrap();
         assert!(b.unsubscribe(id).unwrap());
@@ -362,7 +398,7 @@ mod tests {
 
     #[test]
     fn drop_sink_removes_all_subs() {
-        let b = InMemoryBroker::new(Default::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
+        let b = InMemoryBroker::new(TopicProfile::default(), Duration::from_secs(60), PAYLOAD_LIMIT);
         let s = Arc::new(CountingSink::new(7));
         b.subscribe("a", SubscribeIntent::Live, s.clone()).unwrap();
         b.subscribe("b", SubscribeIntent::Live, s.clone()).unwrap();

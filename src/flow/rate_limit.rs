@@ -1,6 +1,5 @@
 //! Token-bucket rate limiter.
 
-use std::sync::Mutex;
 use std::time::Instant;
 
 use parking_lot::Mutex as PlMutex;
@@ -9,7 +8,7 @@ use parking_lot::Mutex as PlMutex;
 pub struct RateLimiter {
     rps: f64,
     burst: f64,
-    tokens: Mutex<Bucket>,
+    tokens: PlMutex<Bucket>,
 }
 
 struct Bucket {
@@ -18,11 +17,13 @@ struct Bucket {
 }
 
 impl RateLimiter {
+    /// Create a new rate limiter with `rps` tokens per second and a
+    /// burst capacity of `burst`.
     pub fn new(rps: u32, burst: u32) -> Self {
         Self {
             rps: rps as f64,
             burst: burst as f64,
-            tokens: Mutex::new(Bucket {
+            tokens: PlMutex::new(Bucket {
                 tokens: burst as f64,
                 last: Instant::now(),
             }),
@@ -37,7 +38,7 @@ impl RateLimiter {
     /// Try to take `n` tokens. Returns `true` if the bucket had enough.
     pub fn try_take_n(&self, n: u32) -> bool {
         let n = n as f64;
-        let mut g = self.tokens.lock().unwrap();
+        let mut g = self.tokens.lock();
         let now = Instant::now();
         let elapsed = now.duration_since(g.last).as_secs_f64();
         g.tokens = (g.tokens + elapsed * self.rps).min(self.burst);
@@ -51,11 +52,13 @@ impl RateLimiter {
     }
 }
 
-/// PlMutex re-export for callers that want to share state under a
-/// `parking_lot` mutex.
+/// Shared rate limiter — wrap a `RateLimiter` in an `Arc`.
 pub type SharedRateLimiter = std::sync::Arc<RateLimiter>;
 
 /// Per-connection + per-topic rate limit table.
+///
+/// Maps a string key to its own `RateLimiter`, lazily creating
+/// limiters on first access.
 pub struct RateLimitTable {
     inner: PlMutex<std::collections::HashMap<String, std::sync::Arc<RateLimiter>>>,
 }
@@ -67,6 +70,7 @@ impl Default for RateLimitTable {
 }
 
 impl RateLimitTable {
+    /// Create an empty rate limit table.
     pub fn new() -> Self {
         Self {
             inner: PlMutex::new(std::collections::HashMap::new()),
