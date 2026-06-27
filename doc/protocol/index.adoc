@@ -447,3 +447,107 @@ Each topic carries a `TopicProfile` with these policies:
 - No control characters.
 - Must not start with `$` (reserved for system topics).
 - Recommended convention: `/`‑delimited hierarchy (`room/{id}`, `user/{id}`, `org/{id}`).
+
+== RemoteBroker Wire Protocol (Gateway ↔ Broker)
+
+The `RemoteBroker` communicates with an external broker node over a single TCP connection
+using length‑prefixed CBOR frames.  The `WireMsg` enum has 32 variants covering all
+`Broker` trait methods plus push delivery.
+
+=== Wire Format
+
+[source,text]
+----
++--------+--------+--------+--------+--------+--------+--------+--------+
+|       length (u32 big-endian)        |              CBOR payload       |
++--------+--------+--------+--------+--------+--------+--------+--------+
+|                              ... CBOR payload ...                      |
++--------+--------+--------+--------+--------+--------+--------+--------+
+----
+
+=== Request Variants (Gateway → Broker)
+
+[cols="2,5a",options="header"]
+|===
+| Variant | Fields
+
+| `Publish`
+| `frame: Frame`
+
+| `Subscribe`
+| `topic: String`, `intent: SubscribeIntent`, `sink_id: u64`
+
+| `Unsubscribe`
+| `id: u64`
+
+| `DropSink`
+| `sink_id: u64`
+
+| `Replay`
+| `topic: String`, `from: i64`, `to: i64`
+
+| `Snapshot`
+| `topic: String`
+
+| `SubscriberCount`
+| `topic: String`
+
+| `HeadOffset`
+| `topic: String`
+|===
+
+=== Response Variants (Broker → Gateway)
+
+[cols="2,5a",options="header"]
+|===
+| Variant | Fields
+
+| `PublishResult`
+| `outcome: PublishOutcome`
+
+| `SubscribeResult`
+| `id: u64`
+
+| `UnsubscribeResult`
+| `ok: bool`
+
+| `DropSinkResult`
+| `count: usize`
+
+| `ReplayResult`
+| `entries: Vec<Bytes>`
+
+| `SnapshotResult`
+| `snapshot: Option<StoredSnapshot>`
+
+| `SubscriberCountResult`
+| `count: usize`
+
+| `HeadOffsetResult`
+| `offset: i64`
+
+| `Error`
+| `code: String`, `message: String`
+|===
+
+=== Push Variants (Broker → Gateway, async)
+
+[cols="2,5a",options="header"]
+|===
+| Variant | Fields
+
+| `Deliver`
+| `sink_id: u64`, `topic: String`, `payload: Bytes`
+|===
+
+=== Implementing a Broker Node
+
+Any language that can speak framed CBOR over TCP can implement the broker side.
+The expected behaviour per request:
+
+- `Publish` → validate, dedupe, allocate offset, append log, fanout to subscribers,
+  return `PublishResult`.
+- `Subscribe` → register the sink, return `SubscribeResult` with an id.
+- `Deliver` (push) → sent from broker to gateway when a subscribed topic receives
+  a message.  The gateway routes it to the local `FanoutSink`.
+

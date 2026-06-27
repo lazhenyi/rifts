@@ -13,6 +13,8 @@
 [source,sh]
 ----
 cargo add rifts
+# With persistent storage:
+cargo add rifts --features sled
 ----
 
 == Hello World: a minimal server
@@ -27,19 +29,16 @@ use tokio::sync::Notify;
 
 #[tokio::main]
 async fn main() -> rifts::Result<()> {
-    // A Notify signal to trigger graceful shutdown.
     let shutdown = Arc::new(Notify::new());
     let shutdown_sig = shutdown.clone();
 
-    // Ctrl-C handler: notify the server to drain.
     tokio::spawn(async move {
         tokio::signal::ctrl_c().await.ok();
         shutdown_sig.notify_one();
     });
 
-    // Build and run the server.
     RiftServer::builder()
-        .websocket_transport()      // enable standalone WebSocket
+        .websocket_transport()
         .build()?
         .run("127.0.0.1:9000".parse().unwrap(), shutdown)
         .await?;
@@ -55,13 +54,86 @@ Step 2 — run it:
 cargo run
 ----
 
-The server is now listening on `ws://127.0.0.1:9000`.  You can connect with any WebSocket
-client that speaks the Rift/1 binary frame format.
+The server is now listening on `ws://127.0.0.1:9000`.
 
-== Authenticated server
+== Choosing a Broker Backend
 
-By default the server uses `TokenAuth` — an in‑memory token store suitable for
-testing and single‑process deployments:
+`RiftServer::builder()` creates a default `InMemoryBroker` — single‑process, no persistence.
+You can swap in other brokers:
+
+[source,rust]
+----
+use std::sync::Arc;
+use rifts::broker::{InMemoryBroker, RemoteBroker, ActorBroker};
+
+// --- Option 1: Default (in‑memory, no persistence) ---
+let server = RiftServer::builder()
+    .websocket_transport()
+    .build()?;
+
+// --- Option 2: Remote broker (connect to an external node over TCP) ---
+let broker = RemoteBroker::connect("192.168.1.10:9200".parse()?).await?;
+let server = RiftServer::builder()
+    .websocket_transport()
+    .broker(Arc::new(broker))
+    .build()?;
+
+// --- Option 3: Actor‑based broker (per‑topic tasks, in‑process) ---
+use rifts::actor::TopicRegistry;
+use rifts::storage::{MemoryOffsetStore, MemoryLogStore, MemoryDedupeStore, MemorySnapshotStore};
+use std::time::Duration;
+
+let registry = TopicRegistry::new(
+    Arc::new(MemoryOffsetStore::new()),
+    Arc::new(MemoryLogStore::new()),
+    Arc::new(MemoryDedupeStore::new()),
+    Arc::new(MemorySnapshotStore::new()),
+    rifts::TopicProfile::default(),
+    Duration::from_secs(60),
+);
+let broker = ActorBroker::new(Arc::new(registry));
+let server = RiftServer::builder()
+    .websocket_transport()
+    .broker(Arc::new(broker))
+    .build()?;
+----
+
+== Sled Persistence (feature `sled`)
+
+Enable durable storage that survives process restarts:
+
+[source,rust]
+----
+use std::sync::Arc;
+use rifts::storage::{
+    SledEngine, SledOffsetStore, SledLogStore,
+    SledDedupeStore, SledSnapshotStore,
+};
+
+// Open sled database.
+let db = sled::Config::new()
+    .path("/var/lib/rifts/broker")
+    .open()?;
+
+let offsets = SledOffsetStore::new(SledEngine::new(db.open_tree(b"offsets")?));
+let log     = SledLogStore::new(SledEngine::new(db.open_tree(b"log")?));
+let dedupe  = SledDedupeStore::new(SledEngine::new(db.open_tree(b"dedupe")?));
+let snaps   = SledSnapshotStore::new(SledEngine::new(db.open_tree(b"snapshots")?));
+
+// Create a persistent broker.
+let broker = InMemoryBroker::with_stores(
+    rifts::TopicProfile::default(),
+    std::time::Duration::from_secs(60),
+    65_536,
+    offsets, log, dedupe, snaps,
+);
+let server = RiftServer::builder()
+    .websocket_transport()
+    .broker(Arc::new(broker))
+    .build()?;
+----
+
+== Authenticated Server
 
 [source,rust]
 ----
@@ -84,9 +156,7 @@ let server = RiftServer::builder()
     .build()?;
 ----
 
-For production, implement the `AuthProvider` trait to call out to your IdP.
-
-== Customising server parameters
+== Customising Server Parameters
 
 [source,rust]
 ----
@@ -94,9 +164,9 @@ use std::time::Duration;
 use rifts::ServerConfig;
 
 let config = ServerConfig {
-    max_payload_bytes:        256 * 1024,    // 256 KiB
+    max_payload_bytes:        256 * 1024,
     max_topics_per_connection: 64,
-    max_send_queue_bytes:      2 * 1024 * 1024,  // 2 MiB
+    max_send_queue_bytes:      2 * 1024 * 1024,
     idle_timeout:              Duration::from_secs(120),
     ..ServerConfig::default()
 };
@@ -107,10 +177,9 @@ let server = RiftServer::builder()
     .build()?;
 ----
 
-See `ServerConfig` for the full set of tunables — all fields carry
-defaults sourced from the Rift/1 spec §27.1.
+See `ServerConfig` for the full set of tunables — all fields carry defaults from the Rift/1 spec §27.1.
 
-== Framework integration
+== Framework Integration
 
 === Axum
 
@@ -125,7 +194,6 @@ use rifts::transport::axum::axum_ws_handler;
 async fn ws_handler(ws: WebSocketUpgrade) -> impl axum::response::IntoResponse {
     ws.on_upgrade(move |socket| axum_ws_handler(socket, |conn| async move {
         // conn is a Box<dyn TransportConnection>
-        // spawn your Rift connection handler here
     }))
 }
 ----
@@ -134,7 +202,6 @@ async fn ws_handler(ws: WebSocketUpgrade) -> impl axum::response::IntoResponse {
 
 [source,rust]
 ----
-// Cargo.toml
 // rifts = { version = "0.1", default-features = false, features = ["actix-web"] }
 
 use actix_web::{web, HttpRequest, HttpResponse};
@@ -149,6 +216,6 @@ async fn ws_route(req: HttpRequest, stream: web::Payload) -> HttpResponse {
 
 == Next Steps
 
-- xref:architecture.adoc[Architecture] — understand the four‑layer model.
-- xref:examples.adoc[Examples] — chat server, pubsub, and more.
+- xref:architecture.adoc[Architecture] — full crate map, actor runtime, RemoteBroker.
+- xref:examples.adoc[Examples] — Sled, actors, custom AuthProvider.
 - xref:protocol/index.adoc[Protocol Reference] — wire format and semantics.

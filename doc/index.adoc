@@ -1,6 +1,6 @@
 = Rift Realtime Protocol / 1.0 (rifts)
 Zhenyi <434836402@qq.com>
-v0.1.0, 2025-06-27
+v0.1.0, 2025-06-28
 :toc: left
 :toclevels: 3
 :sectanchors:
@@ -16,7 +16,27 @@ image:https://img.shields.io/badge/License-MIT-blue.svg[License,link=LICENSE-MIT
 The `rifts` crate is the canonical Rust server implementation of the **Rift Realtime Protocol (Rift/1)** —
 a bidirectional messaging protocol for real‑time applications.  Rift/1 replaces raw WebSocket +
 event‑string patterns with explicit semantics: eight message classes, offset‑based resume,
-topic‑level QoS, schema‑first events, and protocol‑level backpressure.
+topic‑level QoS, schema‑first events, protocol‑level backpressure, and a pluggable persistence
+layer.
+
+== Project Status
+
+[cols="2,5a",options="header"]
+|===
+| Stat | Value
+
+| Lines of Rust
+| ~11,600 across 72 source files
+
+| Tests
+| 125 (116 unit + 7 integration + 2 doctests)
+
+| Crate features
+| `websocket` (default), `sled`, framework adapters (`axum`, `actix-web`, `warp`, `ntex`)
+
+| Minimum Rust
+| 1.85 (edition 2024)
+|===
 
 == Documentation Map
 
@@ -28,14 +48,15 @@ topic‑level QoS, schema‑first events, and protocol‑level backpressure.
 | Build, configure, and run a Rift/1 server in under ten minutes.
 
 | xref:architecture.adoc[Architecture]
-| Crate layout, layer model, connection lifecycle, and module‑by‑module walkthrough.
+| Full crate map (72 files), four‑layer model, broker dataflow, actor runtime,
+  RemoteBroker TCP protocol, persistence layer.
 
 | xref:protocol/index.adoc[Protocol Reference]
-| Wire format, frame envelope, message classes, topic profiles, ack, and error codes —
-  derived from the upstream specification.
+| Wire format, frame envelope, message classes, topic profiles, ack, and error codes.
 
 | xref:examples.adoc[Examples]
-| Runnable examples: chat server, pubsub broker, framework adapters.
+| Chat server, authenticated pub/sub, direct broker usage, Sled persistence,
+  actor‑based broker, RemoteBroker, custom AuthProvider.
 |===
 
 == Crate Features
@@ -46,6 +67,11 @@ topic‑level QoS, schema‑first events, and protocol‑level backpressure.
 
 | `websocket` *(default)*
 | Standalone WebSocket transport (tokio‑tungstenite).  No framework dependency.
+
+| `sled`
+| Persistent embedded storage via `sled::Db`.  Enables `SledEngine`, `SledBroker`,
+  `SledOffsetStore`, `SledLogStore`, `SledDedupeStore`, `SledSnapshotStore`.
+  Restart the server and offsets/logs survive.
 
 | `axum`
 | Accept Rift/1 connections from `axum::extract::ws::WebSocket`.
@@ -71,14 +97,28 @@ topic‑level QoS, schema‑first events, and protocol‑level backpressure.
 [source,sh]
 ----
 cargo add rifts
+# With persistent storage:
+cargo add rifts --features sled
 ----
 
-Or in `Cargo.toml`:
+== Quick Start
 
-[source,toml]
+[source,rust]
 ----
-[dependencies]
-rifts = "0.1"
+use rifts::RiftServer;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .build()?
+        .run("127.0.0.1:9000".parse().unwrap(), shutdown)
+        .await?;
+    Ok(())
+}
 ----
 
 == License

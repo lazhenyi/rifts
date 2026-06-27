@@ -3,51 +3,39 @@
 :toc: left
 :toclevels: 2
 
-== Chat Server
-
-A complete multi‑room chat server using `rifts` with the WebSocket transport.
+== Chat Server (~30 lines)
 
 [source,rust]
 ----
 use std::sync::Arc;
-use rifts::{RiftServer, Broker, SubscribeIntent};
+use rifts::RiftServer;
 use tokio::sync::Notify;
 
 #[tokio::main]
 async fn main() -> rifts::Result<()> {
     let shutdown = Arc::new(Notify::new());
-    let server = RiftServer::builder()
+    RiftServer::builder()
         .websocket_transport()
-        .build()?;
-
-    // Run the server; each connecting client goes through the
-    // handshake, then publishes and subscribes to room/* topics.
-    server.run("0.0.0.0:9000".parse().unwrap(), shutdown).await?;
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
     Ok(())
 }
 ----
 
-Only ~30 lines.  The server handles handshake, auth, topic creation, fanout,
-ack, replay, and backpressure automatically.
-
 == Authenticated Pub/Sub
-
-A server with token‑based auth and a custom topic profile for rate‑limited rooms:
 
 [source,rust]
 ----
 use std::sync::Arc;
-use std::time::Duration;
 use rifts::{
-    RiftServer, ServerConfig, TopicProfile, RetentionPolicy, OrderingPolicy,
+    RiftServer, ServerConfig, AuthMode,
     session::{TokenAuth, AuthContext, ClientId},
-    AuthMode,
 };
 use tokio::sync::Notify;
 
 #[tokio::main]
 async fn main() -> rifts::Result<()> {
-    // In-memory token store.
     let auth = Arc::new(TokenAuth::new());
     auth.register("admin-token", AuthContext {
         client_id: ClientId::new("admin"),
@@ -56,16 +44,11 @@ async fn main() -> rifts::Result<()> {
         hints:     Default::default(),
     });
 
-    let config = ServerConfig {
-        max_payload_bytes: 128 * 1024,
-        ..ServerConfig::default()
-    };
-
     let shutdown = Arc::new(Notify::new());
     RiftServer::builder()
         .websocket_transport()
         .auth(auth)
-        .config(config)
+        .config(ServerConfig::default())
         .build()?
         .run("0.0.0.0:9000".parse().unwrap(), shutdown)
         .await?;
@@ -74,47 +57,155 @@ async fn main() -> rifts::Result<()> {
 }
 ----
 
-== Direct Broker Usage (no network)
+== Sled Persistence
 
-You can use the in‑memory broker directly without any transport — useful for
-unit tests, non‑networked services, or pipelines:
+[source,rust]
+----
+// Cargo.toml
+// rifts = { version = "0.1", features = ["sled"] }
+
+use std::sync::Arc;
+use std::time::Duration;
+use rifts::{
+    RiftServer, TopicProfile,
+    broker::InMemoryBroker,
+    storage::{
+        SledEngine, SledOffsetStore, SledLogStore,
+        SledDedupeStore, SledSnapshotStore,
+    },
+};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let db = sled::Config::new()
+        .path("/var/lib/rifts/broker")
+        .open()?;
+
+    let broker = InMemoryBroker::with_stores(
+        TopicProfile::default(),
+        Duration::from_secs(60),
+        65_536,
+        SledOffsetStore::new(SledEngine::new(db.open_tree(b"offsets")?)),
+        SledLogStore::new(SledEngine::new(db.open_tree(b"log")?)),
+        SledDedupeStore::new(SledEngine::new(db.open_tree(b"dedupe")?)),
+        SledSnapshotStore::new(SledEngine::new(db.open_tree(b"snapshots")?)),
+    );
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .broker(Arc::new(broker))
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== Actor‑Based Broker (per‑topic parallelism)
 
 [source,rust]
 ----
 use std::sync::Arc;
 use std::time::Duration;
 use rifts::{
-    InMemoryBroker, Broker, TopicProfile, RetentionPolicy,
-    SubscribeIntent, Frame, FrameType, FrameFlags, Codec,
+    RiftServer, TopicProfile,
+    actor::TopicRegistry,
+    broker::ActorBroker,
+    storage::{
+        MemoryOffsetStore, MemoryLogStore,
+        MemoryDedupeStore, MemorySnapshotStore,
+    },
 };
-use bytes::Bytes;
+use tokio::sync::Notify;
 
-#[test]
-fn test_broker_pub_sub() {
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let registry = Arc::new(TopicRegistry::new(
+        Arc::new(MemoryOffsetStore::new()),
+        Arc::new(MemoryLogStore::new()),
+        Arc::new(MemoryDedupeStore::new()),
+        Arc::new(MemorySnapshotStore::new()),
+        TopicProfile::default(),
+        Duration::from_secs(60),
+    ));
+
+    let broker = ActorBroker::new(registry);
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .broker(Arc::new(broker))
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== RemoteBroker (Gateway ↔ External Broker Node)
+
+[source,rust]
+----
+use std::sync::Arc;
+use rifts::{RiftServer, broker::RemoteBroker};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let broker = RemoteBroker::connect("192.168.1.10:9200".parse()?).await?;
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .broker(Arc::new(broker))
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+The broker node must speak the `WireMsg` CBOR protocol defined in
+`src/broker/wire.rs`.  Any language / stack can implement it.
+
+== Direct Broker Usage (no network)
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+use bytes::Bytes;
+use rifts::{
+    broker::{InMemoryBroker, Broker, SubscribeIntent},
+    frame::{Frame, FrameType, Codec},
+    TopicProfile, RetentionPolicy,
+};
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
     let profile = TopicProfile {
         retention: RetentionPolicy::Count(100),
         ..TopicProfile::default()
     };
-    let broker = InMemoryBroker::new(profile, Duration::from_secs(60));
+    let broker = InMemoryBroker::new(profile, Duration::from_secs(60), 65_536);
 
-    // Subscribe a counting sink.
-    let sink = Arc::new(CountingSink::new(1));
-    broker.subscribe("test", SubscribeIntent::Live, sink.clone()).unwrap();
-
-    // Publish.
     let frame = Frame {
         frame_type: FrameType::Data,
         codec:      Codec::Json,
         topic:      Some("test".into()),
         message_id: Some("msg-1".into()),
-        event:      Some("greeting".into()),
         payload:    Some(Bytes::from_static(b"hello")),
         ..Frame::default()
     };
-    let outcome = broker.publish(&frame).unwrap();
-    assert_eq!(outcome.offset, 1);
-    assert!(!outcome.duplicate);
-    assert_eq!(sink.count(), 1);
+
+    let outcome = broker.publish(&frame).await?;
+    println!("published at offset {}", outcome.offset);
+    Ok(())
 }
 ----
 
@@ -123,10 +214,7 @@ fn test_broker_pub_sub() {
 [source,rust]
 ----
 // Cargo.toml
-// [dependencies]
 // rifts = { version = "0.1", default-features = false, features = ["axum"] }
-// axum = "0.8"
-// tokio = { version = "1", features = ["full"] }
 
 use axum::{Router, routing::get, extract::ws::WebSocketUpgrade, response::IntoResponse};
 use rifts::transport::axum::AxumWsConnection;
@@ -134,8 +222,7 @@ use rifts::transport::axum::AxumWsConnection;
 async fn ws_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {
     ws.on_upgrade(|socket| async move {
         let conn = AxumWsConnection::new(socket);
-        // Pass `conn` to your Rift connection handler.
-        // Connection::new(…).run(conn).await?;
+        // Pass conn to your Rift connection handler.
     })
 }
 
@@ -148,8 +235,6 @@ async fn main() {
 ----
 
 == Custom AuthProvider
-
-Implement the `AuthProvider` trait for your own identity provider:
 
 [source,rust]
 ----
@@ -171,10 +256,7 @@ impl AuthProvider for MyAuth {
         let token = token.ok_or_else(||
             RiftError::Auth(rifts::error::AuthReject::Required)
         )?;
-
-        // Validate JWT against JWKS endpoint.
         let claims = validate_jwt(token, &self.jwks_url).await?;
-
         Ok(AuthContext {
             client_id: ClientId::new(claims.sub),
             claims:    serde_json::to_value(&claims).unwrap(),
@@ -183,8 +265,7 @@ impl AuthProvider for MyAuth {
         })
     }
 
-    async fn revoke(&self, client_id: &ClientId) -> Result<()> {
-        // Call revocation endpoint.
+    async fn revoke(&self, _client_id: &ClientId) -> Result<()> {
         Ok(())
     }
 }

@@ -13,18 +13,7 @@ Session::    Identity, connection lifetime, recovery, heartbeat, flow‑control 
 Message::    Message type, reliability, ordering, ack, replay, priority, TTL.
 Topic::       Subscription, publish, permission, sharding, fanout, retention, snapshot.
 
-Each layer is represented by a public module in the crate:
-
-[source]
-----
-src/transport/   → Transport abstraction + framework adapters
-src/session/     → Session lifecycle, auth, resume, offset tracking
-src/message/     → Event, Command, Reply, State, Datagram, Stream, Snapshot
-src/topic/       → Topic profiles, store, retention, ordering
-src/broker/      → In‑memory broker, router, fanout, dedupe, offsets, snapshots
-----
-
-== Crate Map
+== Full Crate Map (72 files, ~11,600 LOC)
 
 [cols="2m,1m,6a",options="header"]
 |===
@@ -32,11 +21,11 @@ src/broker/      → In‑memory broker, router, fanout, dedupe, offsets, snapsh
 
 | `frame`
 | Message
-| `Frame` envelope, `FrameType`, `FrameFlags`, `Codec`, `Priority`.
+| `Frame` envelope, `FrameType`, `FrameFlags`, `Codec`, `Priority`.  All `Serialize`/`Deserialize` for CBOR wire.
 
 | `codec`
 | Transport
-| JSON + CBOR codecs.  Negotiated during handshake.
+| JSON + CBOR codecs.  `Codec` trait with `encode_value`/`decode_value`.  Negotiated during handshake.
 
 | `protocol`
 | Session
@@ -48,15 +37,23 @@ src/broker/      → In‑memory broker, router, fanout, dedupe, offsets, snapsh
 
 | `topic`
 | Topic
-| `TopicProfile`, `RetentionPolicy`, `OrderingPolicy`, `TopicStore` (DashMap‑backed + Arc‑shared).
+| `TopicProfile`, `RetentionPolicy`, `OrderingPolicy`, `TopicStore` (Arc‑shared DashMap).
 
 | `session`
 | Session
-| `Session` (ULID‑based), `SessionState` FSM, `AuthProvider` trait, `ResumeManager`, `OffsetTracker`.
+| `Session` (ULID), `SessionState` FSM, `AuthProvider` trait, `ResumeManager`, `OffsetTracker`.
 
 | `broker`
 | Topic
-| `InMemoryBroker`, `TopicRouter`, `FanoutEngine`, `DedupeStore`, `OffsetStore`, `SnapshotStore`.
+| `Broker` trait (async), `InMemoryBroker<O,L,D,S>`, `RemoteBroker` (TCP), `ActorBroker` (actors), `WireMsg` CBOR protocol, `FanoutEngine`, `DedupeStore`, `OffsetStore`, `SnapshotStore`.
+
+| `actor`
+| Topic
+| `TopicActor` (per‑topic task + catch_unwind), `TopicRegistry` (lazy spawn), `LocalActorRef<M>`, `RemoteActorRef<M>` (stub), `TopicMsg` enum (8 variants).
+
+| `storage`
+| Topic
+| `StorageEngine` trait, `MemoryEngine`, `SledEngine` (sled::Tree), `OffsetStore`/`LogStore`/`DedupeStore`/`SnapshotStore` traits + Memory + Sled impls, key encoding helpers.
 
 | `transport`
 | Transport
@@ -80,7 +77,7 @@ src/broker/      → In‑memory broker, router, fanout, dedupe, offsets, snapsh
 
 | `metrics`
 | —
-| Process‑local atomic counters (connections, messages, backpressure, latency).  Export‑ready structure.
+| Process‑local atomic counters (connections, messages, backpressure).
 
 | `trace`
 | Message
@@ -113,64 +110,156 @@ Client                                Server
   |                                      |
 ----
 
-=== Handshake Flow in `Connection::handshake()`
+== Broker Architecture
 
-1. `read_frame()` — expect a `Control`‑type `hello` frame.
-2. Decode `Hello` payload — extract protocol, version, codecs, auth_modes, token, `last_offsets`.
-3. `negotiate_major(client_major)` — accept only major version 1.
-4. `negotiate(server_codecs, client_codecs)` — pick JSON or CBOR.
-5. `auth_provider.authenticate(mode, token)` — produce `AuthContext { client_id, claims }`.
-6. `ResumeManager::evaluate(...)` — decide `FullResume | PartialResume | SnapshotRequired | ColdStart`.
-7. Write `welcome` + `ready` frames synchronously (before spawning reader/writer tasks).
+The `Broker` trait is the central abstraction — all topic operations go through it:
 
-== In‑Memory Broker
+[source,rust]
+----
+#[async_trait]
+pub trait Broker: Send + Sync {
+    async fn publish(&self, frame: &Frame) -> Result<PublishOutcome>;
+    async fn subscribe(&self, topic: &str, intent: SubscribeIntent, sink: ConnectionSink)
+        -> Result<SubscriptionId>;
+    async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
+    async fn drop_sink(&self, sink_id: u64) -> usize;
+    async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>>;
+    async fn snapshot(&self, topic: &str) -> Result<Option<StoredSnapshot>>;
+    async fn subscriber_count(&self, topic: &str) -> usize;
+    async fn head_offset(&self, topic: &str) -> i64;
+}
+----
 
-The `InMemoryBroker` is the default broker.  It wires together six stores:
+Three implementations ship with the crate:
+
+[cols="2,3,5a",options="header"]
+|===
+| Impl | Use Case | Key Property
+
+| `InMemoryBroker<O,L,D,S>`
+| Single‑process, default
+| Generic over storage backends.  `DefaultBroker` = all memory.  `SledBroker` = all sled.
+
+| `RemoteBroker`
+| Gateway ↔ external broker node
+| Thin RPC adapter over framed CBOR TCP.  Users provide the broker node in any language.
+
+| `ActorBroker`
+| In‑process, per‑topic parallelism
+| Each topic is an independent Tokio task.  No locks — actor loop is single‑threaded.
+|===
+
+=== InMemoryBroker Dataflow
 
 [source]
 ----
-  publish ─→ DedupeStore ─→ OffsetStore ─→ TopicStore.append()
-                     │                          │
-                     │                          ▼
-                     │                    FanoutEngine.deliver()
-                     │                          │
-                     │                ┌─────────┴──────────┐
-                     │                │  subscriber sinks   │
-                     │                │  (mpsc → writer     │
-                     │                │   task → WebSocket) │
-                     │                └────────────────────┘
-                     ▼
-              (duplicate → skip fanout)
+  publish ─→ validate ─→ router.route() ─→ DedupeStore.check_and_record()
+                                              │
+                                              ├─ duplicate → skip fanout
+                                              │
+                                              ▼
+                                         OffsetStore.alloc()
+                                              │
+                                              ▼
+                                         LogStore.append(entry, retention)
+                                              │
+                                              ▼
+                                         FanoutEngine.deliver()
+                                              │
+                                    ┌─────────┴──────────┐
+                                    │  subscriber sinks   │
+                                    │  (mpsc → writer     │
+                                    │   task → WebSocket) │
+                                    └────────────────────┘
 ----
 
-- `TopicStore` — `Arc<DashMap<String, Arc<TopicEntry>>>`; shared between broker and router.
-- `DedupeStore` — keyed by `(topic, dedupe_key)`; sweep drops expired entries.
-- `OffsetStore` — atomic monotonic offset per topic.
-- `FanoutEngine` — subscription table (topic → sinks); direct fanout for small topics.
-- `SnapshotStore` — latest snapshot per topic; aids resume.
-- `LocalRouter` — resolves topic name → `Arc<TopicEntry>`; calls `get_or_create`.
+=== RemoteBroker Wire Protocol
 
-== Transport Architecture
+Gateway and external broker node communicate over a single TCP connection using
+length‑prefixed CBOR frames.  The `WireMsg` enum has 32 variants covering all
+`Broker` trait methods plus push delivery:
 
-The `Transport` / `TransportListener` / `TransportConnection` traits are the abstraction
-boundary.  Each transport binding provides independent read / write halves so that the
-server’s reader and writer tasks never contend on a mutex.
+[source,rust]
+----
+pub enum WireMsg {
+    Publish { frame: Frame },
+    Subscribe { topic: String, intent: SubscribeIntent, sink_id: u64 },
+    Unsubscribe { id: u64 },
+    DropSink { sink_id: u64 },
+    Replay { topic: String, from: i64, to: i64 },
+    Snapshot { topic: String },
+    // ... responses, errors, and Deliver push messages
+}
+----
 
-*Standalone WebSocket* (`features = ["websocket"]`)::
-  `tokio-tungstenite` is split with `WebSocketStream::split()` at accept time.
-  The reader half is used by the reader task; the writer half is wrapped in
-  `Arc<tokio::sync::Mutex<SplitSink>>` and shared between the handshake writer
-  and the writer task.
+Each request gets a matching response variant.  Fanout uses `Deliver` push messages
+from broker to gateway.  The wire codec is `WireCodec` — a `tokio_util::codec::Decoder`
++ `Encoder` pair.
 
-*Framework adapters* (`features = ["axum"]`, etc.)::
-  Each adapter implements `TransportConnection` for the framework’s WebSocket type
-  (axum uses `Arc<tokio::sync::Mutex<WebSocket>>`; actix and ntex use a channel bridge
-  because their WS types are `!Send`).
+=== Actor Runtime
+
+For users who want in‑process per‑topic parallelism without a network hop:
+
+[source]
+----
+┌────────────────────────────────────────────┐
+│              TopicRegistry                 │
+│  DashMap<String, LocalActorRef<TopicMsg>>  │
+│                                            │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
+│  │ room/1   │  │ room/2   │  │ user/42  │ │
+│  │ actor    │  │ actor    │  │ actor    │ │
+│  │ (tokio   │  │ (tokio   │  │ (tokio   │ │
+│  │  task)   │  │  task)   │  │  task)   │ │
+│  └──────────┘  └──────────┘  └──────────┘ │
+└────────────────────────────────────────────┘
+----
+
+- `TopicActor` owns one topic's state — `OffsetStore`, `LogStore`, `DedupeStore`,
+  `SnapshotStore`, subscriber map.  The actor loop processes one `TopicMsg` at a time.
+- `catch_unwind` wraps each message handler — one bad message cannot crash the topic.
+- If the actor task dies, `TopicRegistry::get_or_spawn` detects the closed channel
+  and spawns a fresh actor (lazy recreate).
+- `ActorBroker` implements `Broker` by delegating to `TopicRegistry`.
+
+== Persistence Layer
+
+[cols="2,5a",options="header"]
+|===
+| Trait | Key Methods | Memory Impl | Sled Impl
+
+| `StorageEngine`
+| `get`, `put`, `delete`, `scan_prefix`
+| `MemoryEngine` (DashMap)
+| `SledEngine` (sled::Tree)
+
+| `OffsetStore`
+| `alloc(topic) -> i64`, `head(topic) -> i64`
+| `MemoryOffsetStore`
+| `SledOffsetStore`
+
+| `LogStore`
+| `append(topic, entry, retention)`, `range(topic, from, to) -> Vec<LogEntry>`
+| `MemoryLogStore`
+| `SledLogStore`
+
+| `DedupeStore`
+| `check_and_record(topic, key, window) -> bool`, `sweep() -> usize`
+| `MemoryDedupeStore`
+| `SledDedupeStore`
+
+| `SnapshotStore`
+| `capture(topic, store, ttl)`, `get(topic)`, `list()`
+| `MemorySnapshotStore`
+| `SledSnapshotStore`
+|===
+
+Each sled store uses a separate `sled::Tree` within the same `Db` file, keyed with
+`\x00`‑separated topic prefixes for efficient `scan_prefix` range scans.
 
 == Error Model
 
-Errors use `thiserror` deeply.  The top‑level `RiftError` composes six typed
-sub‑enums:
+Errors use `thiserror` deeply.  The top‑level `RiftError` composes six typed sub‑enums:
 
 [source,rust]
 ----
@@ -186,13 +275,13 @@ pub enum RiftError {
 }
 ----
 
-Large error sources (tungstenite, ciborium, serde_json, etc.) are boxed inside
-a `BoxedStdError` wrapper so the `Result` type stays small on the stack.
+Large error sources (tungstenite, ciborium, serde_json) are boxed inside a `BoxedStdError`
+wrapper so the `Result` type stays small on the stack.
 
 == Backpressure
 
-`BackpressureController` guards the per‑connection send queue with an atomic
-CAS‑loop enqueue.  When the queue exceeds the high‑water mark (90% of `max_send_queue_bytes`),
+`BackpressureController` guards the per‑connection send queue with an atomic CAS‑loop
+enqueue.  When the queue exceeds the high‑water mark (90% of `max_send_queue_bytes`),
 the controller selects a strategy:
 
 [cols="2,5a",options="header"]
@@ -222,13 +311,14 @@ the controller selects a strategy:
 
 The crate ships three test suites:
 
-. *Unit tests* (95) — inline `#[cfg(test)] mod tests` in every module.
+. *Unit tests* (116) — inline `#[cfg(test)] mod tests` in every module.
 . *Integration tests* (7) — `tests/integration.rs`: frame‑encoding round‑trip, codec, auth.
-. *Doc tests* (1) — `src/lib.rs` quick‑start example.
+. *Doc tests* (2) — `src/lib.rs` quick‑start example, `src/actor/mod.rs` actor example.
 
 Run them all with:
 
 [source,sh]
 ----
 cargo test
+cargo test --features sled
 ----
