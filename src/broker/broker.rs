@@ -2,12 +2,10 @@
 //!
 //! Concrete implementations live in sibling modules:
 //! - [`InMemoryBroker`](crate::broker::InMemoryBroker) — single-process, no persistence.
-//! - Sled-backed (Phase 1).
-//! - [`RemoteBroker`] (Phase 2a).
-//! - [`ActorBroker`] (Phase 2b).
+//! - [`RemoteBroker`] — TCP-based distributed broker (Phase 2a).
+//! - [`ActorBroker`] — actor-based broker (Phase 2b).
 
-use std::sync::Arc;
-
+use async_trait::async_trait;
 use bytes::Bytes;
 
 use crate::broker::fanout::{ConnectionSink, SubscribeIntent, SubscriptionId};
@@ -15,7 +13,7 @@ use crate::error::Result;
 use crate::frame::Frame;
 
 /// The outcome of publishing a message.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PublishOutcome {
     /// The offset assigned by the broker.
     pub offset: i64,
@@ -23,18 +21,14 @@ pub struct PublishOutcome {
     pub duplicate: bool,
 }
 
-/// Broker trait.
-///
-/// All topic operations — publish, subscribe, replay, snapshot —
-/// go through this trait.  Implementations range from the built-in
-/// [`InMemoryBroker`](crate::broker::InMemoryBroker) to user-provided
-/// remote or actor-based brokers.
+/// Broker trait — all topic operations are async.
+#[async_trait]
 pub trait Broker: Send + Sync {
     /// Publish a message to a topic.
-    fn publish(&self, frame: &Frame) -> Result<PublishOutcome>;
+    async fn publish(&self, frame: &Frame) -> Result<PublishOutcome>;
 
     /// Subscribe a connection sink to a topic.
-    fn subscribe(
+    async fn subscribe(
         &self,
         topic: &str,
         intent: SubscribeIntent,
@@ -42,23 +36,22 @@ pub trait Broker: Send + Sync {
     ) -> Result<SubscriptionId>;
 
     /// Cancel a subscription.
-    fn unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
+    async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool>;
 
     /// Remove all subscriptions belonging to a sink.
-    fn drop_sink(&self, sink_id: u64) -> usize;
+    async fn drop_sink(&self, sink_id: u64) -> usize;
 
-    /// Replay messages in `[from, to]` on `topic`. The returned
-    /// frames are already serialized and ready to send.
-    fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>>;
+    /// Replay messages in `[from, to]` on `topic`.
+    async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>>;
 
     /// Fetch a snapshot for `topic`, if one is available.
-    fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>>;
+    async fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>>;
 
     /// Number of subscribers for a topic.
-    fn subscriber_count(&self, topic: &str) -> usize;
+    async fn subscriber_count(&self, topic: &str) -> usize;
 
     /// Current head offset for a topic.
-    fn head_offset(&self, topic: &str) -> i64;
+    async fn head_offset(&self, topic: &str) -> i64;
 }
 
 /// Helper: produce a serialized frame for fanout, stamping the

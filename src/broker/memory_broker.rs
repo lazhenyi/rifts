@@ -4,6 +4,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
 
@@ -159,6 +160,7 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> InMemoryBrok
     }
 }
 
+#[async_trait]
 impl<
     O: OffsetStore + 'static,
     L: LogStore + 'static,
@@ -166,7 +168,7 @@ impl<
     S: SnapshotStore + 'static,
 > Broker for InMemoryBroker<O, L, D, S>
 {
-    fn publish(&self, frame: &Frame) -> Result<PublishOutcome> {
+    async fn publish(&self, frame: &Frame) -> Result<PublishOutcome> {
         let (topic, message_id) = self.validate_publish(frame)?;
         crate::topic::store::validate_name(topic)?;
 
@@ -231,7 +233,7 @@ impl<
         Ok(PublishOutcome { offset, duplicate })
     }
 
-    fn subscribe(
+    async fn subscribe(
         &self,
         topic: &str,
         intent: SubscribeIntent,
@@ -253,7 +255,7 @@ impl<
         Ok(self.fanout.subscribe(topic, intent, sink))
     }
 
-    fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
+    async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
         if let Some(topic) = self.fanout.unsubscribe(id) {
             if let Some(entry) = self.store.get(&topic) {
                 entry.dec_subscriber();
@@ -264,7 +266,7 @@ impl<
         }
     }
 
-    fn drop_sink(&self, sink_id: u64) -> usize {
+    async fn drop_sink(&self, sink_id: u64) -> usize {
         let topics = self.fanout.drop_sink(sink_id);
         let count = topics.len();
         for topic in topics {
@@ -275,7 +277,7 @@ impl<
         count
     }
 
-    fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {
+    async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {
         // Use log store for replay.
         Ok(self
             .log
@@ -285,7 +287,7 @@ impl<
             .collect())
     }
 
-    fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>> {
+    async fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>> {
         // Capture from log store's latest state.
         if let Some(entry) = self.log.latest(topic) {
             let now = now_ms();
@@ -302,11 +304,11 @@ impl<
         }
     }
 
-    fn subscriber_count(&self, topic: &str) -> usize {
+    async fn subscriber_count(&self, topic: &str) -> usize {
         self.fanout.topic_subscriber_count(topic)
     }
 
-    fn head_offset(&self, topic: &str) -> i64 {
+    async fn head_offset(&self, topic: &str) -> i64 {
         self.offsets.head(topic)
     }
 }
@@ -353,21 +355,21 @@ mod tests {
 
     const PAYLOAD_LIMIT: usize = 65_536;
 
-    #[test]
-    fn publish_assigns_offset() {
+    #[tokio::test]
+    async fn publish_assigns_offset() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
             PAYLOAD_LIMIT,
         );
-        let out = b.publish(&make_frame("t", "m1", b"hello")).unwrap();
+        let out = b.publish(&make_frame("t", "m1", b"hello")).await.unwrap();
         assert_eq!(out.offset, 1);
-        let out2 = b.publish(&make_frame("t", "m2", b"world")).unwrap();
+        let out2 = b.publish(&make_frame("t", "m2", b"world")).await.unwrap();
         assert_eq!(out2.offset, 2);
     }
 
-    #[test]
-    fn publish_requires_topic_and_message_id() {
+    #[tokio::test]
+    async fn publish_requires_topic_and_message_id() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
@@ -375,14 +377,14 @@ mod tests {
         );
         let mut f = make_frame("t", "m1", b"x");
         f.topic = None;
-        assert!(b.publish(&f).is_err());
+        assert!(b.publish(&f).await.is_err());
         f.topic = Some("t".into());
         f.message_id = None;
-        assert!(b.publish(&f).is_err());
+        assert!(b.publish(&f).await.is_err());
     }
 
-    #[test]
-    fn publish_fans_out_to_subscribers() {
+    #[tokio::test]
+    async fn publish_fans_out_to_subscribers() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
@@ -390,13 +392,14 @@ mod tests {
         );
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
+            .await
             .unwrap();
-        b.publish(&make_frame("t", "m1", b"hi")).unwrap();
+        b.publish(&make_frame("t", "m1", b"hi")).await.unwrap();
         assert_eq!(sink.count(), 1);
     }
 
-    #[test]
-    fn publish_dedupes_within_window() {
+    #[tokio::test]
+    async fn publish_dedupes_within_window() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
@@ -404,52 +407,62 @@ mod tests {
         );
         let sink = Arc::new(CountingSink::new(1));
         b.subscribe("t", SubscribeIntent::Live, sink.clone())
+            .await
             .unwrap();
-        let out1 = b.publish(&make_frame("t", "dup", b"x")).unwrap();
-        let out2 = b.publish(&make_frame("t", "dup", b"x")).unwrap();
+        let out1 = b.publish(&make_frame("t", "dup", b"x")).await.unwrap();
+        let out2 = b.publish(&make_frame("t", "dup", b"x")).await.unwrap();
         assert!(!out1.duplicate);
         assert!(out2.duplicate);
         assert_eq!(sink.count(), 1);
     }
 
-    #[test]
-    fn replay_returns_in_range() {
+    #[tokio::test]
+    async fn replay_returns_in_range() {
         let profile = TopicProfile {
             retention: RetentionPolicy::Count(100),
             ..TopicProfile::default()
         };
         let b = DefaultBroker::new(profile, Duration::from_secs(60), PAYLOAD_LIMIT);
         for i in 1..=5 {
-            b.publish(&make_frame("t", &format!("m{i}"), b"x")).unwrap();
+            b.publish(&make_frame("t", &format!("m{i}"), b"x"))
+                .await
+                .unwrap();
         }
-        let r = b.replay("t", 2, 4).unwrap();
+        let r = b.replay("t", 2, 4).await.unwrap();
         assert_eq!(r.len(), 3);
     }
 
-    #[test]
-    fn subscribe_and_unsubscribe() {
+    #[tokio::test]
+    async fn subscribe_and_unsubscribe() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
             PAYLOAD_LIMIT,
         );
         let s = Arc::new(CountingSink::new(1));
-        let id = b.subscribe("t", SubscribeIntent::Live, s.clone()).unwrap();
-        assert!(b.unsubscribe(id).unwrap());
-        b.publish(&make_frame("t", "m1", b"x")).unwrap();
+        let id = b
+            .subscribe("t", SubscribeIntent::Live, s.clone())
+            .await
+            .unwrap();
+        assert!(b.unsubscribe(id).await.unwrap());
+        b.publish(&make_frame("t", "m1", b"x")).await.unwrap();
         assert_eq!(s.count(), 0);
     }
 
-    #[test]
-    fn drop_sink_removes_all_subs() {
+    #[tokio::test]
+    async fn drop_sink_removes_all_subs() {
         let b = DefaultBroker::new(
             TopicProfile::default(),
             Duration::from_secs(60),
             PAYLOAD_LIMIT,
         );
         let s = Arc::new(CountingSink::new(7));
-        b.subscribe("a", SubscribeIntent::Live, s.clone()).unwrap();
-        b.subscribe("b", SubscribeIntent::Live, s.clone()).unwrap();
-        assert_eq!(b.drop_sink(7), 2);
+        b.subscribe("a", SubscribeIntent::Live, s.clone())
+            .await
+            .unwrap();
+        b.subscribe("b", SubscribeIntent::Live, s.clone())
+            .await
+            .unwrap();
+        assert_eq!(b.drop_sink(7).await, 2);
     }
 }

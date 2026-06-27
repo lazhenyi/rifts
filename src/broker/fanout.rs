@@ -16,7 +16,7 @@ use uuid::Uuid;
 pub struct SubscriptionId(pub u64);
 
 /// What a subscriber wants to receive.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubscribeIntent {
     /// New messages after subscription.
     Live,

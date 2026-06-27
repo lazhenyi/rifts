@@ -212,7 +212,7 @@ impl Connection {
         if let Some(mut t) = transport_slot.lock().await.take() {
             let _ = t.close(CloseCode::Normal, "bye").await;
         }
-        self.broker.drop_sink(self.sink_id);
+        self.broker.drop_sink(self.sink_id).await;
         self.ack_manager.forget(session.id.as_str());
         self.resume.tracker.forget(&session.id);
         self.metrics.inc(&self.metrics.connection_close_total);
@@ -274,7 +274,7 @@ impl Connection {
             .collect();
         let mut topic_offsets = std::collections::HashMap::new();
         for topic in last_offsets.keys() {
-            topic_offsets.insert(topic.clone(), self.broker.head_offset(topic));
+            topic_offsets.insert(topic.clone(), self.broker.head_offset(topic).await);
         }
         match self.resume.evaluate(
             &session,
@@ -392,7 +392,7 @@ async fn reader_task(
                 }
                 let requires_ack = frame.requires_ack();
                 let msg_id = frame.message_id.clone();
-                match broker.publish(&frame) {
+                match broker.publish(&frame).await {
                     Ok(outcome) => {
                         if requires_ack {
                             let status = if outcome.duplicate {
@@ -487,7 +487,7 @@ async fn handle_control(
                 tx: out_tx.clone(),
                 id: crate::broker::fanout::new_sink_id(),
             });
-            let id = broker.subscribe(&topic, intent, sink)?;
+            let id = broker.subscribe(&topic, intent, sink).await?;
             let reply = serde_json::json!({
                 "type": "subscribe_ack",
                 "topic": topic,
@@ -514,7 +514,9 @@ async fn handle_control(
                         "subscription_id",
                     ))
                 })?;
-            let removed = broker.unsubscribe(crate::broker::fanout::SubscriptionId(sub_id))?;
+            let removed = broker
+                .unsubscribe(crate::broker::fanout::SubscriptionId(sub_id))
+                .await?;
             let reply = serde_json::json!({
                 "type": "unsubscribe_ack",
                 "subscription_id": sub_id,

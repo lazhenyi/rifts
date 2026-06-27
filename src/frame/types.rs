@@ -3,7 +3,7 @@
 use std::fmt;
 
 /// Frame type (spec §6.2).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum FrameType {
     /// hello, welcome, ready, ping, pong, subscribe, unsubscribe, resume…
     Control,
@@ -54,7 +54,7 @@ impl fmt::Display for FrameType {
 }
 
 /// Encoding codec for the frame payload.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum Codec {
     /// JSON — debug / development only (spec §7).
     Json,
@@ -94,7 +94,19 @@ impl fmt::Display for Codec {
 
 /// Message priority (spec §18.3). Used to order transmission and to
 /// decide what gets dropped under backpressure.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 #[repr(u8)]
 pub enum Priority {
     Background = 0,
@@ -139,7 +151,9 @@ impl fmt::Display for Priority {
 
 /// Bit flags on a frame (spec §6.3). Internally stored as a `u16`
 /// bitset.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub struct FrameFlags(u16);
 
 impl FrameFlags {

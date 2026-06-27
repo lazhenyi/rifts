@@ -6,11 +6,12 @@
 use std::fmt;
 
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 use crate::frame::{Codec, FrameFlags, FrameType, Priority};
 
 /// A single frame exchanged between client and server.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Frame {
     /// Protocol version. Spec §6.1 requires this to be present.
     pub version: u16,
