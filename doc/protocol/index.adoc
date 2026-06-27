@@ -1,4 +1,4 @@
-= Protocol Reference
+Protocol Reference
 :sectanchors:
 :toc: left
 :toclevels: 3

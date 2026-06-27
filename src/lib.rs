@@ -25,6 +25,7 @@
 #![warn(rust_2018_idioms)]
 
 pub mod ack;
+pub mod actor;
 pub mod broker;
 pub mod codec;
 pub mod config;
