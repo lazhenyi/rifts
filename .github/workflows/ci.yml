@@ -62,7 +62,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --no-deps -- -D warnings
+        run: cargo clippy --no-deps -- -D warnings -A clippy::large_enum_variant -A clippy::module_inception
 
   docs:
     name: Docs

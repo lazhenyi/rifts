@@ -31,7 +31,7 @@ use crate::topic::store::LogEntry;
 /// - `S`: [`SnapshotStore`](crate::storage::SnapshotStore) — snapshot capture and retrieval
 ///
 /// Use the type aliases for common configurations:
-/// - [`DefaultBroker`] — all memory-backed (development)
+/// - [`DefaultBroker`](DefaultBroker) — all memory-backed (development)
 /// - `SledBroker` — all sled-backed (production, feature `sled`)
 pub struct InMemoryBroker<O, L, D, S> {
     /// In-memory topic metadata store.
