@@ -32,7 +32,7 @@ use crate::topic::store::LogEntry;
 ///
 /// Use the type aliases for common configurations:
 /// - [`DefaultBroker`] — all memory-backed (development)
-/// - [`SledBroker`] — all sled-backed (production, feature `sled`) [`SledBroker`]: SledBroker
+/// - `SledBroker` — all sled-backed (production, feature `sled`)
 pub struct InMemoryBroker<O, L, D, S> {
     /// In-memory topic metadata store.
     pub store: TopicStore,

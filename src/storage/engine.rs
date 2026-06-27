@@ -2,7 +2,7 @@
 //!
 //! Two implementations:
 //! - [`MemoryEngine`](super::MemoryEngine) — `DashMap`-backed, no persistence.
-//! - [`SledEngine`](super::SledEngine) — `sled::Tree`-backed, durable (feature `sled`).
+//! - `SledEngine` — `sled::Tree`-backed, durable (feature `sled`).
 
 use std::sync::Arc;
 
