@@ -55,7 +55,7 @@ pub fn validate_name(name: &str) -> Result<()> {
 pub struct SubscriberId(pub u64);
 
 /// A replay log entry. Stores the offset and a serialized payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LogEntry {
     /// The offset assigned by the broker.
     pub offset: i64,

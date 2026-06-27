@@ -37,6 +37,7 @@ pub mod metrics;
 pub mod protocol;
 pub mod server;
 pub mod session;
+pub mod storage;
 pub mod topic;
 pub mod trace;
 pub mod transport;
