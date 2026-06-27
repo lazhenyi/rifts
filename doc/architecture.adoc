@@ -1,0 +1,234 @@
+= Architecture
+:sectanchors:
+:toc: left
+:toclevels: 3
+
+== Four-Layer Model
+
+Rift/1 splits the real‑time stack into four layers (spec §3):
+
+[horizontal]
+Transport::  Carries bidirectional byte‑streams or datagrams (WebSocket, WebTransport, TCP).
+Session::    Identity, connection lifetime, recovery, heartbeat, flow‑control negotiation.
+Message::    Message type, reliability, ordering, ack, replay, priority, TTL.
+Topic::       Subscription, publish, permission, sharding, fanout, retention, snapshot.
+
+Each layer is represented by a public module in the crate:
+
+[source]
+----
+src/transport/   → Transport abstraction + framework adapters
+src/session/     → Session lifecycle, auth, resume, offset tracking
+src/message/     → Event, Command, Reply, State, Datagram, Stream, Snapshot
+src/topic/       → Topic profiles, store, retention, ordering
+src/broker/      → In‑memory broker, router, fanout, dedupe, offsets, snapshots
+----
+
+== Crate Map
+
+[cols="2m,1m,6a",options="header"]
+|===
+| Module | Layer | Responsibility
+
+| `frame`
+| Message
+| `Frame` envelope, `FrameType`, `FrameFlags`, `Codec`, `Priority`.
+
+| `codec`
+| Transport
+| JSON + CBOR codecs.  Negotiated during handshake.
+
+| `protocol`
+| Session
+| `Hello` / `Welcome` / `Ready`, `CloseCode` (1000‑1015), `ErrorCode` (42 codes), `HeartbeatPolicy`.
+
+| `message`
+| Message
+| Eight message classes, `DeliveryMode`, `SubscribeMode`, `Message` enum.
+
+| `topic`
+| Topic
+| `TopicProfile`, `RetentionPolicy`, `OrderingPolicy`, `TopicStore` (DashMap‑backed + Arc‑shared).
+
+| `session`
+| Session
+| `Session` (ULID‑based), `SessionState` FSM, `AuthProvider` trait, `ResumeManager`, `OffsetTracker`.
+
+| `broker`
+| Topic
+| `InMemoryBroker`, `TopicRouter`, `FanoutEngine`, `DedupeStore`, `OffsetStore`, `SnapshotStore`.
+
+| `transport`
+| Transport
+| `Transport` / `TransportListener` / `TransportConnection` traits, `WebSocketTransport` with split read/write halves, framework adapters (axum, actix, warp, ntex).
+
+| `ack`
+| Session
+| `AckManager`, `AckStatus` (9 variants), per‑session timeout tracking.
+
+| `flow`
+| Session
+| `BackpressureController` (atomic CAS‑loop enqueue, 6 strategies), `RateLimiter` (token‑bucket).
+
+| `server`
+| —
+| `RiftServer` + `RiftServerBuilder`, event loop, graceful shutdown.
+
+| `connection`
+| Session
+| Per‑connection state machine: Open → Hello → Auth → Resume/Start → Ready → Active → Draining → Closed.
+
+| `metrics`
+| —
+| Process‑local atomic counters (connections, messages, backpressure, latency).  Export‑ready structure.
+
+| `trace`
+| Message
+| Lightweight `TraceContext` (trace_id, span_id, parent_span_id, sampled).
+|===
+
+== Connection Lifecycle (spec §5)
+
+[source]
+----
+Client                                Server
+  |                                      |
+  | -------- TCP / WS open ------------> |
+  |                                      |
+  | -------- hello (protocol, v, codecs, auth_modes) --> |
+  |                                      | negotiate version + codec
+  |                                      | authenticate (bearer / mtls / anon)
+  | <------- welcome ------------------- |
+  |                                      |
+  |                                      | [resume or cold-start decision]
+  |                                      |
+  | <------- ready --------------------- |  (heartbeat, limits, server_time)
+  |                                      |
+  | <======= Active ===================> |  subscribe, publish, command, ack
+  |                                      |
+  | <------- draining ------------------- |  (deploy, rebalance, overload)
+  |                                      |
+  | -------- close / timeout ----------> |
+  | <------- close --------------------- |
+  |                                      |
+----
+
+=== Handshake Flow in `Connection::handshake()`
+
+1. `read_frame()` — expect a `Control`‑type `hello` frame.
+2. Decode `Hello` payload — extract protocol, version, codecs, auth_modes, token, `last_offsets`.
+3. `negotiate_major(client_major)` — accept only major version 1.
+4. `negotiate(server_codecs, client_codecs)` — pick JSON or CBOR.
+5. `auth_provider.authenticate(mode, token)` — produce `AuthContext { client_id, claims }`.
+6. `ResumeManager::evaluate(...)` — decide `FullResume | PartialResume | SnapshotRequired | ColdStart`.
+7. Write `welcome` + `ready` frames synchronously (before spawning reader/writer tasks).
+
+== In‑Memory Broker
+
+The `InMemoryBroker` is the default broker.  It wires together six stores:
+
+[source]
+----
+  publish ─→ DedupeStore ─→ OffsetStore ─→ TopicStore.append()
+                     │                          │
+                     │                          ▼
+                     │                    FanoutEngine.deliver()
+                     │                          │
+                     │                ┌─────────┴──────────┐
+                     │                │  subscriber sinks   │
+                     │                │  (mpsc → writer     │
+                     │                │   task → WebSocket) │
+                     │                └────────────────────┘
+                     ▼
+              (duplicate → skip fanout)
+----
+
+- `TopicStore` — `Arc<DashMap<String, Arc<TopicEntry>>>`; shared between broker and router.
+- `DedupeStore` — keyed by `(topic, dedupe_key)`; sweep drops expired entries.
+- `OffsetStore` — atomic monotonic offset per topic.
+- `FanoutEngine` — subscription table (topic → sinks); direct fanout for small topics.
+- `SnapshotStore` — latest snapshot per topic; aids resume.
+- `LocalRouter` — resolves topic name → `Arc<TopicEntry>`; calls `get_or_create`.
+
+== Transport Architecture
+
+The `Transport` / `TransportListener` / `TransportConnection` traits are the abstraction
+boundary.  Each transport binding provides independent read / write halves so that the
+server’s reader and writer tasks never contend on a mutex.
+
+*Standalone WebSocket* (`features = ["websocket"]`)::
+  `tokio-tungstenite` is split with `WebSocketStream::split()` at accept time.
+  The reader half is used by the reader task; the writer half is wrapped in
+  `Arc<tokio::sync::Mutex<SplitSink>>` and shared between the handshake writer
+  and the writer task.
+
+*Framework adapters* (`features = ["axum"]`, etc.)::
+  Each adapter implements `TransportConnection` for the framework’s WebSocket type
+  (axum uses `Arc<tokio::sync::Mutex<WebSocket>>`; actix and ntex use a channel bridge
+  because their WS types are `!Send`).
+
+== Error Model
+
+Errors use `thiserror` deeply.  The top‑level `RiftError` composes six typed
+sub‑enums:
+
+[source,rust]
+----
+pub enum RiftError {
+    Frame(FrameReject),       // version, codec, schema, encoding
+    Session(SessionReject),   // not found, expired, conflict, resume
+    Topic(TopicReject),       // not found, closed, rate-limited, forbidden
+    Message(MessageReject),   // duplicate, expired, too large, ack timeout
+    Auth(AuthReject),         // required, invalid, expired, revoked, denied
+    System(SystemReject),     // overloaded, maintenance, shard-moved, internal
+    Config(ConfigError),      // invalid configuration
+    Io(std::io::Error),
+}
+----
+
+Large error sources (tungstenite, ciborium, serde_json, etc.) are boxed inside
+a `BoxedStdError` wrapper so the `Result` type stays small on the stack.
+
+== Backpressure
+
+`BackpressureController` guards the per‑connection send queue with an atomic
+CAS‑loop enqueue.  When the queue exceeds the high‑water mark (90% of `max_send_queue_bytes`),
+the controller selects a strategy:
+
+[cols="2,5a",options="header"]
+|===
+| Strategy | Behaviour
+
+| `Pause`
+| Caller spins with `tokio::time::sleep` until capacity frees.
+
+| `DropVolatile`
+| Messages with `Priority::Volatile` or `Priority::Background` are discarded.
+
+| `CoalesceState`
+| State messages for the same `state_key` are collapsed to the latest.
+
+| `Downgrade`
+| All messages are deferred; the writer is throttled.
+
+| `Disconnect`
+| The slow consumer is kicked with `CloseCode::SlowConsumer`.
+
+| `SnapshotLater`
+| The connection switches to periodic snapshot polling instead of live messages.
+|===
+
+== Testing
+
+The crate ships three test suites:
+
+. *Unit tests* (95) — inline `#[cfg(test)] mod tests` in every module.
+. *Integration tests* (7) — `tests/integration.rs`: frame‑encoding round‑trip, codec, auth.
+. *Doc tests* (1) — `src/lib.rs` quick‑start example.
+
+Run them all with:
+
+[source,sh]
+----
+cargo test
+----

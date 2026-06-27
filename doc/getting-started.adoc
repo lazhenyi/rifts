@@ -1,0 +1,154 @@
+= Getting Started
+:sectanchors:
+:toc: left
+:toclevels: 3
+
+== Prerequisites
+
+- Rust {rust-version} edition toolchain (1.85+)
+- A running Tokio runtime (multi‑thread recommended)
+
+== Add `rifts` to your project
+
+[source,sh]
+----
+cargo add rifts
+----
+
+== Hello World: a minimal server
+
+Step 1 — write `src/main.rs`:
+
+[source,rust]
+----
+use rifts::RiftServer;
+use std::sync::Arc;
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    // A Notify signal to trigger graceful shutdown.
+    let shutdown = Arc::new(Notify::new());
+    let shutdown_sig = shutdown.clone();
+
+    // Ctrl-C handler: notify the server to drain.
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        shutdown_sig.notify_one();
+    });
+
+    // Build and run the server.
+    RiftServer::builder()
+        .websocket_transport()      // enable standalone WebSocket
+        .build()?
+        .run("127.0.0.1:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+Step 2 — run it:
+
+[source,sh]
+----
+cargo run
+----
+
+The server is now listening on `ws://127.0.0.1:9000`.  You can connect with any WebSocket
+client that speaks the Rift/1 binary frame format.
+
+== Authenticated server
+
+By default the server uses `TokenAuth` — an in‑memory token store suitable for
+testing and single‑process deployments:
+
+[source,rust]
+----
+use rifts::session::{TokenAuth, AuthContext, ClientId};
+
+let auth = Arc::new(TokenAuth::new());
+auth.register(
+    "my-secret-token",
+    AuthContext {
+        client_id: ClientId::new("user-1"),
+        claims:       serde_json::json!({"role": "admin"}),
+        mode:         rifts::AuthMode::Bearer,
+        hints:        Default::default(),
+    },
+);
+
+let server = RiftServer::builder()
+    .websocket_transport()
+    .auth(auth)
+    .build()?;
+----
+
+For production, implement the `AuthProvider` trait to call out to your IdP.
+
+== Customising server parameters
+
+[source,rust]
+----
+use std::time::Duration;
+use rifts::ServerConfig;
+
+let config = ServerConfig {
+    max_payload_bytes:        256 * 1024,    // 256 KiB
+    max_topics_per_connection: 64,
+    max_send_queue_bytes:      2 * 1024 * 1024,  // 2 MiB
+    idle_timeout:              Duration::from_secs(120),
+    ..ServerConfig::default()
+};
+
+let server = RiftServer::builder()
+    .websocket_transport()
+    .config(config)
+    .build()?;
+----
+
+See `ServerConfig` for the full set of tunables — all fields carry
+defaults sourced from the Rift/1 spec §27.1.
+
+== Framework integration
+
+=== Axum
+
+[source,rust]
+----
+// Cargo.toml
+// rifts = { version = "0.1", default-features = false, features = ["axum"] }
+
+use axum::{Router, routing::get, extract::ws::WebSocketUpgrade};
+use rifts::transport::axum::axum_ws_handler;
+
+async fn ws_handler(ws: WebSocketUpgrade) -> impl axum::response::IntoResponse {
+    ws.on_upgrade(move |socket| axum_ws_handler(socket, |conn| async move {
+        // conn is a Box<dyn TransportConnection>
+        // spawn your Rift connection handler here
+    }))
+}
+----
+
+=== Actix‑web
+
+[source,rust]
+----
+// Cargo.toml
+// rifts = { version = "0.1", default-features = false, features = ["actix-web"] }
+
+use actix_web::{web, HttpRequest, HttpResponse};
+use rifts::transport::actix::actix_ws_handler;
+
+async fn ws_route(req: HttpRequest, stream: web::Payload) -> HttpResponse {
+    actix_ws_handler(req, stream, |conn| async move {
+        // conn is a Box<dyn TransportConnection>
+    })
+}
+----
+
+== Next Steps
+
+- xref:architecture.adoc[Architecture] — understand the four‑layer model.
+- xref:examples.adoc[Examples] — chat server, pubsub, and more.
+- xref:protocol/index.adoc[Protocol Reference] — wire format and semantics.

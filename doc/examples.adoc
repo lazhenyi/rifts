@@ -1,0 +1,191 @@
+= Examples
+:sectanchors:
+:toc: left
+:toclevels: 2
+
+== Chat Server
+
+A complete multi‑room chat server using `rifts` with the WebSocket transport.
+
+[source,rust]
+----
+use std::sync::Arc;
+use rifts::{RiftServer, Broker, SubscribeIntent};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let shutdown = Arc::new(Notify::new());
+    let server = RiftServer::builder()
+        .websocket_transport()
+        .build()?;
+
+    // Run the server; each connecting client goes through the
+    // handshake, then publishes and subscribes to room/* topics.
+    server.run("0.0.0.0:9000".parse().unwrap(), shutdown).await?;
+    Ok(())
+}
+----
+
+Only ~30 lines.  The server handles handshake, auth, topic creation, fanout,
+ack, replay, and backpressure automatically.
+
+== Authenticated Pub/Sub
+
+A server with token‑based auth and a custom topic profile for rate‑limited rooms:
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+use rifts::{
+    RiftServer, ServerConfig, TopicProfile, RetentionPolicy, OrderingPolicy,
+    session::{TokenAuth, AuthContext, ClientId},
+    AuthMode,
+};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    // In-memory token store.
+    let auth = Arc::new(TokenAuth::new());
+    auth.register("admin-token", AuthContext {
+        client_id: ClientId::new("admin"),
+        claims:    serde_json::json!({"role": "admin"}),
+        mode:      AuthMode::Bearer,
+        hints:     Default::default(),
+    });
+
+    let config = ServerConfig {
+        max_payload_bytes: 128 * 1024,
+        ..ServerConfig::default()
+    };
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .auth(auth)
+        .config(config)
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== Direct Broker Usage (no network)
+
+You can use the in‑memory broker directly without any transport — useful for
+unit tests, non‑networked services, or pipelines:
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+use rifts::{
+    InMemoryBroker, Broker, TopicProfile, RetentionPolicy,
+    SubscribeIntent, Frame, FrameType, FrameFlags, Codec,
+};
+use bytes::Bytes;
+
+#[test]
+fn test_broker_pub_sub() {
+    let profile = TopicProfile {
+        retention: RetentionPolicy::Count(100),
+        ..TopicProfile::default()
+    };
+    let broker = InMemoryBroker::new(profile, Duration::from_secs(60));
+
+    // Subscribe a counting sink.
+    let sink = Arc::new(CountingSink::new(1));
+    broker.subscribe("test", SubscribeIntent::Live, sink.clone()).unwrap();
+
+    // Publish.
+    let frame = Frame {
+        frame_type: FrameType::Data,
+        codec:      Codec::Json,
+        topic:      Some("test".into()),
+        message_id: Some("msg-1".into()),
+        event:      Some("greeting".into()),
+        payload:    Some(Bytes::from_static(b"hello")),
+        ..Frame::default()
+    };
+    let outcome = broker.publish(&frame).unwrap();
+    assert_eq!(outcome.offset, 1);
+    assert!(!outcome.duplicate);
+    assert_eq!(sink.count(), 1);
+}
+----
+
+== Axum WebSocket Adapter
+
+[source,rust]
+----
+// Cargo.toml
+// [dependencies]
+// rifts = { version = "0.1", default-features = false, features = ["axum"] }
+// axum = "0.8"
+// tokio = { version = "1", features = ["full"] }
+
+use axum::{Router, routing::get, extract::ws::WebSocketUpgrade, response::IntoResponse};
+use rifts::transport::axum::AxumWsConnection;
+
+async fn ws_upgrade(ws: WebSocketUpgrade) -> impl IntoResponse {
+    ws.on_upgrade(|socket| async move {
+        let conn = AxumWsConnection::new(socket);
+        // Pass `conn` to your Rift connection handler.
+        // Connection::new(…).run(conn).await?;
+    })
+}
+
+#[tokio::main]
+async fn main() {
+    let app = Router::new().route("/ws", get(ws_upgrade));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+----
+
+== Custom AuthProvider
+
+Implement the `AuthProvider` trait for your own identity provider:
+
+[source,rust]
+----
+use async_trait::async_trait;
+use rifts::{
+    session::{AuthProvider, AuthContext, AuthHints, ClientId},
+    AuthMode, Result, RiftError,
+};
+
+struct MyAuth {
+    jwks_url: String,
+}
+
+#[async_trait]
+impl AuthProvider for MyAuth {
+    async fn authenticate(&self, mode: AuthMode, token: Option<&str>)
+        -> Result<AuthContext>
+    {
+        let token = token.ok_or_else(||
+            RiftError::Auth(rifts::error::AuthReject::Required)
+        )?;
+
+        // Validate JWT against JWKS endpoint.
+        let claims = validate_jwt(token, &self.jwks_url).await?;
+
+        Ok(AuthContext {
+            client_id: ClientId::new(claims.sub),
+            claims:    serde_json::to_value(&claims).unwrap(),
+            mode,
+            hints:     AuthHints::default(),
+        })
+    }
+
+    async fn revoke(&self, client_id: &ClientId) -> Result<()> {
+        // Call revocation endpoint.
+        Ok(())
+    }
+}
+----

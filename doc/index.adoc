@@ -1,0 +1,87 @@
+= Rift Realtime Protocol / 1.0 (rifts)
+Zhenyi <434836402@qq.com>
+v0.1.0, 2025-06-27
+:toc: left
+:toclevels: 3
+:sectanchors:
+:source-highlighter: rouge
+:rust-version: 2024
+:sectlinks:
+:docinfo1:
+
+image:https://github.com/lazhenyi/rifts/actions/workflows/ci.yml/badge.svg[CI,link=https://github.com/lazhenyi/rifts/actions/workflows/ci.yml]
+image:https://img.shields.io/crates/v/rifts.svg[Crates.io,link=https://crates.io/crates/rifts]
+image:https://img.shields.io/badge/License-MIT-blue.svg[License,link=LICENSE-MIT]
+
+The `rifts` crate is the canonical Rust server implementation of the **Rift Realtime Protocol (Rift/1)** —
+a bidirectional messaging protocol for real‑time applications.  Rift/1 replaces raw WebSocket +
+event‑string patterns with explicit semantics: eight message classes, offset‑based resume,
+topic‑level QoS, schema‑first events, and protocol‑level backpressure.
+
+== Documentation Map
+
+[cols="2,5a",options="header"]
+|===
+| Guide | Description
+
+| xref:getting-started.adoc[Getting Started]
+| Build, configure, and run a Rift/1 server in under ten minutes.
+
+| xref:architecture.adoc[Architecture]
+| Crate layout, layer model, connection lifecycle, and module‑by‑module walkthrough.
+
+| xref:protocol/index.adoc[Protocol Reference]
+| Wire format, frame envelope, message classes, topic profiles, ack, and error codes —
+  derived from the upstream specification.
+
+| xref:examples.adoc[Examples]
+| Runnable examples: chat server, pubsub broker, framework adapters.
+|===
+
+== Crate Features
+
+[cols="3m,7a",options="header"]
+|===
+| Feature | Description
+
+| `websocket` *(default)*
+| Standalone WebSocket transport (tokio‑tungstenite).  No framework dependency.
+
+| `axum`
+| Accept Rift/1 connections from `axum::extract::ws::WebSocket`.
+
+| `actix-web`
+| Accept Rift/1 connections from actix‑web WebSocket sessions.
+
+| `warp`
+| Accept Rift/1 connections from `warp::ws::WebSocket`.
+
+| `ntex`
+| Accept Rift/1 connections from ntex WebSocket handlers.
+
+| `tokio-frameworks`
+| Shortcut: enables `axum` + `warp`.
+
+| `all-frameworks`
+| Shortcut: enables `axum` + `actix-web` + `warp` + `ntex`.
+|===
+
+== Quick Install
+
+[source,sh]
+----
+cargo add rifts
+----
+
+Or in `Cargo.toml`:
+
+[source,toml]
+----
+[dependencies]
+rifts = "0.1"
+----
+
+== License
+
+Licensed under either of the Apache License, Version 2.0 or the MIT license at your option.
+See link:LICENSE-MIT[] for details.

@@ -1,0 +1,449 @@
+= Protocol Reference
+:sectanchors:
+:toc: left
+:toclevels: 3
+
+This section documents the Rift/1 wire protocol as implemented by the `rifts` crate.
+
+== Binary Frame Envelope (spec §6)
+
+Every frame on the wire is a 24‑byte header followed by an N‑byte payload:
+
+[source,text]
+----
+ 0      1      2      3      4             11     12            19     20     23
++------+------+------+------+-------------+------+-------------+------+------+
+| type | codec| flags (u16 BE) | frame_id   (u64 BE) | timestamp   (u64 BE) |
++------+------+------+------+-------------+------+-------------+------+------+
+ 20     23      24              23 + N
++------+------+------+// .... //+------+
+| plen (u32 BE) |  payload  ...   |
++------+------+------+// .... //+------+
+----
+
+=== Field Reference
+
+[cols="3m,3m,7a",options="header"]
+|===
+| Field | Type | Description
+
+| `type`
+| u8
+| Frame type tag: `C` (Control), `D` (Data), `A` (Ack), `F` (Flow), `E` (Error).
+
+| `codec`
+| u8
+| Payload encoding: `J` (JSON), `B` (CBOR).
+
+| `flags`
+| u16 BE
+| Bitmask (see <<Flags>>).
+
+| `frame_id`
+| u64 BE
+| Monotonic frame ID within the connection.
+
+| `timestamp`
+| i64 BE
+| Sender timestamp (ms since epoch).
+
+| `plen`
+| u32 BE
+| Payload length in bytes.
+
+| `payload`
+| bytes
+| Codec‑encoded business or control data.
+|===
+
+[[Flags]]
+=== Frame Flags (spec §6.3)
+
+[cols="2m,1m,5a",options="header"]
+|===
+| Name | Bit | Description
+
+| `COMPRESSED`
+| 0
+| Payload is compressed.
+
+| `ENCRYPTED`
+| 1
+| Payload is application‑layer encrypted.
+
+| `FRAGMENTED`
+| 2
+| Frame is a fragment (not the last).
+
+| `FINAL_FRAGMENT`
+| 3
+| Last fragment in a sequence.
+
+| `REQUIRES_ACK`
+| 4
+| Peer must send an ack.
+
+| `REPLAYED`
+| 5
+| Frame comes from a replay buffer.
+
+| `SNAPSHOT`
+| 6
+| Payload is a snapshot.
+
+| `DEGRADED`
+| 7
+| Message was downgraded by the server.
+
+| `DUPLICATE`
+| 8
+| Server detected a duplicate.
+
+| `TRACE`
+| 9
+| Frame carries distributed‑trace metadata.
+|===
+
+[[Ctrl]]
+== Control Frames
+
+Control frames carry the handshake and subscription lifecycle.
+
+=== Hello (Client → Server)
+
+[source,json]
+----
+{
+  "protocol":   "rift",
+  "version":     256,
+  "client_id":   "…",
+  "session_id":  "…",
+  "epoch":       1,
+  "codecs":      ["json", "cbor"],
+  "auth_modes":  ["bearer"],
+  "token":       "…",
+  "last_offsets":{"room/1": 42},
+  "sdk":         {"name": "…", "version": "…"},
+  "features":    ["resume", "replay"]
+}
+----
+
+=== Welcome (Server → Client)
+
+[source,json]
+----
+{
+  "type":           "welcome",
+  "session_id":     "01H…",
+  "epoch":           1,
+  "server_time":    1719482400000,
+  "resume_window_ms":300000,
+  "negotiated_codec":"cbor"
+}
+----
+
+=== Ready (Server → Client)
+
+[source,json]
+----
+{
+  "type":                    "ready",
+  "session_id":              "01H…",
+  "epoch":                    1,
+  "ping_interval_ms":         25000,
+  "pong_timeout_ms":          10000,
+  "max_missed_pongs":         2,
+  "idle_timeout_ms":          300000,
+  "jitter_ms":                2500,
+  "max_payload_bytes":        65536,
+  "max_topics_per_connection":128,
+  "max_send_queue_bytes":     1048576,
+  "server_time":              1719482400000
+}
+----
+
+=== Subscribe (Client → Server)
+
+[source,json]
+----
+{
+  "type":    "subscribe",
+  "topic":   "room/1",
+  "mode":    "live",
+  "from_offset": null,
+  "filter":  null
+}
+----
+
+=== Subscribe Ack (Server → Client)
+
+[source,json]
+----
+{
+  "type":   "subscribe_ack",
+  "topic":  "room/1",
+  "result": "accepted"
+}
+----
+
+[[Mc]]
+== Message Classes (spec §8.1)
+
+[cols="3m,3m,4a,",options="header"]
+|===
+| Class | Default Delivery | Use Case
+
+| `event`
+| `at_least_once`
+| Chat, notifications, business events.
+
+| `command`
+| `at_least_once`
+| RPC, operation requests.
+
+| `reply`
+| follows command
+| Command responses.
+
+| `state`
+| `latest_only`
+| Online presence, cursor position, room counts.
+
+| `datagram`
+| `best_effort`
+| Game input, typing indicators, telemetry.
+
+| `stream`
+| `durable_ordered`
+| AI token streaming, file transfer, media chunks.
+
+| `snapshot`
+| `at_least_once`
+| Reconnect re‑initialisation.
+
+| `system`
+| `at_least_once`
+| Rate‑limit notices, migration, maintenance.
+|===
+
+[[Delivery]]
+== Delivery Modes (spec §8.2)
+
+[cols="3m,7a",options="header"]
+|===
+| Mode | Guarantee
+
+| `at_most_once`
+| Fire‑and‑forget. May be lost. No retry.
+
+| `at_least_once`
+| May duplicate. Server assigns offset.  Client dedupes with `message_id`.
+
+| `exactly_once_effect`
+| Protocol provides idempotency key + dedupe window.  Business layer guarantees side‑effect‑once.
+
+| `latest_only`
+| Older values are overwritten by newer ones on the same `state_key`.
+
+| `best_effort`
+| No ack, no replay.  Dropped under backpressure.
+
+| `durable_ordered`
+| Persisted, strictly ordered, replayable by offset.
+|===
+
+[[Ack]]
+== Acknowledgement (spec §12)
+
+Ack statuses exchanged between client and server:
+
+[cols="2,6a",options="header"]
+|===
+| Status | Meaning
+
+| `received`
+| Peer received the frame.
+
+| `accepted`
+| Server accepted the message for processing.
+
+| `persisted`
+| Message is durably stored.
+
+| `delivered`
+| Message reached the target subscriber(s).
+
+| `processed`
+| Business handler completed successfully.
+
+| `rejected`
+| Message was rejected (permission, validation).
+
+| `expired`
+| TTL elapsed before delivery.
+
+| `duplicate`
+| Dedupe key collision — not re‑executed.
+
+| `failed`
+| Processing failed.
+|===
+
+[[Err]]
+== Error Codes (spec §19.1)
+
+=== Protocol
+
+[horizontal]
+`RIFT_PROTOCOL_VERSION_UNSUPPORTED`::  Client/server version mismatch.
+`RIFT_PROTOCOL_FRAME_INVALID`::       Malformed frame.
+`RIFT_PROTOCOL_CODEC_UNSUPPORTED`::   Codec not in server’s supported set.
+`RIFT_PROTOCOL_PAYLOAD_TOO_LARGE`::   Payload exceeds `max_payload_bytes`.
+`RIFT_PROTOCOL_REQUIRED_FIELD_MISSING`::  Required field absent.
+`RIFT_PROTOCOL_SCHEMA_MISMATCH`::     Schema version not compatible.
+`RIFT_PROTOCOL_ORDER_VIOLATION`::     Message order constraint broken.
+
+=== Auth & Permission
+
+[horizontal]
+`RIFT_AUTH_REQUIRED`::      Anonymous not permitted.
+`RIFT_AUTH_INVALID`::       Token / credential rejected.
+`RIFT_AUTH_EXPIRED`::       Session or token past expiry.
+`RIFT_AUTH_REVOKED`::       Token actively revoked.
+`RIFT_PERMISSION_DENIED`::  Operation not authorised.
+`RIFT_TOPIC_FORBIDDEN`::    Topic access denied by policy.
+
+=== Session & Resume
+
+[horizontal]
+`RIFT_SESSION_NOT_FOUND`::      Session ID unknown.
+`RIFT_SESSION_EXPIRED`::        Resume window closed.
+`RIFT_SESSION_CONFLICT`::       Epoch mismatch.
+`RIFT_RESUME_REJECTED`::        Resume attempt denied.
+`RIFT_REPLAY_OFFSET_EXPIRED`::  Offset outside replay window.
+`RIFT_SNAPSHOT_REQUIRED`::      Client must pull a fresh snapshot.
+
+=== Topic
+
+[horizontal]
+`RIFT_TOPIC_NOT_FOUND`::         Topic does not exist.
+`RIFT_TOPIC_CLOSED`::            Topic has been closed.
+`RIFT_TOPIC_OVERLOADED`::        Topic is under backpressure.
+`RIFT_TOPIC_SUBSCRIBER_LIMIT`::  Maximum subscribers reached.
+`RIFT_TOPIC_PUBLISHER_LIMIT`::   Maximum publishers reached.
+`RIFT_TOPIC_RATE_LIMITED`::      Per‑publisher or per‑topic rate exceeded.
+
+=== Message
+
+[horizontal]
+`RIFT_MESSAGE_DUPLICATE`::       Duplicate `message_id` or `dedupe_key`.
+`RIFT_MESSAGE_EXPIRED`::         TTL elapsed.
+`RIFT_MESSAGE_REJECTED`::        Validation or policy rejection.
+`RIFT_MESSAGE_TOO_LARGE`::       Payload exceeds limit.
+`RIFT_MESSAGE_ACK_TIMEOUT`::     Expected ack not received.
+`RIFT_MESSAGE_DELIVERY_FAILED`:: Fanout or subscriber delivery failure.
+
+=== System
+
+[horizontal]
+`RIFT_SYSTEM_OVERLOADED`::         Node is overloaded.
+`RIFT_SYSTEM_MAINTENANCE`::        Scheduled maintenance.
+`RIFT_SYSTEM_SHARD_MOVED`::        Topic shard relocated.
+`RIFT_SYSTEM_REGION_UNAVAILABLE`:: Region temporarily unavailable.
+`RIFT_SYSTEM_INTERNAL`::           Unexpected internal error.
+
+[[Close]]
+== Close Codes (spec §20)
+
+[cols="1m,1m,5a",options="header"]
+|===
+| Code | Name | Trigger
+
+| 1000 | `normal`
+| Graceful client disconnect.
+
+| 1001 | `draining`
+| Server draining (deploy, rebalance).
+
+| 1002 | `protocol_error`
+| Frame or handshake violation.
+
+| 1003 | `unsupported_codec`
+| No mutually‑supported codec.
+
+| 1004 | `auth_failed`
+| Authentication rejected.
+
+| 1005 | `auth_expired`
+| Session or token expired.
+
+| 1006 | `permission_revoked`
+| Mid‑session privilege revocation.
+
+| 1007 | `session_conflict`
+| Newer epoch superseded this connection.
+
+| 1008 | `rate_limited`
+| Connection‑level rate limit hit.
+
+| 1009 | `payload_too_large`
+| Payload exceeded server limit.
+
+| 1010 | `slow_consumer`
+| Client cannot keep up.
+
+| 1011 | `server_overloaded`
+| Node‑level overload.
+
+| 1012 | `shard_moved`
+| Topic relocated to another node.
+
+| 1013 | `idle_timeout`
+| No traffic within `idle_timeout_ms`.
+
+| 1014 | `client_upgrade_required`
+| Client SDK too old.
+
+| 1015 | `policy_violation`
+| Administrative policy breach.
+|===
+
+== Topic Profiles (spec §9.2)
+
+Each topic carries a `TopicProfile` with these policies:
+
+[cols="2,6a",options="header"]
+|===
+| Policy | Options
+
+| `retention`
+| `None` / `Ttl(Duration)` / `Count(usize)` / `Size(usize)` / `Durable` / `Latest`
+
+| `ordering`
+| `None` / `Connection` / `Publisher` / `Topic` / `Key` / `Causal`
+
+| `auth_policy`
+| Per‑action permission callback.
+
+| `fanout_policy`
+| `Direct` (small topics, default) / `TreeFanout` / `RegionalFanout` / `EdgeCache`.
+
+| `rate_limit`
+| Per‑publisher + per‑topic token‑bucket (messages/sec).
+
+| `backpressure`
+| Strategy selection: pause, drop‑volatile, coalesce‑state, downgrade, disconnect.
+
+| `replay`
+| Whether offsets are stored and replayable.  Window: `replay_window`.
+
+| `snapshot`
+| Whether periodic snapshots are captured.
+|===
+
+== Topic Naming (spec §9.1)
+
+- UTF‑8, max 256 bytes.
+- No control characters.
+- Must not start with `$` (reserved for system topics).
+- Recommended convention: `/`‑delimited hierarchy (`room/{id}`, `user/{id}`, `org/{id}`).
