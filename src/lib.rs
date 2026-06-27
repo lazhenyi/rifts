@@ -20,6 +20,10 @@
 //! # Ok(()) }
 //! ```
 
+#![forbid(unsafe_code)]
+#![deny(unreachable_pub)]
+#![warn(rust_2018_idioms)]
+
 pub mod ack;
 pub mod broker;
 pub mod codec;
@@ -57,3 +61,18 @@ pub use transport::frame_codec::{decode_binary_frame, decode_text_frame, encode_
 #[cfg(feature = "websocket")]
 pub use transport::websocket::WebSocketTransport;
 pub use transport::{Transport, TransportConnection, TransportListener};
+
+// --- Shared utility: monotonic millisecond timestamp (UTC) ---
+
+/// Returns the current UTC time as milliseconds since the Unix epoch.
+///
+/// Saturates to `0` on clock underflow — this is a deliberate choice:
+/// a zero timestamp is always stale, so callers that check freshness
+/// will treat zero as "expired".  No protocol-critical path should
+/// depend on the raw value.
+pub(crate) fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}

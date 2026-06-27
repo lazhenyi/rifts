@@ -2,8 +2,15 @@
 name = "rift"
 version = "0.1.0"
 edition = "2024"
+authors = ["Zhenyi <434836402@qq.com>"]
 description = "Rift Realtime Protocol / 1.0 — server-side implementation"
+repository = "https://github.com/lazhenyi/rift"
+homepage = "https://github.com/lazhenyi/rift"
+documentation = "https://docs.rs/rift"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
+keywords = ["realtime", "websocket", "messaging", "pubsub", "protocol"]
+categories = ["network-programming", "web-programming::websocket"]
 
 [features]
 default = ["websocket"]
