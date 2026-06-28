@@ -62,7 +62,6 @@ use crate::storage::StoredSnapshot;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WireMsg {
     // -- Requests (Gateway to Broker) ----------------------------------
-
     /// Publish a frame to the topic specified within the frame.
     ///
     /// The broker validates, deduplicates, offsets, logs, and fans
@@ -157,7 +156,6 @@ pub enum WireMsg {
     },
 
     // -- Responses (Broker to Gateway) ---------------------------------
-
     /// Response to a [`Publish`](WireMsg::Publish) request.
     ///
     /// Contains the outcome of the publish operation, including the
@@ -240,7 +238,6 @@ pub enum WireMsg {
     },
 
     // -- Push (Broker to Gateway) --------------------------------------
-
     /// Push a message to a connected subscriber.
     ///
     /// Sent by the broker when a new message is published to a topic

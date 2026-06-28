@@ -68,7 +68,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ErrorCode {
     // ── Protocol (§19.1) ──────────────────────────────────────────
-
     /// The requested protocol version is not supported by the server.
     ///
     /// This typically means the client is too old (or too new) for the
@@ -114,7 +113,6 @@ pub enum ErrorCode {
     ProtocolOrderViolation,
 
     // ── Auth & permission ─────────────────────────────────────────
-
     /// Authentication is required but no credentials were provided.
     ///
     /// The client must include credentials in its `Hello` frame or
@@ -152,7 +150,6 @@ pub enum ErrorCode {
     TopicForbidden,
 
     // ── Session & resume ──────────────────────────────────────────
-
     /// The referenced session could not be found.
     ///
     /// This typically means the session ID provided by the client is
@@ -191,7 +188,6 @@ pub enum ErrorCode {
     SnapshotRequired,
 
     // ── Topic ─────────────────────────────────────────────────────
-
     /// The requested topic does not exist.
     ///
     /// The client may need to create the topic first (if the server
@@ -226,7 +222,6 @@ pub enum ErrorCode {
     TopicRateLimited,
 
     // ── Message ───────────────────────────────────────────────────
-
     /// The message is a duplicate of one already processed.
     ///
     /// The server uses message IDs to detect and reject duplicates.
@@ -263,7 +258,6 @@ pub enum ErrorCode {
     MessageDeliveryFailed,
 
     // ── System ────────────────────────────────────────────────────
-
     /// The server is temporarily overloaded (CPU, memory, connections).
     ///
     /// The client should back off and retry with exponential delay.

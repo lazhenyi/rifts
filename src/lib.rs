@@ -133,7 +133,7 @@ pub use protocol::hello::{AuthMode, Hello, Ready, ResumeResult, SdkInfo, Welcome
 pub use server::{RiftServer, RiftServerBuilder};
 pub use session::{
     AllowAllAuth, AuthContext, AuthHints, AuthProvider, ClientId, OffsetTracker, Session,
-    SessionId, SessionState, TokenAuth,
+    SessionId, SessionState, SessionStore, TokenAuth,
 };
 pub use topic::{OrderingPolicy, RetentionPolicy, TopicProfile, TopicStore};
 pub use transport::frame_codec::{decode_binary_frame, decode_text_frame, encode_frame};

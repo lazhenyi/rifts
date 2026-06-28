@@ -38,8 +38,8 @@ use crate::ack::{Ack, AckStatus, SharedAckManager};
 use crate::broker::fanout::{FanoutError, FanoutSink};
 use crate::broker::{Broker, SubscribeIntent};
 use crate::codec::{CborCodec, Codec, JsonCodec, negotiate};
-use crate::config::ServerConfig;
-use crate::error::{Result, RiftError, SystemReject};
+use crate::config::{CodecOffer, ServerConfig};
+use crate::error::{Result, RiftError, SessionReject, SystemReject};
 use crate::flow::BackpressureController;
 use crate::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
 use crate::metrics::Metrics;
@@ -47,7 +47,8 @@ use crate::now_ms;
 use crate::protocol::close::CloseCode;
 use crate::protocol::hello::{AuthMode, Hello};
 use crate::session::resume::ResumeManager;
-use crate::session::{AuthProvider, Session, SessionId, SessionState};
+use crate::session::store::SessionStore;
+use crate::session::{AuthProvider, OffsetTracker, Session, SessionId, SessionState};
 use crate::transport::TransportConnection;
 
 /// Lightweight fanout sink that writes inbound frames to the connection's
@@ -145,8 +146,17 @@ pub struct Connection {
     /// frames.
     pub ack_manager: SharedAckManager,
 
-    /// Resume manager for evaluating session resume requests.
+    /// Shared resume manager for evaluating session resume requests.
     pub resume: Arc<ResumeManager>,
+
+    /// Shared offset tracker for recording per-session per-topic offset
+    /// progress. Persists across connections for cross-connection resume.
+    pub offset_tracker: Arc<OffsetTracker>,
+
+    /// Shared session store for cross-connection session resumption.
+    /// The server holds one store for all connections so that a
+    /// reconnecting client can find its previous session.
+    session_store: SessionStore,
 
     /// Backpressure controller for monitoring the outbound queue.
     pub backpressure: BackpressureController,
@@ -190,6 +200,8 @@ impl Connection {
         metrics: Arc<Metrics>,
         ack_manager: SharedAckManager,
         resume: Arc<ResumeManager>,
+        offset_tracker: Arc<OffsetTracker>,
+        session_store: SessionStore,
     ) -> Self {
         let (out_tx, out_rx) = mpsc::channel::<Frame>(1024);
         let max_send_queue_bytes = config.max_send_queue_bytes;
@@ -201,6 +213,8 @@ impl Connection {
             metrics,
             ack_manager,
             resume,
+            offset_tracker,
+            session_store,
             backpressure: BackpressureController::new(max_send_queue_bytes),
             out_tx,
             out_rx: parking_lot::Mutex::new(Some(out_rx)),
@@ -238,12 +252,15 @@ impl Connection {
     /// 5. Closes the transport, releases resources (sink, acks, resume,
     ///    per-topic publisher slots), and decrements connection metrics.
     /// 6. Returns the reader's result.
-    pub async fn run(self, mut transport: Box<dyn TransportConnection>) -> Result<()> {
+    pub async fn run(mut self, mut transport: Box<dyn TransportConnection>) -> Result<()> {
         self.metrics.inc(&self.metrics.connection_open_total);
         self.metrics.inc(&self.metrics.active_connections);
 
         // Drive the handshake synchronously using the same transport.
-        let session = match self.handshake(&mut transport).await {
+        // Pass the session_store by value-clone so we don't borrow
+        // `self` twice (once &mut for handshake, once &self for the store).
+        let store = self.session_store.clone();
+        let session = match self.handshake(&mut transport, &store).await {
             Ok(s) => s,
             Err(e) => {
                 self.metrics.inc(&self.metrics.connection_close_total);
@@ -319,7 +336,7 @@ impl Connection {
         }
         self.broker.drop_sink(self.sink_id).await;
         self.ack_manager.forget(session.id.as_str());
-        self.resume.tracker.forget(&session.id);
+        self.offset_tracker.forget(&session.id);
         // Release per-topic publisher slots so the limit isn't
         // permanently consumed by this connection.
         let topics: Vec<String> = self.published_topics.lock().drain().collect();
@@ -343,16 +360,21 @@ impl Connection {
     /// authenticates the client, evaluates the resume request, and
     /// sends the welcome and ready frames.
     ///
-    /// **Note**: the resume decision is computed and recorded in metrics,
-    /// but the outcome does not affect this session. The client is always
-    /// treated as a cold start. Cross-connection resume is the
-    /// responsibility of a future `SessionManager` layer that shares
-    /// session state across `accept_and_spawn` invocations; today every
-    /// `Connection::run` creates a fresh session and the new session's
-    /// epoch (always 1) is what the client must match.
+    /// ## Session resumption
+    ///
+    /// If the client provides a `session_id` in its Hello, the server
+    /// looks up the session in the [`SessionStore`]. If found and the
+    /// epoch matches, the server evaluates the client's last offsets
+    /// against the broker's current head offsets and replays any missed
+    /// messages before the client begins processing live frames.
+    ///
+    /// If the session is not found or the epoch mismatches, the
+    /// handshake fails with a session error and the connection is
+    /// closed.
     async fn handshake(
-        &self,
+        &mut self,
         transport: &mut Box<dyn TransportConnection>,
+        session_store: &SessionStore,
     ) -> Result<Arc<Session>> {
         let hello_frame = transport.read_frame().await?;
         if hello_frame.frame_type != FrameType::Control {
@@ -377,8 +399,26 @@ impl Connection {
             ));
         }
 
-        let server_codecs: Vec<Arc<dyn Codec>> = vec![Arc::new(JsonCodec), Arc::new(CborCodec)];
+        // Build the server's codec list from the configured offer.
+        // An empty `codec_offer` means all compiled-in codecs are offered.
+        let server_codecs: Vec<Arc<dyn Codec>> = if self.config.codec_offer.is_empty() {
+            vec![Arc::new(JsonCodec), Arc::new(CborCodec)]
+        } else {
+            self.config
+                .codec_offer
+                .iter()
+                .map(|offer| -> Arc<dyn Codec> {
+                    match offer {
+                        CodecOffer::Json => Arc::new(JsonCodec),
+                        CodecOffer::Cbor => Arc::new(CborCodec),
+                    }
+                })
+                .collect()
+        };
         let codec = negotiate(&server_codecs, &hello.codecs)?;
+        // Store the negotiated codec on the connection so the reader
+        // task uses the same encoding for all subsequent frames.
+        self.codec = codec.clone();
 
         let auth_mode = hello
             .auth_modes
@@ -388,51 +428,141 @@ impl Connection {
         let auth_ctx = self.auth.authenticate(auth_mode, token.as_deref()).await?;
         let client_id = auth_ctx.client_id.clone();
 
-        let session = Arc::new(Session::new(SessionId::new(), client_id));
+        // --- Session lookup / creation ----------------------------------
 
-        // Build server-side topic offsets for resume evaluation.
         let last_offsets: std::collections::HashMap<String, i64> = hello
             .last_offsets
             .iter()
             .map(|(k, v)| (k.clone(), *v))
             .collect();
-        let mut topic_offsets = std::collections::HashMap::new();
-        for topic in last_offsets.keys() {
-            topic_offsets.insert(topic.clone(), self.broker.head_offset(topic).await);
-        }
-        match self.resume.evaluate(
-            &session,
-            session.current_epoch(),
-            &last_offsets,
-            &topic_offsets,
-        ) {
-            Ok(outcome) => match outcome {
+
+        let (session, resume_result) = if let Some(ref sid) = hello.session_id {
+            // Client wants to resume an existing session.
+            match session_store.get(sid) {
+                Some(existing) => {
+                    // Validate epoch.
+                    let incoming_epoch = hello.epoch.unwrap_or(0);
+                    if incoming_epoch != existing.current_epoch() {
+                        return Err(RiftError::Session(SessionReject::Conflict {
+                            incoming: incoming_epoch,
+                            current: existing.current_epoch(),
+                        }));
+                    }
+                    // Check for a conflicting active connection.
+                    match existing.state() {
+                        SessionState::Active | SessionState::Ready => {
+                            return Err(RiftError::Session(SessionReject::Conflict {
+                                incoming: incoming_epoch,
+                                current: existing.current_epoch(),
+                            }));
+                        }
+                        _ => {}
+                    }
+                    // Bump epoch for this new incarnation.
+                    existing.bump_epoch();
+                    existing.set_state(SessionState::Resuming);
+
+                    // Evaluate resume decision against broker head offsets.
+                    let mut topic_offsets = std::collections::HashMap::new();
+                    for topic in last_offsets.keys() {
+                        topic_offsets.insert(topic.clone(), self.broker.head_offset(topic).await);
+                    }
+                    let outcome = match self.resume.evaluate(
+                        &existing,
+                        existing.current_epoch(),
+                        &last_offsets,
+                        &topic_offsets,
+                    ) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            self.metrics.inc(&self.metrics.resume_failed_total);
+                            return Err(e);
+                        }
+                    };
+                    (existing, Some(outcome))
+                }
+                None => {
+                    return Err(RiftError::Session(SessionReject::NotFound(sid.clone())));
+                }
+            }
+        } else {
+            // Cold start — create a brand new session.
+            let s = Arc::new(Session::new(SessionId::new(), client_id));
+            session_store.insert(s.clone());
+            (s, None)
+        };
+
+        // Record resume metrics.
+        match resume_result {
+            Some(
                 crate::session::resume::ResumeOutcome::Resumed
                 | crate::session::resume::ResumeOutcome::Partial
-                | crate::session::resume::ResumeOutcome::Replaying => {
-                    self.metrics.inc(&self.metrics.resume_success_total);
-                }
-                _ => {
-                    self.metrics.inc(&self.metrics.resume_failed_total);
-                }
-            },
-            Err(_) => {
+                | crate::session::resume::ResumeOutcome::Replaying,
+            ) => {
+                self.metrics.inc(&self.metrics.resume_success_total);
+            }
+            Some(_) => {
                 self.metrics.inc(&self.metrics.resume_failed_total);
             }
+            None => {}
         }
 
         session.set_state(SessionState::Ready);
 
-        // Send welcome + ready synchronously.
-        let welcome = build_welcome_frame(&session, codec.frame_codec());
+        // Send welcome (with resume_result + negotiated_codec).
+        let resume_result_str = resume_result.map(|o| match o {
+            crate::session::resume::ResumeOutcome::Resumed => "resumed",
+            crate::session::resume::ResumeOutcome::Partial => "partial",
+            crate::session::resume::ResumeOutcome::Replaying => "replaying",
+            crate::session::resume::ResumeOutcome::SnapshotRequired => "snapshot_required",
+            crate::session::resume::ResumeOutcome::ColdStart => "cold_start",
+            crate::session::resume::ResumeOutcome::Rejected => "rejected",
+        });
+        let welcome = build_welcome_frame(&session, codec.frame_codec(), resume_result_str);
         transport.write_frame(&welcome).await?;
-        let ready = build_ready_frame(&session, &self.config);
+
+        // Replay missed messages for Partial / Replaying outcomes.
+        if matches!(
+            resume_result,
+            Some(crate::session::resume::ResumeOutcome::Partial)
+                | Some(crate::session::resume::ResumeOutcome::Replaying)
+        ) {
+            for (topic, &last_offset) in &last_offsets {
+                let head = self.broker.head_offset(topic).await;
+                if last_offset < head {
+                    match self.broker.replay(topic, last_offset + 1, head).await {
+                        Ok(frames) => {
+                            for data in frames {
+                                let mut replay_frame = Frame {
+                                    frame_type: FrameType::Data,
+                                    codec: FrameCodec::Json,
+                                    payload: Some(data),
+                                    flags: FrameFlags::empty(),
+                                    topic: Some(topic.clone()),
+                                    ..Frame::default()
+                                };
+                                replay_frame.mark_replay();
+                                let _ = transport.write_frame(&replay_frame).await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                conn = self.conn_id,
+                                topic = %topic,
+                                "replay failed: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        // Send ready.
+        let ready = build_ready_frame(&session, &self.config, codec.frame_codec());
         transport.write_frame(&ready).await?;
         session.set_state(SessionState::Active);
 
-        // The negotiated codec will be used by the reader task via
-        // self.codec (the field is independently cloned when building
-        // the reader).
         Ok(session)
     }
 }
@@ -651,6 +781,11 @@ async fn handle_control(
                 "passive" => SubscribeIntent::Passive,
                 "ephemeral" => SubscribeIntent::Ephemeral,
                 "latest" => SubscribeIntent::Latest,
+                "snapshot_then_live" => SubscribeIntent::SnapshotThenLive,
+                "replay" => {
+                    let from = v.get("from_offset").and_then(|x| x.as_i64()).unwrap_or(0);
+                    SubscribeIntent::Replay { from }
+                }
                 other => {
                     return Err(RiftError::Frame(crate::error::FrameReject::FrameInvalid(
                         format!("unknown subscribe intent: {other}"),
@@ -914,19 +1049,25 @@ async fn send_ack_frame(
 /// Build the "welcome" control frame sent immediately after successful
 /// authentication.
 ///
-/// Contains the assigned session id, epoch, and server timestamp.
-fn build_welcome_frame(session: &Session, codec: FrameCodec) -> Frame {
-    let body = serde_json::json!({
+/// Contains the assigned session id, epoch, negotiated codec,
+/// resume result, and server timestamp.
+fn build_welcome_frame(session: &Session, codec: FrameCodec, resume_result: Option<&str>) -> Frame {
+    let mut body = serde_json::json!({
         "type": "welcome",
         "session_id": session.id.as_str(),
         "epoch": session.current_epoch(),
+        "negotiated_codec": codec.name(),
         "server_time": now_ms(),
     });
+    if let Some(r) = resume_result {
+        body["resume_result"] = serde_json::Value::String(r.to_string());
+    }
     Frame {
         frame_type: FrameType::Control,
         codec,
         session_id: Some(session.id.as_str().to_string()),
         payload: Some(Bytes::from(body.to_string())),
+        timestamp: now_ms(),
         ..Frame::default()
     }
 }
@@ -936,7 +1077,7 @@ fn build_welcome_frame(session: &Session, codec: FrameCodec) -> Frame {
 /// Contains the negotiated session parameters: ping interval, pong
 /// timeout, max missed pongs, idle timeout, jitter, max payload bytes,
 /// max topics per connection, and max send queue bytes.
-fn build_ready_frame(session: &Session, config: &ServerConfig) -> Frame {
+fn build_ready_frame(session: &Session, config: &ServerConfig, codec: FrameCodec) -> Frame {
     let body = serde_json::json!({
         "type": "ready",
         "session_id": session.id.as_str(),
@@ -953,9 +1094,10 @@ fn build_ready_frame(session: &Session, config: &ServerConfig) -> Frame {
     });
     Frame {
         frame_type: FrameType::Control,
-        codec: FrameCodec::Json,
+        codec,
         session_id: Some(session.id.as_str().to_string()),
         payload: Some(Bytes::from(body.to_string())),
+        timestamp: now_ms(),
         ..Frame::default()
     }
 }

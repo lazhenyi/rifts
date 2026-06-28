@@ -49,6 +49,7 @@ use crate::error::{ConfigError, RiftError};
 use crate::metrics::Metrics;
 use crate::session::AuthProvider;
 use crate::session::resume::ResumeManager;
+use crate::session::store::SessionStore;
 use crate::transport::TransportConnection;
 #[cfg(feature = "websocket")]
 use crate::transport::{Transport, TransportListener};
@@ -107,6 +108,12 @@ pub struct RiftServerBuilder {
     transport: Option<Arc<dyn TransportFactory>>,
     /// Metrics collector. Defaults to a new [`Metrics`] instance if not set.
     metrics: Option<Arc<Metrics>>,
+    /// Shared session store for cross-connection resume. If `None`,
+    /// a fresh empty store is created at build time.
+    session_store: Option<SessionStore>,
+    /// Shared resume manager. If `None`, a fresh one is created at
+    /// build time.
+    resume_manager: Option<Arc<ResumeManager>>,
 }
 
 impl RiftServerBuilder {
@@ -122,6 +129,8 @@ impl RiftServerBuilder {
             #[cfg(feature = "websocket")]
             transport: None,
             metrics: None,
+            session_store: None,
+            resume_manager: None,
         }
     }
 
@@ -185,6 +194,24 @@ impl RiftServerBuilder {
     /// server. In standalone mode the transport factory is reconstructed
     /// with the current `config.max_payload_bytes` to ensure any
     /// post-`websocket_transport()` config changes are applied.
+    /// Provide a pre-populated [`SessionStore`].
+    ///
+    /// Useful when embedding the server in a larger process that
+    /// already tracks sessions externally. If not set, a fresh empty
+    /// store is created at build time.
+    pub fn session_store(mut self, store: SessionStore) -> Self {
+        self.session_store = Some(store);
+        self
+    }
+
+    /// Provide a shared [`ResumeManager`].
+    ///
+    /// If not set, a fresh default manager is created at build time.
+    pub fn resume_manager(mut self, rm: Arc<ResumeManager>) -> Self {
+        self.resume_manager = Some(rm);
+        self
+    }
+
     pub fn build(self) -> Result<RiftServer> {
         let metrics = self.metrics.unwrap_or_else(|| Arc::new(Metrics::new()));
         let config_max_payload = self.config.max_payload_bytes;
@@ -211,6 +238,11 @@ impl RiftServerBuilder {
             }) as Arc<dyn TransportFactory>
         });
 
+        let session_store = self.session_store.unwrap_or_default();
+        let resume_manager = self
+            .resume_manager
+            .unwrap_or_else(|| Arc::new(ResumeManager::new()));
+
         Ok(RiftServer {
             config: self.config,
             auth,
@@ -219,6 +251,8 @@ impl RiftServerBuilder {
             #[cfg(feature = "websocket")]
             transport,
             next_conn_id: Arc::new(AtomicU64::new(1)),
+            session_store,
+            resume_manager,
         })
     }
 }
@@ -250,6 +284,10 @@ pub struct RiftServer {
     transport: Option<Arc<dyn TransportFactory>>,
     /// Monotonically increasing connection id counter.
     next_conn_id: Arc<AtomicU64>,
+    /// Shared session store for cross-connection session resumption.
+    session_store: SessionStore,
+    /// Shared resume manager for evaluating session resume requests.
+    resume_manager: Arc<ResumeManager>,
 }
 
 impl RiftServer {
@@ -319,7 +357,7 @@ impl RiftServer {
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let ack_manager: SharedAckManager = Arc::new(AckManager::new());
-        let resume = Arc::new(ResumeManager::new());
+        let offset_tracker = self.session_store.offset_tracker().clone();
         let connection = Connection::new(
             id,
             self.broker.clone(),
@@ -327,7 +365,9 @@ impl RiftServer {
             self.config.clone(),
             self.metrics.clone(),
             ack_manager,
-            resume,
+            self.resume_manager.clone(),
+            offset_tracker,
+            self.session_store.clone(),
         );
         tokio::spawn(async move {
             if let Err(e) = connection.run(transport).await {

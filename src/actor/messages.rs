@@ -223,10 +223,7 @@ pub enum WireTopicMsg {
     ///
     /// * `request_id` -- correlation identifier for the response.
     /// * `frame` -- boxed frame to publish (boxed to reduce enum size).
-    Publish {
-        request_id: u32,
-        frame: Box<Frame>,
-    },
+    Publish { request_id: u32, frame: Box<Frame> },
 
     /// Subscribe a sink to the topic (wire equivalent of
     /// [`TopicMsg::Subscribe`]).
@@ -253,10 +250,7 @@ pub enum WireTopicMsg {
     ///
     /// * `request_id` -- correlation identifier for the response.
     /// * `id` -- the subscription ID to remove (as a raw `u64`).
-    Unsubscribe {
-        request_id: u32,
-        id: u64,
-    },
+    Unsubscribe { request_id: u32, id: u64 },
 
     /// Replay messages in an offset range (wire equivalent of
     /// [`TopicMsg::Replay`]).
@@ -266,11 +260,7 @@ pub enum WireTopicMsg {
     /// * `request_id` -- correlation identifier for the response.
     /// * `from` -- inclusive start offset.
     /// * `to` -- exclusive end offset.
-    Replay {
-        request_id: u32,
-        from: i64,
-        to: i64,
-    },
+    Replay { request_id: u32, from: i64, to: i64 },
 
     /// Fetch the latest snapshot (wire equivalent of
     /// [`TopicMsg::Snapshot`]).
@@ -278,9 +268,7 @@ pub enum WireTopicMsg {
     /// # Fields
     ///
     /// * `request_id` -- correlation identifier for the response.
-    Snapshot {
-        request_id: u32,
-    },
+    Snapshot { request_id: u32 },
 
     /// Get the head offset (wire equivalent of
     /// [`TopicMsg::HeadOffset`]).
@@ -288,9 +276,7 @@ pub enum WireTopicMsg {
     /// # Fields
     ///
     /// * `request_id` -- correlation identifier for the response.
-    HeadOffset {
-        request_id: u32,
-    },
+    HeadOffset { request_id: u32 },
 
     /// Drop all subscriptions for a sink (wire equivalent of
     /// [`TopicMsg::DropSink`]).
@@ -299,10 +285,7 @@ pub enum WireTopicMsg {
     ///
     /// * `request_id` -- correlation identifier for the response.
     /// * `sink_id` -- the numeric sink identifier to match.
-    DropSink {
-        request_id: u32,
-        sink_id: u64,
-    },
+    DropSink { request_id: u32, sink_id: u64 },
 
     /// Graceful shutdown request (wire equivalent of
     /// [`TopicMsg::Shutdown`]).
@@ -310,7 +293,5 @@ pub enum WireTopicMsg {
     /// # Fields
     ///
     /// * `request_id` -- correlation identifier for the response.
-    Shutdown {
-        request_id: u32,
-    },
+    Shutdown { request_id: u32 },
 }
