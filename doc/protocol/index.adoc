@@ -449,6 +449,96 @@ Each topic carries a `TopicProfile` with these policies:
 - Must not start with `$` (reserved for system topics).
 - Recommended convention: `/`‑delimited hierarchy (`room/{id}`, `user/{id}`, `org/{id}`).
 
+== Heartbeat Policy (spec §21)
+
+The server sends heartbeat parameters during the `ready` handshake.  The client
+must send a ping within `ping_interval_ms`; the server replies with a pong.  If
+`max_missed_pongs` consecutive pongs are missed, the connection is closed with
+`CloseCode::HeartbeatTimeout`.
+
+[cols="3,5a",options="header"]
+|===
+| Parameter | Default (spec §27.1)
+
+| `ping_interval_ms`
+| 25 000
+
+| `pong_timeout_ms`
+| 10 000
+
+| `max_missed_pongs`
+| 2
+
+| `idle_timeout_ms`
+| 300 000
+
+| `jitter_ms`
+| 2 500
+|===
+
+The `jitter_ms` value is a hint to the client — it should randomise its ping
+interval by ±`jitter_ms` to avoid thundering‑herd heartbeat storms.
+
+== Version Negotiation (spec §4)
+
+The protocol version is a 16‑bit unsigned integer encoded as `major * 256 + minor`.
+Rift/1.0 = 256.  During the `hello` handshake the client sends its version; the
+server replies with the negotiated version in `welcome`.  If the server cannot
+support the client's version, it closes with
+`RIFT_PROTOCOL_VERSION_UNSUPPORTED`.
+
+== Subscribe Modes (spec §9.3)
+
+[cols="2,6a",options="header"]
+|===
+| Mode | Behaviour
+
+| `live`
+| Receive only messages published after the subscription is accepted.
+
+| `replay`
+| Receive messages from a given offset forward.  Requires `replay_enabled` on the
+  topic profile.
+
+| `snapshot_then_live`
+| Server sends the latest snapshot (if available), then switches to live delivery.
+  Used for re‑initialisation after reconnect.
+
+| `last_value`
+| Server sends only the most recent retained message, then no further messages.
+|===
+
+== Priority Levels (spec §8.3)
+
+[cols="2,1,6a",options="header"]
+|===
+| Level | Tag | Treatment
+
+| `Critical`
+| 0
+| Always delivered.  Never dropped under backpressure.  Ack required.
+
+| `High`
+| 1
+| Delivered ahead of normal.  Dropped only under extreme pressure.
+
+| `Normal`
+| 2
+| Default priority.  Standard FIFO delivery.
+
+| `Low`
+| 3
+| Delivered after normal.  Eligible for coalescing.
+
+| `Volatile`
+| 4
+| May be dropped silently under backpressure.  No ack, no replay.
+
+| `Background`
+| 5
+| Bulk data, analytics.  Lowest priority.  Dropped first.
+|===
+
 == RemoteBroker Wire Protocol (Gateway ↔ Broker)
 
 The `RemoteBroker` communicates with an external broker node over a single TCP connection
