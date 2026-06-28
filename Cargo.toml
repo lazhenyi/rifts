@@ -3,7 +3,7 @@ name = "rifts"
 version = "0.3.3"
 edition = "2024"
 authors = ["Zhenyi <434836402@qq.com>"]
-description = "Rift Realtime Protocol / 1.0 — server-side implementation"
+description = "Rift Realtime Protocol / 1.0 — server + client implementation"
 repository = "https://github.com/rift-proto/rifts"
 homepage = "https://github.com/rift-proto/rifts"
 documentation = "https://docs.rs/rifts"
@@ -17,6 +17,9 @@ default = ["websocket"]
 
 # Standalone WebSocket transport (default).
 websocket = ["dep:tokio-tungstenite"]
+
+# Async client SDK with auto-reconnect, heartbeat, and typed events.
+client = ["websocket", "dep:rand"]
 
 # Embedded persistent storage via sled.
 sled = ["dep:sled"]
@@ -49,6 +52,7 @@ tracing = "0.1"
 async-trait = "0.1"
 tokio-util = { version = "0.7", features = ["rt", "codec"] }
 sled = { version = "0.34", optional = true }
+rand = { version = "0.9", optional = true }
 
 # Framework adapters (optional, gated by features).
 axum = { version = "0.8", optional = true, features = ["ws"] }

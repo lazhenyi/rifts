@@ -68,6 +68,10 @@
 /// Message acknowledgement (ack / nack) semantics and tracking.
 pub mod ack;
 
+/// Async client SDK with auto-reconnect, heartbeat, and typed events.
+#[cfg(feature = "client")]
+pub mod client;
+
 /// Actor model abstraction — ActorRef, TopicActor, ActorRegistry.
 pub mod actor;
 
