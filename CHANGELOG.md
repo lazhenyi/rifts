@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.1] — 2026-06-28
+
+### Documentation
+
+- **Architecture** — flow control section expanded with `RateLimiter`
+  alongside `BackpressureController`; metrics and trace context
+  sections added.
+- **Protocol reference** — heartbeat policy, version negotiation,
+  subscribe modes, and priority levels documented.
+- **Examples** — custom `TopicProfile`, Prometheus metrics export,
+  per-connection rate limiting, and trace context propagation examples
+  added.
+
 ## [0.2.1] — 2026-06-28
 
 ### Fixed
