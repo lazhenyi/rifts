@@ -1,4 +1,28 @@
-//! Message types — spec §8.
+//! # Message Types -- Semantic Layer
+//!
+//! This module implements the message type system defined in spec section 8.
+//!
+//! ## Message Classes
+//!
+//! | Class | Purpose | Default Delivery Mode |
+//! |-------|---------|----------------------|
+//! | `Event` | Business events | AtLeastOnce |
+//! | `Command` | Request-style commands (RPC semantics) | AtLeastOnce |
+//! | `Reply` | Command responses | AtLeastOnce |
+//! | `State` | State messages (only the latest value per key is valid) | LatestOnly |
+//! | `Datagram` | High-frequency, loss-tolerant datagrams | BestEffort |
+//! | `Stream` | Continuously ordered data streams (AI tokens, file chunks, etc.) | DurableOrdered |
+//! | `Snapshot` | Topic state snapshots | AtLeastOnce |
+//! | `System` | System control messages | AtLeastOnce |
+//!
+//! ## Submodules
+//!
+//! - [`command`]: Command (request) and Reply (response)
+//! - [`datagram`]: High-frequency datagrams
+//! - [`event`]: Business events
+//! - [`snapshot`]: Topic state snapshots
+//! - [`state`]: State messages and Presence
+//! - [`stream`]: Continuously ordered stream segments
 
 pub mod command;
 pub mod datagram;
@@ -9,21 +33,33 @@ pub mod stream;
 
 use serde::{Deserialize, Serialize};
 
-/// Top-level message class (spec §8.1).
+/// Message class (spec section 8.1).
+///
+/// Every [`Message`] has exactly one `MessageClass`, which determines
+/// the message's delivery semantics, retention policy, and client-side handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageClass {
+    /// Business event -- a regular message in the publish/subscribe model.
     Event,
+    /// Request-style command -- carries a `correlation_id` and expects a Reply from the peer.
     Command,
+    /// Command response -- the Reply paired with a Command.
     Reply,
+    /// State message -- only the latest value per `state_key` is retained.
     State,
+    /// High-frequency datagram -- loss-tolerant, low-latency (e.g. mouse movement, input state).
     Datagram,
+    /// Continuously ordered stream segment -- used for AI token streams, file transfers, audio/video frames, etc.
     Stream,
+    /// Topic state snapshot -- used for fast initialization after reconnection.
     Snapshot,
+    /// System control message -- used internally by the protocol.
     System,
 }
 
 impl MessageClass {
+    /// Returns the string representation of the message class (used for serialization and logging).
     pub fn as_str(self) -> &'static str {
         match self {
             MessageClass::Event => "event",
@@ -38,20 +74,31 @@ impl MessageClass {
     }
 }
 
-/// Delivery semantics (spec §8.2).
+/// Delivery semantics (spec section 8.2).
+///
+/// Determines how a message behaves on network anomalies: whether it is retried,
+/// persisted, or only the latest value is retained.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
+    /// At-most-once delivery -- no retries, no acknowledgment, may be lost.
     AtMostOnce,
+    /// At-least-once delivery -- may be duplicated; the receiver must deduplicate.
     AtLeastOnce,
+    /// Exactly-once effect -- guarantees equivalent-to-exactly-once semantics through idempotency.
     ExactlyOnceEffect,
+    /// Latest-only -- old messages are overwritten by newer ones (e.g. state messages).
     LatestOnly,
+    /// Best-effort delivery -- no delivery guarantee, suitable for high-frequency, low-value data.
     BestEffort,
+    /// Durable ordered -- written to a persistent log and delivered strictly in offset order.
     DurableOrdered,
 }
 
 impl DeliveryMode {
-    /// Default delivery mode for a message class (spec §8.2).
+    /// Returns the default delivery mode for a given message class (spec section 8.2).
+    ///
+    /// Used as the fallback when no delivery mode is explicitly specified at message creation time.
     pub fn default_for(class: MessageClass) -> Self {
         match class {
             MessageClass::Event => DeliveryMode::AtLeastOnce,
@@ -66,55 +113,100 @@ impl DeliveryMode {
     }
 }
 
-/// Subscription mode (spec §10.1).
+/// Subscribe mode (spec section 10.1).
+///
+/// Determines the scope and method of message reception when a client joins a topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscribeMode {
+    /// Only receive new messages that arrive after the subscription is established.
     Live,
+    /// Replay historical messages starting from a specified offset; no real-time messages.
     Replay,
+    /// Send a snapshot first, then switch to live mode (recommended for UI synchronization).
     SnapshotThenLive,
+    /// Only fetch the latest state snapshot of the topic.
     Latest,
+    /// Passive mode -- does not count toward the subscriber count and does not affect retention policy.
     Passive,
+    /// Ephemeral subscription -- not persisted, not restored after disconnection.
     Ephemeral,
 }
 
-/// Subscribe acknowledgement result (spec §10.2).
+/// Subscribe acknowledgment result (spec section 10.2).
+///
+/// Status code returned by the server after processing a subscribe request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SubscribeResult {
+    /// Subscription accepted.
     Accepted,
+    /// Subscription denied (insufficient permissions or policy restrictions).
     Denied,
+    /// Topic does not exist and auto-creation is not allowed.
     NotFound,
+    /// Topic is closed.
     Gone,
+    /// Historical message replay required (server returns a starting offset).
     ReplayRequired,
+    /// Snapshot required (snapshot-mode subscription).
     SnapshotRequired,
+    /// Subscription request was rate-limited.
     RateLimited,
+    /// Server is overloaded, temporarily rejecting.
     Overloaded,
+    /// Filter expression has a syntax error.
     InvalidFilter,
 }
 
-/// A typed message exchanged with the broker.
+/// Typed messages exchanged with the Broker.
 ///
-/// Most variants wrap the on-wire structs from each submodule; the
-/// `Raw` variant is the escape hatch used when we don't have a typed
-/// representation (e.g. a state message that is purely a JSON value).
+/// Each variant wraps the corresponding struct from its submodule; the `System` variant
+/// is used for internal system communication.
+///
+/// # Pattern matching
+///
+/// ```rust,no_run
+/// use rifts::message::{Message, MessageClass};
+///
+/// fn classify(msg: &Message) {
+///     match msg {
+///         Message::Event(e) => { /* handle business event */ }
+///         Message::Command(c) => { /* handle command request */ }
+///         Message::State(s) => { /* handle state update */ }
+///         _ => {}
+///     }
+/// }
+/// ```
 #[derive(Debug, Clone)]
 pub enum Message {
+    /// Business event.
     Event(event::Event),
+    /// Request-style command.
     Command(command::Command),
+    /// Command response.
     Reply(command::Reply),
+    /// State message.
     State(state::State),
+    /// High-frequency datagram.
     Datagram(datagram::Datagram),
+    /// Continuous stream segment.
     Stream(stream::StreamSegment),
+    /// Topic state snapshot.
     Snapshot(snapshot::Snapshot),
-    /// Generic system message keyed by an event name.
+    /// Generic system message, routed by event name.
     System {
+        /// System event name (e.g. "heartbeat", "degradation").
         event: String,
+        /// System message payload.
         payload: serde_json::Value,
     },
 }
 
 impl Message {
+    /// Returns the class this message belongs to.
+    ///
+    /// Useful for generic dispatch when the specific variant is not important.
     pub fn class(&self) -> MessageClass {
         match self {
             Message::Event(_) => MessageClass::Event,

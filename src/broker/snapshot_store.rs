@@ -1,4 +1,32 @@
-//! Snapshot store — spec §13.4.
+//! Snapshot store — spec section 13.4.
+//!
+//! This module provides an in-process snapshot store that captures and
+//! retrieves per-topic snapshots. A snapshot represents the latest
+//! state of a topic at a particular message offset, allowing
+//! subscribers to bootstrap quickly without replaying the entire
+//! message history.
+//!
+//! # Retention policy
+//!
+//! Only the most recent snapshot per topic is retained. When a new
+//! snapshot is captured for a topic that already has one, the previous
+//! snapshot is overwritten. Snapshots can optionally be configured
+//! with a time-to-live (TTL); expired snapshots are treated as absent
+//! and are returned as `None` by [`SnapshotStore::get`].
+//!
+//! # Snapshot capture
+//!
+//! The [`SnapshotStore::capture`] method pulls the latest log entry
+//! from a [`TopicStore`] and records it as a snapshot. The caller
+//! provides an optional TTL duration; if `None`, the snapshot never
+//! expires. Each snapshot is assigned a unique UUID identifier.
+//!
+//! # Shared access
+//!
+//! The store is wrapped in a [`parking_lot::RwLock`] internally,
+//! allowing multiple concurrent readers or a single writer. A shared
+//! reference can be distributed via the [`SharedSnapshotStore`] type
+//! alias (`Arc<SnapshotStore>`).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -11,19 +39,55 @@ use uuid::Uuid;
 
 use crate::topic::TopicStore;
 
+/// A captured snapshot of a topic's state at a particular offset.
+///
+/// Contains the snapshot payload, metadata about when it was created,
+/// and an optional expiration timestamp. Instances are produced by
+/// [`SnapshotStore::capture`] and consumed by subscribers that want
+/// to bootstrap from the latest state.
 #[derive(Debug, Clone)]
 pub struct StoredSnapshot {
+    /// Unique identifier for this snapshot, generated as a UUID v4
+    /// string. Used to distinguish snapshots and for cache keys.
     pub snapshot_id: String,
+    /// The topic name this snapshot belongs to.
     pub topic: String,
+    /// The message offset at which this snapshot was taken. All
+    /// messages with offsets greater than this value occurred after
+    /// the snapshot.
     pub base_offset: i64,
+    /// The snapshot payload — the serialized state of the topic at
+    /// the time the snapshot was captured.
     pub payload: bytes::Bytes,
+    /// Epoch millisecond timestamp when the snapshot was created.
     pub created_at: i64,
+    /// Optional epoch millisecond timestamp at which the snapshot
+    /// expires. If `None`, the snapshot never expires. If the current
+    /// time exceeds this value, [`SnapshotStore::get`] returns `None`.
     pub expires_at: Option<i64>,
 }
 
-/// In-process snapshot store. One snapshot per topic is retained
-/// (the most recent); older ones are overwritten.
+/// In-process snapshot store with per-topic retention.
+///
+/// Stores at most one snapshot per topic (the most recent). Older
+/// snapshots for the same topic are silently overwritten. The store
+/// is protected by a [`parking_lot::RwLock`] for concurrent read
+/// access and exclusive write access.
+///
+/// # Examples
+///
+/// ```ignore
+/// use rifts::broker::SnapshotStore;
+/// use std::time::Duration;
+///
+/// let store = SnapshotStore::new();
+/// let snapshot = store.capture("orders", &topic_store, Some(Duration::from_secs(300)));
+/// if let Some(snap) = snapshot {
+///     println!("Snapshot at offset {}: {} bytes", snap.base_offset, snap.payload.len());
+/// }
+/// ```
 pub struct SnapshotStore {
+    /// Map from topic name to the most recent snapshot for that topic.
     inner: RwLock<HashMap<String, StoredSnapshot>>,
 }
 
@@ -42,14 +106,34 @@ impl Default for SnapshotStore {
 }
 
 impl SnapshotStore {
+    /// Create an empty snapshot store with no captured snapshots.
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
         }
     }
 
-    /// Take a snapshot of the topic's current state. Pulls the latest
-    /// log entry from the `TopicStore` and records it.
+    /// Capture a snapshot of a topic's current state.
+    ///
+    /// Retrieves the latest log entry from the provided
+    /// [`TopicStore`] for the given topic, wraps it in a
+    /// [`StoredSnapshot`] with a new UUID and the current timestamp,
+    /// and stores it. Any previously stored snapshot for the same
+    /// topic is overwritten.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` — The topic name to snapshot.
+    /// * `store` — The [`TopicStore`] from which to pull the latest
+    ///   log entry.
+    /// * `ttl` — Optional time-to-live duration. If `Some(d)`, the
+    ///   snapshot's `expires_at` is set to `now + d`. If `None`, the
+    ///   snapshot never expires.
+    ///
+    /// # Returns
+    ///
+    /// `Some(StoredSnapshot)` if the topic exists and has at least
+    /// one log entry, `None` otherwise.
     pub fn capture(
         &self,
         topic: &str,
@@ -71,7 +155,15 @@ impl SnapshotStore {
         Some(stored)
     }
 
-    /// Get a snapshot, returning `None` if it has expired.
+    /// Retrieve the most recent snapshot for a topic.
+    ///
+    /// Returns `None` if no snapshot has been captured for the topic,
+    /// or if the snapshot's `expires_at` timestamp is in the past
+    /// (i.e. the snapshot has expired).
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` — The topic name to look up.
     pub fn get(&self, topic: &str) -> Option<StoredSnapshot> {
         let snap = self.inner.read().get(topic).cloned()?;
         if let Some(expires) = snap.expires_at
@@ -82,16 +174,34 @@ impl SnapshotStore {
         Some(snap)
     }
 
+    /// Remove the snapshot for a topic, returning it if one existed.
+    ///
+    /// After removal, subsequent calls to [`get`](SnapshotStore::get)
+    /// for the same topic will return `None` until a new snapshot is
+    /// captured.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` — The topic whose snapshot should be removed.
     pub fn remove(&self, topic: &str) -> Option<StoredSnapshot> {
         self.inner.write().remove(topic)
     }
 
+    /// List all currently stored snapshots across all topics.
+    ///
+    /// Returns a `Vec` of cloned snapshot records. This includes
+    /// snapshots that may have logically expired but have not yet been
+    /// removed. Callers should check `expires_at` if they need to
+    /// filter out expired snapshots.
     pub fn list(&self) -> Vec<StoredSnapshot> {
         self.inner.read().values().cloned().collect()
     }
 }
 
-/// Shared snapshot store.
+/// A type alias for a thread-safe, shared snapshot store.
+///
+/// Wraps [`SnapshotStore`] in an `Arc` for sharing across async tasks
+/// and broker components.
 pub type SharedSnapshotStore = Arc<SnapshotStore>;
 
 #[cfg(test)]
@@ -154,7 +264,7 @@ mod tests {
             timestamp: 0,
         });
         let snaps = SnapshotStore::new();
-        // Capture with 0-ms TTL → expires immediately.
+        // Capture with 0-ms TTL — expires immediately.
         snaps.capture("t", &store, Some(Duration::from_millis(0)));
         // Manually set expires_at to 0.
         if let Some(snap) = snaps.inner.write().get_mut("t") {

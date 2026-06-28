@@ -1,7 +1,24 @@
-//! Offset tracking — per-topic last processed offset for a session.
+//! # Offset Tracker
 //!
-//! Used to drive resume (spec §13.2): the client submits its
-//! `last_offsets`; the server replays anything the client missed.
+//! Tracks the last processed offset per topic for each session. This
+//! information is the foundation of the resume mechanism defined in the
+//! protocol specification section 13.2: when a client reconnects it
+//! submits its `last_offsets`, and the server uses those offsets (along
+//! with the current head offsets) to decide what data the client missed.
+//!
+//! ## Components
+//!
+//! * [`OffsetTracker`] -- A thread-safe, in-memory store mapping
+//!   `(SessionId, topic)` pairs to the latest offset the session has
+//!   acknowledged. Used by the server to record progress and by the
+//!   resume system to retrieve the client's last-known position.
+//!
+//! * [`ResumeDecision`] -- An enum describing the outcome of comparing
+//!   a client's last offsets against the server's current head offsets.
+//!   Each variant maps to a distinct action the server should take.
+//!
+//! * [`decide`] -- The pure function that computes a [`ResumeDecision`]
+//!   given the client's and server's offset maps.
 
 use std::collections::HashMap;
 
@@ -10,17 +27,31 @@ use parking_lot::Mutex;
 use crate::session::session::SessionId;
 
 /// Per-session offset tracker.
+///
+/// Maintains a mapping from [`SessionId`] to a set of `(topic, offset)`
+/// pairs. The inner map is protected by a [`Mutex`] for concurrent access.
+///
+/// This tracker is typically owned by the [`ResumeManager`](crate::session::resume::ResumeManager)
+/// and updated by the broker each time a session acknowledges a message.
 #[derive(Default)]
 pub struct OffsetTracker {
+    /// Maps each session to its topic-to-offset map. The outer key is
+    /// the [`SessionId`]; the inner key is the topic name and the value
+    /// is the highest offset the session has processed for that topic.
     inner: Mutex<HashMap<SessionId, HashMap<String, i64>>>,
 }
 
 impl OffsetTracker {
+    /// Create a new, empty offset tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Record the latest offset the session has processed for `topic`.
+    ///
+    /// If the session has no prior entry, one is created automatically.
+    /// If the session already has an offset for this topic, it is
+    /// overwritten with the new value.
     pub fn record(&self, session: &SessionId, topic: &str, offset: i64) {
         let mut g = self.inner.lock();
         g.entry(session.clone())
@@ -29,6 +60,9 @@ impl OffsetTracker {
     }
 
     /// Read the last recorded offset for `(session, topic)`.
+    ///
+    /// Returns `None` if the session has never recorded an offset for
+    /// this topic, or if the session itself is unknown to the tracker.
     pub fn get(&self, session: &SessionId, topic: &str) -> Option<i64> {
         self.inner
             .lock()
@@ -36,30 +70,86 @@ impl OffsetTracker {
             .and_then(|m| m.get(topic).copied())
     }
 
-    /// Bulk read of all topics for a session.
+    /// Bulk read of all topics and their offsets for a session.
+    ///
+    /// Returns a cloned snapshot of the topic-to-offset map for the
+    /// given session. If the session has never been recorded, returns
+    /// an empty map.
     pub fn snapshot(&self, session: &SessionId) -> HashMap<String, i64> {
         self.inner.lock().get(session).cloned().unwrap_or_default()
     }
 
-    /// Drop a session.
+    /// Drop all offset data for a session.
+    ///
+    /// After this call, [`get`](Self::get) and [`snapshot`](Self::snapshot)
+    /// will return `None` / empty for this session. This is typically
+    /// called when a session is closed or expired.
     pub fn forget(&self, session: &SessionId) {
         self.inner.lock().remove(session);
     }
 }
 
-/// Resume decision result (spec §13.3).
+/// Resume decision result as defined in the protocol specification
+/// section 13.3.
+///
+/// Each variant describes a different relationship between the client's
+/// last-known offsets and the server's current head offsets, and maps
+/// directly to a strategy the server should follow when deciding whether
+/// to allow a resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeDecision {
+    /// The client's offsets match the server's head exactly. The client
+    /// has missed nothing and can proceed immediately.
     FullResume,
+
+    /// The client is behind on at least one topic by more than one
+    /// offset. A partial replay is needed for those topics.
     PartialResume,
+
+    /// The client is behind on at least one topic but only by a single
+    /// offset within each topic. A lightweight replay of the missing
+    /// messages is sufficient.
     Replaying,
+
+    /// At least one topic the client tracks is not present on the
+    /// server (possibly due to compaction or expiry). The client must
+    /// pull a fresh snapshot before continuing.
     SnapshotRequired,
+
+    /// The client submitted an empty offset map, indicating it has
+    /// never subscribed to any topics. A full re-subscription from
+    /// scratch is required.
     ColdStart,
+
+    /// The client's reported offset for at least one topic exceeds
+    /// the server's head. This indicates data corruption or a
+    /// protocol violation. The resume attempt must be rejected.
     Rejected,
 }
 
 /// Decide what to do with a resume attempt given the client's offsets
 /// and the topic's current state.
+///
+/// This is a pure function with no side effects. It iterates over the
+/// client's reported offsets and compares them to the server's head
+/// offsets, returning the most appropriate [`ResumeDecision`].
+///
+/// # Arguments
+///
+/// * `last_offsets` -- The offsets the client claims to have last
+///   processed, keyed by topic name. May be empty for a cold start.
+///
+/// * `topic_offsets` -- The server's current head offsets, keyed by
+///   topic name.
+///
+/// # Decision Logic
+///
+/// 1. Empty `last_offsets` => [`ColdStart`](ResumeDecision::ColdStart).
+/// 2. Any topic missing from the server => [`SnapshotRequired`](ResumeDecision::SnapshotRequired).
+/// 3. Client ahead of server on any topic => [`Rejected`](ResumeDecision::Rejected).
+/// 4. Client behind by exactly 1 on every lagging topic => [`Replaying`](ResumeDecision::Replaying).
+/// 5. Client behind by more than 1 on any topic => [`PartialResume`](ResumeDecision::PartialResume).
+/// 6. All offsets match => [`FullResume`](ResumeDecision::FullResume).
 pub fn decide(
     last_offsets: &HashMap<String, i64>,
     topic_offsets: &HashMap<String, i64>,

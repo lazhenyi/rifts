@@ -1,211 +1,346 @@
-//! Top-level error type for the Rift/1 server.
+//! # Global Error Type Hierarchy
+//!
+//! This module defines the complete error classification system for the Rift server,
+//! using a layered enum design:
+//!
+//! ```text
+//! RiftError
+//! ├── FrameReject      — Frame-level rejection (malformed structure, unsupported version, payload too large, etc.)
+//! ├── SessionReject    — Session-level rejection (not found, expired, conflict, replay offset expired, etc.)
+//! ├── TopicReject      — Topic-level rejection (not found, closed, overloaded, insufficient permissions, etc.)
+//! ├── MessageReject    — Message-level rejection (duplicate, expired, ack timeout, etc.)
+//! ├── AuthReject       — Authentication/authorization rejection (missing, invalid, expired, insufficient permissions, etc.)
+//! ├── SystemReject     — System-level failures (overloaded, maintenance, shard migration, region unavailable, etc.)
+//! ├── ConfigError      — Configuration errors
+//! ├── Io               — I/O errors
+//! ├── SerdeJson / Cbor* — Serialization errors
+//! ├── WebSocket        — WebSocket transport errors
+//! └── Other            — Catch-all fallback
+//! ```
+//!
+//! Each sub-enum implements `thiserror::Error`, providing clear error messages and
+//! automatic `From` conversions.  The top-level `RiftError` uses `#[from]` to derive
+//! `From` impls for every sub-type.
 
 use thiserror::Error;
 
-/// Result alias used throughout the crate.
+/// Convenience `Result` alias used throughout the crate.
+///
+/// Equivalent to `std::result::Result<T, RiftError>`, simplifying function signatures.
 pub type Result<T> = std::result::Result<T, RiftError>;
 
-/// Reasons a frame may be rejected during decode/validation.
+/// Frame-level rejection reasons.
+///
+/// Produced during frame decoding and validation in the [`frame`](crate::frame) module,
+/// indicating that the client sent a frame that does not conform to the protocol
+/// specification or exceeds server-imposed limits.
 #[derive(Debug, Error)]
 pub enum FrameReject {
-    /// The client's protocol version is not supported by this server.
+    /// The client's protocol version is not supported by the server.
+    ///
+    /// The range of supported versions is determined by
+    /// [`version::SUPPORTED`](crate::protocol::version).
+    /// When this error is triggered the server should inform the client of
+    /// the supported version range via an Error frame.
     #[error("protocol version unsupported: client={client}, server={server}")]
     ProtocolVersionUnsupported { client: u16, server: u16 },
 
-    /// The frame is structurally invalid or contains illegal values.
+    /// The frame structure is invalid: missing fields, wrong types, corrupted encoding, etc.
+    ///
+    /// Carries a human-readable description intended for logging and debugging.
     #[error("frame is malformed: {0}")]
     FrameInvalid(String),
 
-    /// The client requested a codec the server does not support.
+    /// The codec requested by the client is not supported by the server.
+    ///
+    /// Typically occurs during codec negotiation in the Hello phase.
     #[error("codec unsupported: {0}")]
     CodecUnsupported(String),
 
-    /// The payload exceeds the server-configured maximum.
+    /// The payload exceeds the maximum size configured on the server.
+    ///
+    /// `actual` is the number of bytes received; `max` is
+    /// [`ServerConfig::max_payload_bytes`](crate::config::ServerConfig).
     #[error("payload too large: {actual} > {max}")]
     PayloadTooLarge { actual: usize, max: usize },
 
-    /// A required protocol field was absent.
+    /// A required field specified by the protocol is missing.
+    ///
+    /// The field name is a compile-time string literal for easy log correlation.
     #[error("required field missing: {0}")]
     RequiredFieldMissing(&'static str),
 
-    /// The frame schema does not match the expected schema.
+    /// The frame structure does not match the expected schema.
+    ///
+    /// For example: a Subscribe frame carrying a Publish-only field.
     #[error("schema mismatch: {0}")]
     SchemaMismatch(String),
 
-    /// The frame violates the message ordering contract.
+    /// The frame violates a message ordering constraint.
+    ///
+    /// For example: sending messages out of order in stream mode.
     #[error("order violation: {0}")]
     OrderViolation(String),
 }
 
-/// Reasons a session or resume attempt may fail.
+/// Session/resume operation rejection reasons.
+///
+/// Produced during session lookup, resumption, and replay stages,
+/// typically triggering a disconnect-reconnect flow.
 #[derive(Debug, Error)]
 pub enum SessionReject {
     /// The requested session does not exist.
+    ///
+    /// Possible causes: the session expired and was garbage-collected,
+    /// the `session_id` is misspelled, or the session was never created.
     #[error("session not found: {0}")]
     NotFound(String),
 
     /// The session has expired.
+    ///
+    /// The expiration duration is controlled by
+    /// [`ServerConfig::idle_timeout`](crate::config::ServerConfig).
     #[error("session expired")]
     Expired,
 
-    /// The client's epoch does not match the server's.
+    /// The client's epoch does not match the one recorded by the server.
+    ///
+    /// An epoch conflict indicates the server has restarted or undergone
+    /// failover, making the old session state unreliable.
     #[error("session epoch conflict: incoming={incoming}, current={current}")]
     Conflict { incoming: u32, current: u32 },
 
-    /// The resume attempt was rejected.
+    /// The resume request was rejected.
+    ///
+    /// Carries a human-readable description of the rejection reason.
     #[error("resume rejected: {0}")]
     ResumeRejected(String),
 
-    /// The requested replay offset is no longer available.
+    /// The requested replay offset has expired and is no longer within the
+    /// server's retained replay window.
+    ///
+    /// The client should switch to snapshot mode to obtain the current state
+    /// and then begin consuming from the latest offset.
     #[error("replay offset expired: topic={topic}, requested={requested}")]
     ReplayOffsetExpired { topic: String, requested: i64 },
 
-    /// A full snapshot is required before continuing.
+    /// The topic requires a snapshot before consumption can continue.
+    ///
+    /// Triggered when the topic has snapshots enabled and the consumer's
+    /// offset is too far behind.
     #[error("snapshot required for topic: {0}")]
     SnapshotRequired(String),
 }
 
-/// Reasons a topic operation may fail.
+/// Topic operation rejection reasons.
+///
+/// Produced during topic lookup, creation, publishing, and subscription operations.
 #[derive(Debug, Error)]
 pub enum TopicReject {
     /// The topic does not exist.
     #[error("topic not found: {0}")]
     NotFound(String),
 
-    /// The topic has been closed and no longer accepts messages.
+    /// The topic is closed and no longer accepts new messages.
     #[error("topic closed: {0}")]
     Closed(String),
 
-    /// The topic is currently overloaded.
+    /// The topic is currently overloaded and temporarily rejecting new requests.
+    ///
+    /// The client should retry after the interval indicated by the server.
     #[error("topic overloaded: {0}")]
     Overloaded(String),
 
-    /// The topic has reached its maximum number of subscribers.
+    /// The topic has reached its subscriber limit.
+    ///
+    /// The limit is defined by
+    /// [`TopicProfile::max_subscribers`](crate::topic::TopicProfile).
     #[error("topic subscriber limit reached: {0}")]
     SubscriberLimit(String),
 
-    /// The topic has reached its maximum number of publishers.
+    /// The topic has reached its publisher limit.
+    ///
+    /// The limit is defined by
+    /// [`TopicProfile::max_publishers`](crate::topic::TopicProfile).
     #[error("topic publisher limit reached: {0}")]
     PublisherLimit(String),
 
-    /// The caller does not have permission to access this topic.
+    /// The current identity is not authorized to access this topic.
+    ///
+    /// Typically returned by [`AuthProvider`](crate::session::AuthProvider).
     #[error("topic forbidden: {0}")]
     Forbidden(String),
 
-    /// The topic is rate-limited.
+    /// Topic-level rate limiting has been triggered.
+    ///
+    /// The client should reduce its send rate.
     #[error("topic rate limited: {0}")]
     RateLimited(String),
 
     /// The topic name is invalid.
+    ///
+    /// Valid names must be non-empty, at most 256 characters, and contain
+    /// only `[a-zA-Z0-9._/-]`.
     #[error("invalid topic name: {0}")]
     InvalidName(String),
 }
 
-/// Reasons a message may be rejected.
+/// Message-level rejection reasons.
+///
+/// Produced during message publishing, acknowledgment, and distribution.
 #[derive(Debug, Error)]
 pub enum MessageReject {
-    /// A message with this dedupe key was already processed.
+    /// The message's `dedupe_key` has already been seen within the deduplication window.
+    ///
+    /// The deduplication window is controlled by
+    /// [`ServerConfig::dedupe_window`](crate::config::ServerConfig).
     #[error("duplicate message: id={0}")]
     Duplicate(String),
 
     /// The message has expired.
+    ///
+    /// The message's TTL or `expires_at` timestamp has elapsed; it will
+    /// not be delivered.
     #[error("message expired")]
     Expired,
 
-    /// The message was rejected by application logic.
+    /// The message was rejected by application-layer logic.
+    ///
+    /// For example: the message content does not satisfy business validation rules.
     #[error("message rejected: {0}")]
     Rejected(String),
 
-    /// The message exceeds the maximum size.
+    /// The message exceeds the size limit.
+    ///
+    /// `actual` is the size in bytes; `max` is
+    /// [`ServerConfig::max_payload_bytes`](crate::config::ServerConfig).
     #[error("message too large: {actual} > {max}")]
     TooLarge { actual: usize, max: usize },
 
-    /// The acknowledgement for this message timed out.
+    /// Waiting for the message acknowledgment (ack) timed out.
+    ///
+    /// The consumer did not send an ack or nack within the expected time,
+    /// so the message is considered a delivery failure.
     #[error("ack timeout: id={0}")]
     AckTimeout(String),
 
     /// Delivery to at least one subscriber failed.
+    ///
+    /// Possible causes: the consumer's outbound queue is full,
+    /// the connection was dropped, etc.
     #[error("delivery failed: {0}")]
     DeliveryFailed(String),
 }
 
-/// Authentication / authorization failures.
+/// Authentication / authorization failure reasons.
+///
+/// Produced during the Hello-phase authentication or topic access authorization.
 #[derive(Debug, Error)]
 pub enum AuthReject {
-    /// Authentication is required but was not provided.
+    /// The server requires authentication but the client did not provide credentials.
+    ///
+    /// The server should include an `auth_required` hint in the Error frame.
     #[error("authentication required")]
     Required,
 
-    /// The provided authentication is invalid.
+    /// The provided credentials are invalid (token not found, signature mismatch, etc.).
     #[error("authentication invalid: {0}")]
     Invalid(String),
 
-    /// The authentication has expired.
+    /// The credentials have expired.
+    ///
+    /// The client should refresh its token and reconnect.
     #[error("authentication expired")]
     Expired,
 
-    /// The authentication has been revoked.
+    /// The credentials have been revoked (e.g., by an administrator).
     #[error("authentication revoked")]
     Revoked,
 
-    /// The authenticated principal lacks permission.
+    /// Authentication succeeded, but the current identity lacks permission
+    /// to perform the requested operation.
+    ///
+    /// For example: a regular user attempting to publish to a protected topic.
     #[error("permission denied: {0}")]
     Denied(String),
 }
 
-/// System-level failures.
+/// System-level failure reasons.
+///
+/// Triggered by infrastructure-level issues that are typically not recoverable
+/// through client-side action alone.
 #[derive(Debug, Error)]
 pub enum SystemReject {
-    /// The system is currently overloaded.
+    /// The server is globally overloaded (CPU, memory, connection count, etc.).
+    ///
+    /// The client should reconnect using exponential backoff.
     #[error("system overloaded")]
     Overloaded,
 
-    /// The system is under maintenance.
+    /// The server is undergoing maintenance and is temporarily unavailable.
     #[error("system maintenance")]
     Maintenance,
 
-    /// The responsible shard has moved to a different node.
+    /// The shard responsible for the topic has moved to another node.
+    ///
+    /// In a distributed deployment the client should reconnect to the new address.
     #[error("shard moved: topic={0}")]
     ShardMoved(String),
 
-    /// This region is currently unavailable.
+    /// The current region is unavailable.
+    ///
+    /// The client should switch to a different available region.
     #[error("region unavailable: {0}")]
     RegionUnavailable(String),
 
     /// An internal error occurred.
+    ///
+    /// Carries a descriptive message that is typically recorded in server logs.
+    /// Clients should not attempt to parse this text.
     #[error("internal error: {0}")]
     Internal(String),
 }
 
-/// Top-level error for all Rift/1 server operations.
+/// Top-level error type that combines all error sub-types.
 ///
-/// The categories live as dedicated enums (`FrameReject`,
-/// `SessionReject`, `TopicReject`, `MessageReject`, `AuthReject`,
-/// `SystemReject`); this top-level type composes them so call-sites
-/// can match on a single result.
+/// Uses `#[from]` to automatically implement `From` for each sub-type, allowing
+/// the `?` operator to propagate errors across function boundaries.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use rifts::error::{RiftError, TopicReject, Result};
+///
+/// fn find_topic(name: &str) -> Result<()> {
+///     if name.is_empty() {
+///         return Err(TopicReject::InvalidName("empty".into()).into());
+///     }
+///     Ok(())
+/// }
+/// ```
 #[derive(Debug, Error)]
 pub enum RiftError {
-    /// Frame-level error.
+    /// Frame-level error (malformed structure, unsupported version, etc.).
     #[error(transparent)]
     Frame(#[from] FrameReject),
 
-    /// Session-level error.
+    /// Session-level error (not found, expired, conflict, etc.).
     #[error(transparent)]
     Session(#[from] SessionReject),
 
-    /// Topic-level error.
+    /// Topic-level error (not found, overloaded, insufficient permissions, etc.).
     #[error(transparent)]
     Topic(#[from] TopicReject),
 
-    /// Message-level error.
+    /// Message-level error (duplicate, expired, ack timeout, etc.).
     #[error(transparent)]
     Message(#[from] MessageReject),
 
-    /// Authentication error.
+    /// Authentication / authorization error.
     #[error(transparent)]
     Auth(#[from] AuthReject),
 
-    /// System-level error.
+    /// System-level failure.
     #[error(transparent)]
     System(#[from] SystemReject),
 
@@ -213,27 +348,36 @@ pub enum RiftError {
     #[error("config error: {0}")]
     Config(#[from] ConfigError),
 
-    /// I/O error from the operating system or transport.
+    /// Operating-system or transport-layer I/O error.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
 
-    /// serde_json serialization/deserialization error.
+    /// `serde_json` serialization / deserialization error.
+    ///
+    /// Wrapped in `BoxedStdError` to avoid exposing `serde_json::Error` in the
+    /// public API.
     #[error("serde_json error: {0}")]
     SerdeJson(BoxedStdError),
 
-    /// CBOR serialization error.
+    /// CBOR serialization error (`ciborium::ser`).
     #[error("ciborium error: {0}")]
     Cbor(BoxedStdError),
 
-    /// CBOR deserialization error.
+    /// CBOR deserialization error (`ciborium::de`).
     #[error("ciborium de error: {0}")]
     CborDe(BoxedStdError),
 
-    /// WebSocket transport error.
+    /// WebSocket transport-layer error.
+    ///
+    /// Only available when the `websocket` feature is enabled.
     #[error("websocket error: {0}")]
     WebSocket(BoxedStdError),
 
-    /// Catch-all for other error types.
+    /// Catch-all variant for wrapping errors that cannot be classified
+    /// into a more specific variant.
+    ///
+    /// Prefer a more specific variant whenever possible; use this only
+    /// when the error type cannot be enumerated in advance.
     #[error("other: {0}")]
     Other(BoxedStdError),
 }
@@ -263,45 +407,78 @@ impl From<tokio_tungstenite::tungstenite::Error> for RiftError {
     }
 }
 
-/// Convenience wrapper so arbitrary `std::error::Error` can be lifted
-/// into `RiftError::Other` without forcing a new variant for every
-/// source.
+/// Convenience wrapper that lifts any `std::error::Error` into [`RiftError::Other`].
+///
+/// Avoids adding a dedicated variant for every third-party error type.
+///
+/// # Internal Layout
+///
+/// Holds a `Box<dyn std::error::Error + Send + Sync>`, supporting any
+/// heap-allocated error type.
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct BoxedStdError(pub Box<dyn std::error::Error + Send + Sync>);
 
 impl RiftError {
-    /// Wrap an arbitrary error into `RiftError::Other`.
+    /// Wraps an arbitrary error into [`RiftError::Other`].
+    ///
+    /// Suitable for third-party library errors or custom error types.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use rifts::RiftError;
+    /// let err: RiftError = RiftError::other(std::io::Error::new(
+    ///     std::io::ErrorKind::Other, "something broke"
+    /// ));
+    /// ```
     pub fn other<E: std::error::Error + Send + Sync + 'static>(e: E) -> Self {
         Self::Other(BoxedStdError(Box::new(e)))
     }
 
-    /// Construct from a `serde_json::Error` without the `From` impl
-    /// (useful when the compiler cannot infer the type).
+    /// Constructs a `RiftError` from a `serde_json::Error` without relying on
+    /// the `From` impl.
+    ///
+    /// Use this instead of `e.into()` when the compiler cannot infer the
+    /// target type (e.g., in deeply nested closures) to avoid type ambiguity.
     pub fn from_serde_json(e: serde_json::Error) -> Self {
         Self::SerdeJson(BoxedStdError(Box::new(e)))
     }
 
-    /// Construct from a CBOR serialization error.
+    /// Constructs a `RiftError` from a CBOR serialization error.
     pub fn from_cbor_ser<E: std::error::Error + Send + Sync + 'static>(e: E) -> Self {
         Self::Cbor(BoxedStdError(Box::new(e)))
     }
 
-    /// Construct from a CBOR deserialization error.
+    /// Constructs a `RiftError` from a CBOR deserialization error.
     pub fn from_cbor_de<E: std::error::Error + Send + Sync + 'static>(e: E) -> Self {
         Self::CborDe(BoxedStdError(Box::new(e)))
     }
 }
 
-/// Invalid server configuration.
+/// Configuration error.
+///
+/// Produced by [`ServerConfig`](crate::config::ServerConfig) validation logic.
 #[derive(Debug, Error)]
 pub enum ConfigError {
     /// A configuration field has an invalid value.
+    ///
+    /// `field` is the field name; `message` is a human-readable explanation.
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use rifts::error::ConfigError;
+    /// let err = ConfigError::Invalid {
+    ///     field: "max_payload_bytes",
+    ///     message: "must be > 0".into(),
+    /// };
+    /// ```
     #[error("invalid value for {field}: {message}")]
     Invalid {
         /// The name of the invalid field.
         field: &'static str,
-        /// A human-readable explanation.
+        /// A human-readable description of the error.
         message: String,
     },
 }

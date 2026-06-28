@@ -1,33 +1,65 @@
 //! Ntex WebSocket adapter.
 //!
-//! Wraps ntex WebSocket (`ntex::ws::WsSink` + message stream) as a
-//! Rift `TransportConnection` via a channel bridge.
+//! This module wraps an ntex WebSocket pair ([`ntex::ws::WsSink`] + message
+//! stream) as a Rift [`TransportConnection`] via a channel bridge.
+//!
+//! # Why a bridge?
+//!
+//! Like actix-web, ntex uses `Rc`-based internals that make its WebSocket
+//! types `!Send`. The bridge spawns reader and writer tasks on the ntex
+//! runtime that shuttle raw bytes through tokio mpsc channels. The returned
+//! `BridgeConnection` is `Send` and can be passed to
+//! [`RiftServer::accept_and_spawn`](crate::server::RiftServer::accept_and_spawn).
+//!
+//! # Usage
+//!
+//! ```ignore
+//! use ntex::web;
+//! use ntex::ws;
+//!
+//! async fn handler(req: web::HttpRequest, stream: web::Payload)
+//!     -> Result<web::HttpResponse, web::Error>
+//! {
+//!     ws::start(req, stream, |msg_stream, sink| async move {
+//!         let conn = rift::transport::ntex::into_connection(sink, msg_stream, None);
+//!         tokio::spawn(async move {
+//!             rift_server.accept_and_spawn(conn);
+//!         });
+//!     })
+//! }
+//! ```
 
 use std::net::SocketAddr;
 
 use crate::transport::TransportConnection;
 use crate::transport::bridge::spawn_bridge_local;
 
-/// Wrap an ntex WebSocket pair into a `TransportConnection`.
+/// Wrap an ntex WebSocket pair into a boxed [`TransportConnection`].
 ///
-/// `stream` is the message stream from `ntex::web::ws::start()`.
-/// `sink` is the `ntex::ws::WsSink` for outgoing messages.
+/// This function spawns two tasks on the ntex runtime:
 ///
-/// ```ignore
-/// use ntex::web;
-/// use ntex::ws;
+/// 1. A **reader task** that pulls messages from the stream, prefixes each
+///    with a 1-byte tag (`b'B'` for binary, `b'T'` for text, `b'C'` for
+///    close), and pushes the tagged bytes into the inbound mpsc channel.
 ///
-/// async fn handler(req: web::HttpRequest, stream: web::Payload)
-///     -> Result<web::HttpResponse, web::Error>
-/// {
-///     ws::start(req, stream, |msg_stream, sink| async move {
-///         let conn = rift::transport::ntex::into_connection(sink, msg_stream, None);
-///         tokio::spawn(async move {
-///             rift_server.accept_and_spawn(conn);
-///         });
-///     })
-/// }
-/// ```
+/// 2. A **writer task** that reads tagged bytes from the outbound mpsc
+///    channel and forwards them to the `WsSink` (stripping the tag prefix
+///    before sending).
+///
+/// The returned `BridgeConnection` is `Send` and can be moved to the
+/// tokio runtime where `Connection::run` operates.
+///
+/// # Type parameters
+///
+/// - `S` — the message stream type, typically obtained from
+///   `ntex::web::ws::start()`.
+/// - `E` — the stream's error type.
+///
+/// # Parameters
+///
+/// - `sink` — the ntex `WsSink` for sending outbound messages.
+/// - `stream` — the ntex message stream for receiving inbound messages.
+/// - `peer` — the peer socket address, or `None` if unknown.
 pub fn into_connection<S, E>(
     sink: ntex::ws::WsSink,
     mut stream: S,

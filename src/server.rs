@@ -1,4 +1,34 @@
 //! Rift/1 server entry point.
+//!
+//! This module provides the [`RiftServer`] — the top-level server that
+//! orchestrates the broker, authentication, metrics, and transport layers.
+//! It can run in two modes:
+//!
+//! 1. **Standalone mode** (feature `websocket`): call
+//!    [`RiftServer::run`] with a socket address and a shutdown notifier.
+//!    The server binds a TCP listener, accepts WebSocket connections, and
+//!    spawns a [`Connection`](crate::connection::Connection) for each.
+//!
+//! 2. **Framework mode**: call
+//!    [`RiftServer::accept_and_spawn`] with a boxed
+//!    [`TransportConnection`](crate::transport::TransportConnection)
+//!    obtained from a framework adapter (axum, actix-web, warp, ntex).
+//!    The server spawns the connection handler on the tokio runtime.
+//!
+//! # Builder pattern
+//!
+//! Use [`RiftServer::builder()`] to obtain a [`RiftServerBuilder`], then
+//! configure the server via chainable methods:
+//!
+//! ```ignore
+//! let server = RiftServer::builder()
+//!     .config(my_config)
+//!     .auth(my_auth_provider)
+//!     .broker(my_broker)
+//!     .websocket_transport()
+//!     .metrics(my_metrics)
+//!     .build()?;
+//! ```
 
 #[cfg(feature = "websocket")]
 use std::net::SocketAddr;
@@ -32,13 +62,21 @@ use crate::transport::websocket::WebSocketTransport;
 type ListenerFuture =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<Box<dyn TransportListener>>> + Send>>;
 
+/// Internal trait for constructing a transport listener from a socket address.
+///
+/// This abstraction allows the builder to defer transport construction until
+/// `build()` is called, so that any `config()` call made after
+/// `websocket_transport()` is honoured.
 #[cfg(feature = "websocket")]
 trait TransportFactory: Send + Sync {
+    /// Build a transport listener bound to `addr`.
     fn build(&self, addr: SocketAddr) -> ListenerFuture;
 }
 
+/// The default transport factory for standalone WebSocket mode.
 #[cfg(feature = "websocket")]
 struct WebSocketFactory {
+    /// Maximum WebSocket message size, taken from `ServerConfig::max_payload_bytes`.
     max_message_size: usize,
 }
 
@@ -50,21 +88,32 @@ impl TransportFactory for WebSocketFactory {
     }
 }
 
-/// Builder for a `RiftServer`.
+/// Builder for a [`RiftServer`].
+///
+/// Use [`RiftServer::builder()`] to obtain an instance, configure it via
+/// chainable methods, and call [`build`](Self::build) to produce the final
+/// server.
 pub struct RiftServerBuilder {
+    /// Server configuration (heartbeat, payload limits, etc.).
     config: ServerConfig,
+    /// Authentication provider. Defaults to [`TokenAuth`](crate::session::TokenAuth)
+    /// if not set.
     auth: Option<Arc<dyn AuthProvider>>,
+    /// Broker implementation. Defaults to [`InMemoryBroker`] if not set.
     broker: Option<Arc<dyn Broker>>,
-    /// Transport is set by `websocket_transport()`; `None` means the
-    /// server is in framework mode and must be driven via
-    /// `accept_and_spawn`.
+    /// Transport factory for standalone mode. `None` means the server is
+    /// in framework mode and must be driven via `accept_and_spawn`.
     #[cfg(feature = "websocket")]
     transport: Option<Arc<dyn TransportFactory>>,
+    /// Metrics collector. Defaults to a new [`Metrics`] instance if not set.
     metrics: Option<Arc<Metrics>>,
 }
 
 impl RiftServerBuilder {
-    /// Create a new builder with defaults.
+    /// Create a new builder with all defaults.
+    ///
+    /// The default configuration is [`ServerConfig::default()`], no
+    /// transport (framework mode), and no custom auth, broker, or metrics.
     pub fn new() -> Self {
         Self {
             config: ServerConfig::default(),
@@ -76,27 +125,40 @@ impl RiftServerBuilder {
         }
     }
 
-    /// Set server configuration.
+    /// Set the server configuration.
+    ///
+    /// This replaces the entire config, so call it before any other
+    /// config-dependent method.
     pub fn config(mut self, config: ServerConfig) -> Self {
         self.config = config;
         self
     }
 
-    /// Set authentication provider.
+    /// Set the authentication provider.
+    ///
+    /// If not set, [`TokenAuth`](crate::session::TokenAuth) is used by
+    /// default.
     pub fn auth(mut self, auth: Arc<dyn AuthProvider>) -> Self {
         self.auth = Some(auth);
         self
     }
 
-    /// Set custom broker.
+    /// Set a custom broker implementation.
+    ///
+    /// If not set, an [`InMemoryBroker`] is created with the default
+    /// topic profile, dedupe window, and max payload bytes from the
+    /// server config.
     pub fn broker(mut self, broker: Arc<dyn Broker>) -> Self {
         self.broker = Some(broker);
         self
     }
 
-    /// Set WebSocket as the standalone transport (requires feature
-    /// `websocket`). The factory is built in `build()` so that any
-    /// `config()` call after this point is honoured.
+    /// Enable standalone WebSocket transport mode (requires feature
+    /// `websocket`).
+    ///
+    /// The actual transport factory is constructed in [`build`](Self::build)
+    /// so that any [`config`](Self::config) call made after this point is
+    /// honoured (specifically `max_payload_bytes`).
     #[cfg(feature = "websocket")]
     pub fn websocket_transport(mut self) -> Self {
         // Placeholder; the real factory is constructed in `build()`
@@ -107,13 +169,22 @@ impl RiftServerBuilder {
         self
     }
 
-    /// Set metrics collector.
+    /// Set the metrics collector.
+    ///
+    /// If not set, a new [`Metrics`] instance is created with all
+    /// counters initialized to zero.
     pub fn metrics(mut self, metrics: Arc<Metrics>) -> Self {
         self.metrics = Some(metrics);
         self
     }
 
-    /// Build the server.
+    /// Build the [`RiftServer`].
+    ///
+    /// This method finalizes the configuration, creates default
+    /// components where none were provided, and returns the ready-to-use
+    /// server. In standalone mode the transport factory is reconstructed
+    /// with the current `config.max_payload_bytes` to ensure any
+    /// post-`websocket_transport()` config changes are applied.
     pub fn build(self) -> Result<RiftServer> {
         let metrics = self.metrics.unwrap_or_else(|| Arc::new(Metrics::new()));
         let config_max_payload = self.config.max_payload_bytes;
@@ -159,29 +230,43 @@ impl Default for RiftServerBuilder {
 }
 
 /// The Rift/1 server.
+///
+/// This is the top-level entry point. It holds the broker, auth provider,
+/// metrics, and (in standalone mode) the transport factory. Each accepted
+/// connection is assigned a unique connection id and spawned as a new
+/// tokio task running the full Rift protocol lifecycle.
 pub struct RiftServer {
-    /// Server configuration.
+    /// Server configuration (heartbeat, payload limits, topic defaults, etc.).
     pub config: ServerConfig,
+    /// Authentication provider used for the hello handshake.
     auth: Arc<dyn AuthProvider>,
+    /// Broker that routes messages between publishers and subscribers.
     broker: Arc<dyn Broker>,
+    /// Metrics collector for connection, message, and error counters.
     metrics: Arc<Metrics>,
     /// Standalone transport factory. `None` in framework mode (the
     /// server is driven via `accept_and_spawn`).
     #[cfg(feature = "websocket")]
     transport: Option<Arc<dyn TransportFactory>>,
+    /// Monotonically increasing connection id counter.
     next_conn_id: Arc<AtomicU64>,
 }
 
 impl RiftServer {
-    /// Create a new builder.
+    /// Create a new [`RiftServerBuilder`].
     pub fn builder() -> RiftServerBuilder {
         RiftServerBuilder::new()
     }
 
     /// Bind and run the server in standalone mode, blocking until
-    /// `shutdown` is notified. Requires feature `websocket` and a
-    /// transport set on the builder (call
-    /// `builder.websocket_transport()` before `build()`).
+    /// `shutdown` is notified.
+    ///
+    /// Requires feature `websocket` and a transport set on the builder
+    /// (call `builder.websocket_transport()` before `build()`).
+    ///
+    /// Each accepted connection is spawned as a new tokio task. The
+    /// method returns when the shutdown notifier fires or when the
+    /// listener encounters a fatal error.
     #[cfg(feature = "websocket")]
     pub async fn run(&self, addr: SocketAddr, shutdown: Arc<tokio::sync::Notify>) -> Result<()> {
         let transport = self.transport.as_ref().ok_or_else(|| {
@@ -216,13 +301,19 @@ impl RiftServer {
         }
     }
 
-    /// Accept a single transport connection and spawn the Rift
-    /// protocol handler onto the tokio runtime. This is the entry
-    /// point for framework integrations.
+    /// Accept a single transport connection and spawn the Rift protocol
+    /// handler onto the tokio runtime.
+    ///
+    /// This is the entry point for framework integrations (axum, actix-web,
+    /// warp, ntex). The caller obtains a `Box<dyn TransportConnection>` from
+    /// the framework adapter and passes it here. The server assigns a unique
+    /// connection id, creates a [`Connection`], and spawns it as a new task.
     pub fn accept_and_spawn(&self, transport: Box<dyn TransportConnection>) {
         self.spawn_connection(transport);
     }
 
+    /// Internal helper: create and spawn a [`Connection`] for the given
+    /// transport.
     fn spawn_connection(&self, transport: Box<dyn TransportConnection>) {
         let id = self
             .next_conn_id
@@ -246,6 +337,11 @@ impl RiftServer {
     }
 }
 
+/// Conversion from the config-level [`DefaultTopicProfile`] to the
+/// topic-layer [`TopicProfile`](crate::topic::TopicProfile).
+///
+/// This conversion is used when the builder creates the default
+/// [`InMemoryBroker`].
 impl From<DefaultTopicProfile> for crate::topic::TopicProfile {
     fn from(d: DefaultTopicProfile) -> Self {
         Self {

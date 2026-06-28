@@ -1,5 +1,45 @@
-//! In-memory broker — orchestrates topic store, dedupe, offsets,
-//! log, snapshots, and fanout (spec §22).
+//! In-memory broker — spec section 22.
+//!
+//! This module implements a single-process broker that orchestrates all
+//! the broker subsystem components: topic metadata store, per-topic
+//! offset allocation, message log persistence, deduplication, snapshot
+//! capture, topic routing, and live fanout delivery to subscribers.
+//!
+//! # Generic storage backends
+//!
+//! The [`InMemoryBroker`] struct is generic over four storage trait
+//! parameters:
+//!
+//! - `O: OffsetStore` — per-topic monotonic offset allocation
+//! - `L: LogStore` — append and range-query message log
+//! - `D: DedupeStore` — time-window-based message deduplication
+//! - `S: SnapshotStore` — topic snapshot capture and retrieval
+//!
+//! This design allows the same broker logic to be used with different
+//! storage backends (e.g. in-memory for development, sled for
+//! production). Type aliases are provided for common configurations:
+//!
+//! - [`DefaultBroker`] — all in-memory stores (development/testing)
+//! - `SledBroker` — all sled-backed stores (production, feature `sled`)
+//!
+//! # Publish flow
+//!
+//! When a message is published, the broker:
+//!
+//! 1. Validates the frame (required fields, payload size, TTL)
+//! 2. Routes the topic name to a [`TopicEntry`] via the router
+//! 3. Checks and enforces the publisher limit
+//! 4. Runs deduplication against the message ID
+//! 5. Allocates a monotonic offset
+//! 6. Builds a log entry and appends it to the log store
+//! 7. Fans out to live subscribers (unless the message is a duplicate)
+//!
+//! # Thread safety
+//!
+//! The broker is safe to share across async tasks via `Arc<dyn Broker>`.
+//! The [`TopicRouter`] is protected by a [`parking_lot::Mutex`] for
+//! mutable access during topic creation, while all storage backends
+//! use their own internal synchronization.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +64,11 @@ use crate::topic::store::LogEntry;
 
 /// Single-process broker, generic over storage backends.
 ///
+/// This struct wires together all the components needed for a
+/// fully functional message broker: topic metadata, offset allocation,
+/// message log, deduplication, snapshot storage, fanout delivery, and
+/// topic routing.
+///
 /// Type parameters correspond to the four persistence traits:
 /// - `O`: [`OffsetStore`] — per-topic offset allocation
 /// - `L`: [`LogStore`] — append + range-query message log
@@ -34,31 +79,53 @@ use crate::topic::store::LogEntry;
 /// - [`DefaultBroker`] — all memory-backed (development)
 /// - `SledBroker` — all sled-backed (production, feature `sled`)
 pub struct InMemoryBroker<O, L, D, S> {
-    /// In-memory topic metadata store.
+    /// In-memory topic metadata store. Holds [`TopicEntry`] instances
+    /// that track per-topic state such as publisher/subscriber counts,
+    /// the topic profile, and the latest snapshot.
     pub store: TopicStore,
-    /// Per-topic offset allocator.
+    /// Per-topic offset allocator. Generates monotonically increasing
+    /// offsets for each message published to a topic.
     pub offsets: O,
-    /// Message log (append, range, retention).
+    /// Message log store. Provides append and range-query operations
+    /// for persisted messages, with configurable retention policies.
     pub log: L,
-    /// Deduplication store.
+    /// Deduplication store. Tracks message IDs within a configurable
+    /// time window to suppress duplicate deliveries to subscribers.
     pub dedupe: D,
-    /// Snapshot store.
+    /// Snapshot store. Captures and retrieves per-topic snapshots for
+    /// subscribers that want the latest state without full replay.
     pub snapshots: S,
-    /// Fanout engine.
+    /// Fanout engine. Manages subscriptions and delivers serialized
+    /// frames to all active subscribers of a topic.
     pub fanout: FanoutEngine,
-    /// Topic router.
+    /// Topic router. Resolves topic names to [`TopicEntry`] handles,
+    /// creating new topics on demand with the configured default
+    /// profile. Protected by a mutex for mutable access during topic
+    /// creation.
     pub router: Mutex<Box<dyn TopicRouter>>,
-    /// Deduplication window duration.
+    /// Duration of the deduplication time window. Messages with the
+    /// same deduplication key published within this window are marked
+    /// as duplicates.
     pub dedupe_window: Duration,
-    /// Maximum payload bytes allowed.
+    /// Maximum allowed payload size in bytes. Messages with payloads
+    /// exceeding this limit are rejected with a
+    /// [`MessageReject::TooLarge`] error.
     pub max_payload_bytes: usize,
 }
 
-/// All in-memory stores. Default for development.
+/// All in-memory stores. Default configuration for development and
+/// testing.
+///
+/// Uses [`MemoryOffsetStore`], [`MemoryLogStore`],
+/// [`MemoryDedupeStore`], and [`MemorySnapshotStore`] — all backed
+/// by in-process data structures with no disk persistence.
 pub type DefaultBroker =
     InMemoryBroker<MemoryOffsetStore, MemoryLogStore, MemoryDedupeStore, MemorySnapshotStore>;
 
 /// All sled-backed stores. Available with `features = ["sled"]`.
+///
+/// Uses sled persistent storage for all four store traits, providing
+/// durability across process restarts.
 #[cfg(feature = "sled")]
 pub type SledBroker = InMemoryBroker<
     crate::storage::SledOffsetStore,
@@ -79,6 +146,20 @@ impl<O, L, D, S> std::fmt::Debug for InMemoryBroker<O, L, D, S> {
 
 impl InMemoryBroker<MemoryOffsetStore, MemoryLogStore, MemoryDedupeStore, MemorySnapshotStore> {
     /// Create a new default (all in-memory) broker.
+    ///
+    /// Initializes all storage backends with their in-memory
+    /// implementations and sets up a [`LocalRouter`] backed by the
+    /// broker's own [`TopicStore`].
+    ///
+    /// # Arguments
+    ///
+    /// * `default_profile` — The [`TopicProfile`](crate::topic::TopicProfile)
+    ///   applied to topics when they are first created.
+    /// * `dedupe_window` — The time window for message deduplication.
+    ///   Messages with the same deduplication key within this window
+    ///   are marked as duplicates.
+    /// * `max_payload_bytes` — The maximum allowed payload size in
+    ///   bytes. Messages exceeding this limit are rejected.
     pub fn new(
         default_profile: crate::topic::TopicProfile,
         dedupe_window: Duration,
@@ -104,7 +185,22 @@ impl InMemoryBroker<MemoryOffsetStore, MemoryLogStore, MemoryDedupeStore, Memory
 }
 
 impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> InMemoryBroker<O, L, D, S> {
-    /// Create a broker with the given storage backends.
+    /// Create a broker with explicitly provided storage backends.
+    ///
+    /// Allows callers to inject custom implementations of the four
+    /// storage traits, enabling different persistence strategies
+    /// (e.g. sled-backed, file-backed, or mock stores for testing).
+    ///
+    /// # Arguments
+    ///
+    /// * `default_profile` — The [`TopicProfile`](crate::topic::TopicProfile)
+    ///   applied to topics when they are first created.
+    /// * `dedupe_window` — The deduplication time window.
+    /// * `max_payload_bytes` — Maximum allowed payload size in bytes.
+    /// * `offsets` — The offset store implementation.
+    /// * `log` — The message log store implementation.
+    /// * `dedupe` — The deduplication store implementation.
+    /// * `snapshots` — The snapshot store implementation.
     pub fn with_stores(
         default_profile: crate::topic::TopicProfile,
         dedupe_window: Duration,
@@ -132,6 +228,20 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> InMemoryBrok
         }
     }
 
+    /// Validate a frame before publishing.
+    ///
+    /// Checks that the frame contains the required `topic` and
+    /// `message_id` fields, that the payload does not exceed the
+    /// configured maximum size, and that the message has not expired
+    /// (TTL check). Returns the topic name and message ID as string
+    /// slices on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RiftError::Frame`] if `topic` or `message_id` is
+    /// missing, [`RiftError::Message`] with [`MessageReject::TooLarge`]
+    /// if the payload exceeds the limit, or [`MessageReject::Expired`]
+    /// if the TTL has been exceeded.
     fn validate_publish<'a>(&self, frame: &'a Frame) -> Result<(&'a str, &'a str)> {
         let topic = frame.topic.as_deref().ok_or_else(|| {
             RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("topic"))
@@ -326,7 +436,10 @@ impl<
     S: SnapshotStore + 'static,
 > InMemoryBroker<O, L, D, S>
 {
-    /// Wrap as a trait object.
+    /// Wrap this broker as a thread-safe trait object.
+    ///
+    /// Returns an `Arc<dyn Broker>` that can be shared across async
+    /// tasks and passed to the server or gateway layer.
     pub fn into_arc(self) -> Arc<dyn Broker> {
         Arc::new(self)
     }

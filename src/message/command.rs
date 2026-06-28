@@ -1,28 +1,67 @@
-//! Command / Reply — spec §15.
+//! # Command / Reply -- Request-Style Commands and Responses (spec section 15)
+//!
+//! Commands implement RPC semantics: a client sends a Command (carrying a `correlation_id`),
+//! the server processes it and returns a Reply (carrying the same `correlation_id`).
+//!
+//! ## Flow
+//!
+//! ```text
+//! Client                         Server
+//!   |                               |
+//!   |-- Command { corr_id=42 } --->|
+//!   |                               |  (process command)
+//!   |<-- Reply { corr_id=42 } -----|
+//!   |                               |
+//! ```
+//!
+//! Supports idempotency (via `idempotency_key`) and timeout control (via `timeout_ms`).
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MessageReject, Result, RiftError};
 
-/// Request-style command sent to the server (or a peer).
+/// A request-style command -- an RPC request sent to the server or a peer.
+///
+/// Each Command must carry a unique `correlation_id` used to match it with its Reply.
+/// Supports an optional idempotency key (`idempotency_key`) for exactly-once-effect semantics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Command {
-    /// Command name.
+    /// Command name, identifies the operation to execute (e.g. `"room.create"`, `"user.update"`).
+    ///
+    /// The naming convention is typically `{domain}.{action}`.
     pub command: String,
-    /// Correlation id linking this command to its reply.
+
+    /// Correlation ID that pairs this command with its Reply.
+    ///
+    /// Must be unique within the same connection; the server echoes it back in the Reply as-is.
     pub correlation_id: String,
+
     /// Request timeout in milliseconds.
+    ///
+    /// If no Reply is received within this duration, the client should treat it as a timeout
+    /// and may retry.
     pub timeout_ms: u32,
-    /// Optional idempotency key.
+
+    /// Idempotency key (optional).
+    ///
+    /// When set, duplicate requests with the same `idempotency_key` return the cached response,
+    /// preventing re-execution of side effects. Typically a UUID or ULID.
     pub idempotency_key: Option<String>,
-    /// Request payload.
+
+    /// Request payload -- command arguments in JSON format.
     pub payload: serde_json::Value,
-    /// Schema id.
+
+    /// Schema identifier, formatted as `{domain}.{name}@{major}.{minor}`.
+    ///
+    /// Used for version management and payload validation.
     pub schema: String,
 }
 
 impl Command {
+    /// Creates a new Command instance.
+    ///
+    /// `idempotency_key` defaults to `None`; set it directly on the struct if needed.
     pub fn new(
         command: impl Into<String>,
         correlation_id: impl Into<String>,
@@ -41,22 +80,30 @@ impl Command {
     }
 }
 
-/// Reply to a previously-issued command.
+/// A command response -- the reply to a Command.
+///
+/// Carries the `correlation_id` of the original command so the client can match the request.
+/// The response can be success (`Ok`), business error (`Error`), timeout (`Timeout`), or rejected (`Rejected`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reply {
-    /// Correlation id of the originating command.
+    /// Correlation ID of the original command.
     pub correlation_id: String,
-    /// Status.
+
+    /// Response status.
     pub status: ReplyStatus,
-    /// Optional response payload.
+
+    /// Response payload (populated only on success).
     pub payload: Option<serde_json::Value>,
-    /// Optional structured error.
+
+    /// Structured error information (populated only for `Error`/`Rejected` statuses).
     pub error: Option<ReplyError>,
-    /// Server time (ms since epoch).
+
+    /// Server timestamp (millisecond Unix timestamp), used for client clock calibration.
     pub server_time: i64,
 }
 
 impl Reply {
+    /// Constructs a successful response.
     pub fn ok(correlation_id: impl Into<String>, payload: serde_json::Value) -> Self {
         Self {
             correlation_id: correlation_id.into(),
@@ -67,6 +114,10 @@ impl Reply {
         }
     }
 
+    /// Constructs an error response.
+    ///
+    /// `code` is a machine-readable error code (e.g. `"RIFT_AUTH_INVALID"`),
+    /// `message` is a human-readable description.
     pub fn error(
         correlation_id: impl Into<String>,
         code: impl Into<String>,
@@ -85,23 +136,32 @@ impl Reply {
     }
 }
 
-/// Reply status.
+/// Reply status code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReplyStatus {
+    /// Command executed successfully.
     Ok,
+    /// Command execution failed (business error).
     Error,
+    /// Command execution timed out.
     Timeout,
+    /// Command was rejected (insufficient permissions or policy restrictions).
     Rejected,
 }
 
-/// Structured error inside a reply.
+/// Structured error information within a Reply.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReplyError {
+    /// Machine-readable error code (e.g. `"RIFT_AUTH_INVALID"`, `"RIFT_NOT_FOUND"`).
     pub code: String,
+    /// Human-readable error description.
     pub message: String,
 }
 
+/// Serializes a Command to JSON bytes.
+///
+/// Validates that `correlation_id` is non-empty; returns `MessageReject::Rejected` otherwise.
 pub fn encode_command(c: &Command) -> Result<Bytes> {
     if c.correlation_id.is_empty() {
         return Err(RiftError::Message(MessageReject::Rejected(
@@ -111,6 +171,9 @@ pub fn encode_command(c: &Command) -> Result<Bytes> {
     Ok(Bytes::from(serde_json::to_vec(c)?))
 }
 
+/// Deserializes a Command from JSON bytes.
+///
+/// Validates that `correlation_id` is non-empty after deserialization.
 pub fn decode_command(bytes: &[u8]) -> Result<Command> {
     let c: Command = serde_json::from_slice(bytes)?;
     if c.correlation_id.is_empty() {
@@ -121,10 +184,12 @@ pub fn decode_command(bytes: &[u8]) -> Result<Command> {
     Ok(c)
 }
 
+/// Serializes a Reply to JSON bytes.
 pub fn encode_reply(r: &Reply) -> Result<Bytes> {
     Ok(Bytes::from(serde_json::to_vec(r)?))
 }
 
+/// Deserializes a Reply from JSON bytes.
 pub fn decode_reply(bytes: &[u8]) -> Result<Reply> {
     Ok(serde_json::from_slice(bytes)?)
 }

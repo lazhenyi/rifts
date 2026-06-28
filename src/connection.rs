@@ -1,5 +1,30 @@
-//! Per-connection state machine — drives the Rift/1 connection
-//! lifecycle (spec §5).
+//! Per-connection state machine — drives the Rift/1 connection lifecycle (spec section 5).
+//!
+//! This module implements the full lifecycle of a single Rift connection:
+//!
+//! 1. **Handshake** — hello, auth, codec negotiation, resume evaluation.
+//! 2. **Active phase** — concurrent reader and writer tasks processing frames.
+//! 3. **Teardown** — drain the outbound queue, release resources, close the transport.
+//!
+//! The [`Connection`] owns all per-connection state (broker ref, auth ref,
+//! config, metrics, ack manager, backpressure controller, codec) and drives
+//! the lifecycle via [`Connection::run`].
+//!
+//! # Architecture
+//!
+//! After the handshake completes, two tokio tasks are spawned:
+//!
+//! - **Writer task** — reads [`Frame`](crate::frame::Frame)s from an mpsc
+//!   channel and writes them to the transport. Tracks in-flight bytes for
+//!   backpressure accounting.
+//!
+//! - **Reader task** — reads frames from the transport, dispatches them
+//!   to the broker (for data frames), the ack manager (for ack frames),
+//!   or the control handler (for subscribe/unsubscribe/ping).
+//!
+//! The two tasks share the transport behind an `Arc<AsyncMutex<Option<...>>>`
+//! so that either task can release it (e.g. on write error) and the other
+//! will observe the `None` and shut down.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -25,17 +50,38 @@ use crate::session::resume::ResumeManager;
 use crate::session::{AuthProvider, Session, SessionId, SessionState};
 use crate::transport::TransportConnection;
 
-/// Lightweight fanout sink that writes inbound frames to the
-/// connection's outbound mpsc.
+/// Lightweight fanout sink that writes inbound frames to the connection's
+/// outbound mpsc channel.
+///
+/// Created by [`Connection::sink`] and handed to the broker so that
+/// subscription fanout can push frames directly into this connection's
+/// write queue without going through the connection object itself.
 struct ConnSink {
+    /// Sender half of the connection's outbound frame channel.
     tx: mpsc::Sender<Frame>,
+
+    /// Atomic counter of bytes currently in the outbound queue.
+    /// Shared with the writer task which decrements it on successful writes.
     in_flight_bytes: Arc<AtomicUsize>,
+
+    /// Maximum allowed bytes in the outbound queue (from
+    /// `ServerConfig::max_send_queue_bytes`).
     max_bytes: usize,
+
+    /// Metrics counter for outgoing messages.
     metrics: Arc<Metrics>,
+
+    /// Unique id for this sink, used by the broker to track subscriptions.
     sink_id: u64,
 }
 
 impl FanoutSink for ConnSink {
+    /// Attempt to deliver a serialized message frame to this connection's
+    /// outbound queue.
+    ///
+    /// Returns `Err(FanoutError::Backpressured)` if the queue is at capacity
+    /// or if the mpsc channel is full. Returns `Err(FanoutError::Closed)` if
+    /// the channel has been closed (connection is shutting down).
     fn deliver(&self, frame: bytes::Bytes) -> std::result::Result<(), FanoutError> {
         let len = frame.len();
         if self.in_flight_bytes.load(Ordering::SeqCst) + len > self.max_bytes {
@@ -70,39 +116,72 @@ impl FanoutSink for ConnSink {
 }
 
 /// Per-connection state.
+///
+/// Each accepted transport connection is wrapped in a `Connection` which
+/// holds every resource the connection needs during its lifetime: the
+/// broker, auth provider, server config, metrics, ack/resume managers,
+/// backpressure controller, and the negotiated codec.
+///
+/// The connection is consumed by [`run`](Self::run) which drives the full
+/// lifecycle (handshake, active phase, teardown).
 pub struct Connection {
-    /// Unique connection id within this process.
+    /// Unique connection id within this process, assigned by the server.
     pub conn_id: u64,
-    /// Reference to the broker.
+
+    /// Reference to the broker that routes messages between publishers
+    /// and subscribers.
     pub broker: Arc<dyn Broker>,
-    /// Authentication provider.
+
+    /// Authentication provider used during the hello handshake.
     pub auth: Arc<dyn AuthProvider>,
-    /// Server configuration.
+
+    /// Server configuration (heartbeat, limits, topic defaults, etc.).
     pub config: ServerConfig,
-    /// Metrics counters.
+
+    /// Metrics counters for connection, message, and error tracking.
     pub metrics: Arc<Metrics>,
-    /// Acknowledgement manager.
+
+    /// Acknowledgement manager for tracking outstanding (sent-but-not-acked)
+    /// frames.
     pub ack_manager: SharedAckManager,
-    /// Resume manager.
+
+    /// Resume manager for evaluating session resume requests.
     pub resume: Arc<ResumeManager>,
-    /// Backpressure controller.
+
+    /// Backpressure controller for monitoring the outbound queue.
     pub backpressure: BackpressureController,
+
+    /// Sender half of the outbound frame channel, shared with the fanout
+    /// sink and the control handler.
     out_tx: mpsc::Sender<Frame>,
+
+    /// Receiver half of the outbound frame channel, taken by the writer
+    /// task at startup.
     out_rx: parking_lot::Mutex<Option<mpsc::Receiver<Frame>>>,
-    /// Unique sink id for this connection.
+
+    /// Unique sink id for this connection's fanout sink.
     pub sink_id: u64,
-    /// Negotiated codec.
+
+    /// Negotiated codec, defaulting to JSON until the handshake completes.
     pub codec: Arc<dyn Codec>,
+
+    /// Atomic counter of bytes currently in the outbound queue. Shared
+    /// between the fanout sink and the writer task.
     in_flight_bytes: Arc<AtomicUsize>,
-    /// Topics this connection has published to. Used on connection
-    /// close to release per-topic publisher counts back to the broker
-    /// (so the slots can be reused by future publishers).
+
+    /// Topics this connection has published to. Used on connection close
+    /// to release per-topic publisher counts back to the broker (so the
+    /// slots can be reused by future publishers).
     published_topics: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl Connection {
-    #[allow(clippy::too_many_arguments)]
     /// Create a new connection with the given parameters.
+    ///
+    /// A bounded mpsc channel (capacity 1024) is created for the outbound
+    /// frame queue. The backpressure controller is initialized with the
+    /// `max_send_queue_bytes` from the server config.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         conn_id: u64,
         broker: Arc<dyn Broker>,
@@ -132,8 +211,12 @@ impl Connection {
         }
     }
 
-    /// Return a `FanoutSink` attached to this connection's outbound
-    /// channel.
+    /// Create a [`FanoutSink`] attached to this connection's outbound channel.
+    ///
+    /// The sink can be handed to the broker so that subscription fanout can
+    /// push frames directly into the connection's write queue. The sink
+    /// enforces the backpressure limit and increments the `messages_out_total`
+    /// metric on each successful delivery.
     pub fn sink(&self) -> Arc<dyn FanoutSink> {
         Arc::new(ConnSink {
             tx: self.out_tx.clone(),
@@ -145,6 +228,16 @@ impl Connection {
     }
 
     /// Run the full connection lifecycle.
+    ///
+    /// This method:
+    ///
+    /// 1. Increments connection metrics.
+    /// 2. Performs the hello handshake (protocol negotiation, auth, resume).
+    /// 3. Spawns the writer and reader tasks.
+    /// 4. Waits for the reader to finish.
+    /// 5. Closes the transport, releases resources (sink, acks, resume,
+    ///    per-topic publisher slots), and decrements connection metrics.
+    /// 6. Returns the reader's result.
     pub async fn run(self, mut transport: Box<dyn TransportConnection>) -> Result<()> {
         self.metrics.inc(&self.metrics.connection_open_total);
         self.metrics.inc(&self.metrics.active_connections);
@@ -245,14 +338,18 @@ impl Connection {
 
     /// Drive the hello → auth → resume/start → ready handshake.
     ///
-    /// **Note**: the resume decision is computed and recorded in
-    /// metrics, but the outcome does not affect this session. The
-    /// client is always treated as a cold start. Cross-connection
-    /// resume is the responsibility of a future `SessionManager`
-    /// layer that shares session state across `accept_and_spawn`
-    /// invocations; today every `Connection::run` creates a fresh
-    /// session and the new session's epoch (always 1) is what the
-    /// client must match.
+    /// This method reads the hello control frame from the transport,
+    /// validates the protocol name and version, negotiates a codec,
+    /// authenticates the client, evaluates the resume request, and
+    /// sends the welcome and ready frames.
+    ///
+    /// **Note**: the resume decision is computed and recorded in metrics,
+    /// but the outcome does not affect this session. The client is always
+    /// treated as a cold start. Cross-connection resume is the
+    /// responsibility of a future `SessionManager` layer that shares
+    /// session state across `accept_and_spawn` invocations; today every
+    /// `Connection::run` creates a fresh session and the new session's
+    /// epoch (always 1) is what the client must match.
     async fn handshake(
         &self,
         transport: &mut Box<dyn TransportConnection>,
@@ -340,6 +437,13 @@ impl Connection {
     }
 }
 
+/// Writer task — drains the outbound frame channel and writes each frame
+/// to the transport.
+///
+/// The task exits when the channel is closed (all senders dropped) or
+/// when a write error occurs. On write failure the transport slot is set
+/// to `None` so that the reader task observes the shutdown and stops.
+/// The `in_flight_bytes` counter is zeroed defensively on exit.
 async fn writer_task(
     mut rx: mpsc::Receiver<Frame>,
     transport_slot: Arc<AsyncMutex<Option<Box<dyn TransportConnection>>>>,
@@ -378,6 +482,15 @@ async fn writer_task(
     in_flight_bytes.store(0, Ordering::SeqCst);
 }
 
+/// Reader task — reads frames from the transport and dispatches them to
+/// the appropriate handler based on frame type.
+///
+/// - **Control frames** are routed to [`handle_control`].
+/// - **Data frames** are published to the broker, with TTL checks and
+///   acknowledgement generation.
+/// - **Ack frames** complete outstanding ack tracking.
+/// - **Flow frames** are logged (currently a no-op beyond logging).
+/// - **Error frames** are logged as warnings.
 #[allow(clippy::too_many_arguments)]
 async fn reader_task(
     transport_slot: Arc<AsyncMutex<Option<Box<dyn TransportConnection>>>>,
@@ -482,6 +595,10 @@ async fn reader_task(
     }
 }
 
+/// Handle a control frame (ping, subscribe, unsubscribe).
+///
+/// The control body is expected to be a JSON object with a `"type"` field.
+/// Unknown control types are logged and ignored.
 #[allow(clippy::too_many_arguments)]
 async fn handle_control(
     out_tx: &mpsc::Sender<Frame>,
@@ -599,14 +716,29 @@ async fn handle_control(
     }
 }
 
+/// A minimal fanout sink used by the subscribe control handler.
+///
+/// Unlike [`ConnSink`] (which is created once per connection and tracks
+/// metrics), `MpscSink` is created per-subscription and only enforces
+/// backpressure without incrementing metrics.
 struct MpscSink {
+    /// Sender half of the connection's outbound frame channel.
     tx: mpsc::Sender<Frame>,
+    /// Atomic counter of bytes currently in the outbound queue.
     in_flight_bytes: Arc<AtomicUsize>,
+    /// Maximum allowed bytes in the outbound queue.
     max_bytes: usize,
+    /// Unique sink id for this subscription.
     id: u64,
 }
 
 impl FanoutSink for MpscSink {
+    /// Attempt to deliver a serialized message frame to the connection's
+    /// outbound queue.
+    ///
+    /// Returns `Err(FanoutError::Backpressured)` if the queue is at capacity
+    /// or if the mpsc channel is full. Returns `Err(FanoutError::Closed)` if
+    /// the channel has been closed.
     fn deliver(&self, frame: bytes::Bytes) -> std::result::Result<(), FanoutError> {
         let len = frame.len();
         if self.in_flight_bytes.load(Ordering::SeqCst) + len > self.max_bytes {
@@ -639,6 +771,11 @@ impl FanoutSink for MpscSink {
     }
 }
 
+/// Send an error frame to the client in response to a failed control
+/// frame.
+///
+/// The error frame contains a JSON body with the error code, message,
+/// and the original frame's `correlation_id`.
 async fn send_error_frame(
     out_tx: &mpsc::Sender<Frame>,
     original: &Frame,
@@ -661,7 +798,12 @@ async fn send_error_frame(
         .map_err(|_| RiftError::System(SystemReject::Overloaded))
 }
 
-/// Map a `RiftError` variant to the closest `ErrorCode` wire identifier.
+/// Map a [`RiftError`] variant to the closest wire-level error code
+/// identifier string.
+///
+/// This is used when constructing error frames to send to the client.
+/// The mapping follows the error code table defined in the Rift protocol
+/// specification.
 fn rift_error_to_code(err: &RiftError) -> &'static str {
     use crate::protocol::error_code::ErrorCode;
     match err {
@@ -740,6 +882,10 @@ fn rift_error_to_code(err: &RiftError) -> &'static str {
     }
 }
 
+/// Build and send an acknowledgement frame to the client.
+///
+/// The ack body is a JSON object containing the ack id, message id,
+/// status, offset, reason, and server timestamp.
 async fn send_ack_frame(
     out_tx: &mpsc::Sender<Frame>,
     ack: Ack,
@@ -765,6 +911,10 @@ async fn send_ack_frame(
 
 // --- handshake helpers ---
 
+/// Build the "welcome" control frame sent immediately after successful
+/// authentication.
+///
+/// Contains the assigned session id, epoch, and server timestamp.
 fn build_welcome_frame(session: &Session, codec: FrameCodec) -> Frame {
     let body = serde_json::json!({
         "type": "welcome",
@@ -781,6 +931,11 @@ fn build_welcome_frame(session: &Session, codec: FrameCodec) -> Frame {
     }
 }
 
+/// Build the "ready" control frame sent after the welcome frame.
+///
+/// Contains the negotiated session parameters: ping interval, pong
+/// timeout, max missed pongs, idle timeout, jitter, max payload bytes,
+/// max topics per connection, and max send queue bytes.
 fn build_ready_frame(session: &Session, config: &ServerConfig) -> Frame {
     let body = serde_json::json!({
         "type": "ready",
@@ -805,6 +960,11 @@ fn build_ready_frame(session: &Session, config: &ServerConfig) -> Frame {
     }
 }
 
+/// Decode the hello control frame payload into a [`Hello`] struct and
+/// an optional authentication token.
+///
+/// The payload is expected to be a JSON object. Missing or malformed
+/// fields are handled gracefully with defaults or descriptive errors.
 fn decode_hello_payload(payload: &Option<Bytes>) -> Result<(Hello, Option<String>)> {
     let p = payload.as_ref().ok_or_else(|| {
         RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing("payload"))

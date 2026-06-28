@@ -1,4 +1,29 @@
-//! Resume orchestration — spec §5.4, §13.
+//! # Resume Manager
+//!
+//! Orchestrates session resumption as defined in the protocol specification
+//! sections 5.4 and 13. When a client reconnects after a transport
+//! interruption, it presents its `SessionId`, the epoch it last knew, and
+//! its last-acknowledged offsets. The [`ResumeManager`] validates these
+//! against the server's current state and returns a [`ResumeOutcome`]
+//! telling the caller what action to take.
+//!
+//! ## Resume Flow
+//!
+//! 1. Client reconnects and sends its `SessionId`, epoch, and offsets.
+//! 2. The server locates the existing [`Session`](crate::session::session::Session).
+//! 3. [`ResumeManager::evaluate`] checks:
+//!    - Is the session still alive (not closed/expired)?
+//!    - Does the client's epoch match the server's current epoch?
+//!    - What do the client's offsets tell us about missed data?
+//! 4. A [`ResumeOutcome`] is returned and acted upon by the broker layer.
+//!
+//! ## Epoch Validation
+//!
+//! Each session has a monotonically increasing epoch counter. The epoch is
+//! bumped every time the session goes through a resume cycle. If the client
+//! presents an epoch that does not match the server's current value, the
+//! resume is rejected with a [`SessionReject::Conflict`](crate::error::SessionReject::Conflict)
+//! error, forcing the client to establish a new session.
 
 use std::collections::HashMap;
 
@@ -7,23 +32,42 @@ use crate::session::offset_tracker::{OffsetTracker, ResumeDecision, decide};
 use crate::session::session::Session;
 use crate::topic::TopicStore;
 
-/// What to do for a given resume attempt.
+/// High-level outcome of a resume attempt.
+///
+/// This enum is the public-facing counterpart of
+/// [`ResumeDecision`](crate::session::offset_tracker::ResumeDecision),
+/// translated into actionable guidance for the server's broker layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResumeOutcome {
-    /// Session fully resumed; client may proceed.
+    /// Session fully resumed. The client's offsets match the server's
+    /// head and no replay is needed. The client may proceed normally.
     Resumed,
-    /// Some topics replayed; client should process replayed frames.
+
+    /// Some topics required a replay. The client should process the
+    /// replayed frames before continuing with new subscriptions.
     Partial,
-    /// Server is still replaying; client should wait.
+
+    /// The server is still replaying data to the client. The client
+    /// should wait until the replay completes before sending new
+    /// messages.
     Replaying,
-    /// Client must pull a fresh snapshot for at least one topic.
+
+    /// The client must pull a fresh snapshot for at least one topic
+    /// because the topic no longer exists on the server or its data
+    /// has been compacted away.
     SnapshotRequired,
-    /// Cold start: re-subscribe from scratch.
+
+    /// The client submitted empty offsets, indicating a cold start.
+    /// It must re-subscribe to all desired topics from scratch.
     ColdStart,
-    /// Resume rejected — new session required.
+
+    /// The resume attempt was rejected (e.g., epoch mismatch, client
+    /// ahead of server). The client must establish a new session.
     Rejected,
 }
 
+/// Convert a low-level [`ResumeDecision`] into the high-level
+/// [`ResumeOutcome`] used by the broker layer.
 impl From<ResumeDecision> for ResumeOutcome {
     fn from(d: ResumeDecision) -> Self {
         match d {
@@ -37,9 +81,14 @@ impl From<ResumeDecision> for ResumeOutcome {
     }
 }
 
-/// Resume manager — checks epoch, decides outcome, exposes current
-/// head offsets to the client.
+/// Resume manager that coordinates session resumption.
+///
+/// Wraps an [`OffsetTracker`] and exposes methods to evaluate a resume
+/// attempt and to compute current topic head offsets from a
+/// [`TopicStore`].
 pub struct ResumeManager {
+    /// The offset tracker used to record and retrieve per-session
+    /// offset data during the resume evaluation process.
     pub tracker: OffsetTracker,
 }
 
@@ -50,18 +99,40 @@ impl Default for ResumeManager {
 }
 
 impl ResumeManager {
+    /// Create a new resume manager with an empty offset tracker.
     pub fn new() -> Self {
         Self {
             tracker: OffsetTracker::new(),
         }
     }
 
-    /// Decide outcome for a resume attempt.
+    /// Evaluate a resume attempt and return the appropriate outcome.
     ///
-    /// - `session` — the existing server-side session being resumed.
-    /// - `incoming_epoch` — the epoch the client claims.
-    /// - `last_offsets` — last offsets the client processed.
-    /// - `topic_offsets` — current head offset per topic on the server.
+    /// This method performs three checks in order:
+    ///
+    /// 1. **Liveness** -- Is the session still alive (not in `Closed`
+    ///    state)? Returns [`SessionReject::Expired`](crate::error::SessionReject::Expired)
+    ///    if not.
+    /// 2. **Epoch match** -- Does `incoming_epoch` match the session's
+    ///    current epoch? Returns [`SessionReject::Conflict`](crate::error::SessionReject::Conflict)
+    ///    if not.
+    /// 3. **Offset analysis** -- Delegates to
+    ///    [`decide`](crate::session::offset_tracker::decide) to compare
+    ///    the client's offsets against the server's head offsets.
+    ///
+    /// # Arguments
+    ///
+    /// * `session` -- The existing server-side session being resumed.
+    /// * `incoming_epoch` -- The epoch the client claims in its resume
+    ///   request.
+    /// * `last_offsets` -- The last offsets the client processed, keyed
+    ///   by topic name.
+    /// * `topic_offsets` -- The server's current head offsets per topic.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the session is expired or if the epoch does
+    /// not match.
     pub fn evaluate(
         &self,
         session: &Session,
@@ -82,6 +153,19 @@ impl ResumeManager {
     }
 
     /// Compute the head offset per topic currently in the store.
+    ///
+    /// Iterates over the given topic names and, for each one present in
+    /// the [`TopicStore`], reads its head offset. Topics that do not
+    /// exist in the store are silently omitted from the result.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` -- The server's topic store containing topic entries.
+    /// * `topics` -- The list of topic names to query.
+    ///
+    /// # Returns
+    ///
+    /// A map from topic name to its current head offset.
     pub fn topic_offsets(&self, store: &TopicStore, topics: &[String]) -> HashMap<String, i64> {
         let mut out = HashMap::new();
         for t in topics {

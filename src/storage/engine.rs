@@ -1,8 +1,28 @@
-//! Low-level byte store abstraction.
+//! # Low-Level Byte Store Engine Abstraction
 //!
-//! Two implementations:
-//! - [`MemoryEngine`] — `DashMap`-backed, no persistence.
-//! - `SledEngine` — `sled::Tree`-backed, durable (feature `sled`).
+//! This module defines the [`StorageEngine`] trait -- the fundamental
+//! key-value interface that every higher-level store (offset, log, dedupe,
+//! snapshot) builds upon. Keys and values are opaque `Vec<u8>` byte slices;
+//! all semantic interpretation (topic names, offsets, timestamps) is left to
+//! the higher-level stores.
+//!
+//! ## Implementations
+//!
+//! - [`MemoryEngine`] -- a `DashMap`-backed engine with no persistence.
+//!   Requires zero configuration and is always available. Ideal for
+//!   development, testing, and single-process deployments.
+//! - [`SledEngine`] -- a `sled::Tree`-backed engine that persists data to
+//!   disk. Requires the `sled` Cargo feature. Each higher-level store
+//!   opens its own tree from a shared `sled::Db` instance, giving each
+//!   store an independent key space without prefix encoding at the engine
+//!   level.
+//!
+//! ## Shared Engine Pattern
+//!
+//! The [`SharedEngine`] type alias (`Arc<dyn StorageEngine>`) allows
+//! multiple higher-level stores to share a single engine instance. In the
+//! sled backend, each store gets its own `SledEngine` wrapping a distinct
+//! `sled::Tree`, so no cross-contamination occurs between key namespaces.
 
 use std::sync::Arc;
 
@@ -12,30 +32,63 @@ use dashmap::DashMap;
 ///
 /// All keys and values are opaque `Vec<u8>`.  Higher-level stores
 /// (offset, log, dedupe, snapshot) build on top of this trait and
-/// perform their own key encoding.
+/// perform their own key encoding via the
+/// [`encode`](crate::storage::encode) module.
+///
+/// Implementations must be both `Send` and `Sync` so they can be shared
+/// safely across threads (typically via an `Arc`).
 pub trait StorageEngine: Send + Sync + 'static {
-    /// Get a value by key.
+    /// Retrieve the value associated with `key`, if it exists.
+    ///
+    /// Returns `None` when the key is not present in the store.
     fn get(&self, key: &[u8]) -> Option<Vec<u8>>;
 
-    /// Put a value by key.
+    /// Insert or overwrite the value for `key`.
+    ///
+    /// If the key already exists, its value is replaced. If the key is
+    /// new, a new entry is created.
     fn put(&self, key: &[u8], value: &[u8]);
 
-    /// Delete a key.
+    /// Remove the entry for `key` from the store.
+    ///
+    /// This is a no-op if the key does not exist.
     fn delete(&self, key: &[u8]);
 
-    /// Scan all entries whose keys start with `prefix`.
+    /// Scan all entries whose keys start with `prefix` and return them as
+    /// `(key, value)` pairs.
+    ///
+    /// The order of the returned pairs is unspecified for unsorted backends
+    /// (e.g. `MemoryEngine`) but is lexicographic by key for sorted
+    /// backends (e.g. `SledEngine`).
     fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)>;
 }
 
-/// In-memory storage engine, backed by a `DashMap`.
+/// In-memory storage engine, backed by a concurrent `DashMap`.
 ///
-/// Suitable for development and single-process deployments.
+/// Provides sub-microsecond latency and requires zero configuration.
+/// Data is **not** persisted -- it is lost when the process exits.
+/// Suitable for development, testing, and single-process deployments.
+///
+/// # Examples
+///
+/// ```ignore
+/// use rifts::storage::{MemoryEngine, StorageEngine};
+///
+/// let engine = MemoryEngine::new();
+/// engine.put(b"key", b"value");
+/// assert_eq!(engine.get(b"key"), Some(b"value".to_vec()));
+/// ```
 #[derive(Debug, Default)]
 pub struct MemoryEngine {
+    /// The underlying concurrent hash map storing key-value byte pairs.
     inner: DashMap<Vec<u8>, Vec<u8>>,
 }
 
 impl MemoryEngine {
+    /// Create a new, empty in-memory storage engine.
+    ///
+    /// The returned engine has no entries and will grow as data is
+    /// written via [`StorageEngine::put`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -63,12 +116,23 @@ impl StorageEngine for MemoryEngine {
     }
 }
 
-/// Wrapper for an `Arc<dyn StorageEngine>`.
+/// Type alias for a thread-safe, reference-counted storage engine.
+///
+/// This is the typical way to share an engine across multiple higher-level
+/// stores. The `Arc` provides cheap cloning and the `dyn StorageEngine`
+/// allows swapping implementations (e.g. from `MemoryEngine` to
+/// `SledEngine`) without changing any downstream code.
 pub type SharedEngine = Arc<dyn StorageEngine>;
 
 #[cfg(feature = "sled")]
 pub mod sled_engine {
-    //! Sled-backed storage engine.
+    //! Sled-backed storage engine implementation.
+    //!
+    //! This sub-module provides [`SledEngine`], a durable key-value store
+    //! backed by a single `sled::Tree`. Each higher-level store (offset,
+    //! log, dedupe, snapshot) opens its own tree from the same `sled::Db`
+    //! instance, giving each an isolated key space without cross-store
+    //! prefix collisions.
 
     use super::StorageEngine;
 
@@ -78,15 +142,37 @@ pub mod sled_engine {
     /// its own tree opened from the same `sled::Db` instance, giving
     /// independent key spaces without prefix encoding at the engine
     /// level.
+    ///
+    /// Because sled flushes data to disk, entries survive broker restarts.
+    /// Call [`flush`](SledEngine::flush) to force a sync to the underlying
+    /// filesystem.
     pub struct SledEngine {
+        /// The sled B+ tree that holds all key-value entries.
         tree: sled::Tree,
     }
 
     impl SledEngine {
+        /// Create a new sled-backed engine wrapping the given `sled::Tree`.
+        ///
+        /// Each higher-level store should open a separate tree from the
+        /// same `sled::Db` to keep key spaces isolated.
+        ///
+        /// # Parameters
+        ///
+        /// - `tree` -- an opened `sled::Tree` instance.
         pub fn new(tree: sled::Tree) -> Self {
             Self { tree }
         }
 
+        /// Flush all pending writes to the underlying filesystem.
+        ///
+        /// Returns the number of bytes flushed on success. This is
+        /// useful for ensuring durability before acknowledging writes
+        /// to clients.
+        ///
+        /// # Errors
+        ///
+        /// Returns a `sled::Error` if the flush fails.
         pub fn flush(&self) -> Result<usize, sled::Error> {
             self.tree.flush()
         }

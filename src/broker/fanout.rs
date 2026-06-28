@@ -1,9 +1,43 @@
-//! Fanout engine — delivers a published message to all subscribers of
-//! a topic (spec §22.4, `direct` strategy for small topics).
+//! Fanout engine — spec section 22.4.
 //!
-//! A `Subscription` ties a connection to a topic with a `from` offset
-//! and a `live_only` flag. The fanout engine hands each matching
-//! subscriber a serialized frame ready to write to the transport.
+//! This module implements the message fanout mechanism that delivers a
+//! published message to all active subscribers of a topic. The fanout
+//! engine uses a "direct" strategy suitable for small-to-medium topics:
+//! when a message is published, the engine iterates over every
+//! subscriber registered for that topic and invokes their
+//! [`FanoutSink::deliver`] method with a pre-serialized frame.
+//!
+//! # Subscriptions
+//!
+//! A [`Subscription`] ties a connection (represented by a
+//! [`ConnectionSink`]) to a topic. Each subscription carries a
+//! [`SubscribeIntent`] that indicates what kind of messages the
+//! subscriber wants to receive (live-only, replay from an offset,
+//! snapshot-then-live, etc.). Subscriptions are identified by a
+//! monotonic [`SubscriptionId`].
+//!
+//! # Sink abstraction
+//!
+//! The fanout engine is transport-agnostic. It does not know whether
+//! subscribers are local TCP connections, WebSocket clients, or
+//! in-process channels. Instead, it operates on the [`FanoutSink`]
+//! trait, which any transport layer can implement. The engine clones
+//! [`Bytes`] for each delivery, so sinks receive an owned buffer
+//! they can serialize or queue independently.
+//!
+//! # Backpressure and errors
+//!
+//! If a sink's delivery fails (e.g. the connection is closed or its
+//! send queue is full), the error is reported but does not prevent
+//! delivery to other subscribers. The caller (typically the broker
+//! implementation) is responsible for cleaning up stale subscriptions
+//! via [`FanoutEngine::unsubscribe`] or [`FanoutEngine::drop_sink`].
+//!
+//! # Concurrency
+//!
+//! The engine uses [`DashMap`] for both its topic-to-subscribers index
+//! and its subscription-id-to-topic index, allowing concurrent reads
+//! and writes without a global lock.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,77 +46,175 @@ use dashmap::DashMap;
 use uuid::Uuid;
 
 /// Identifies a single (connection, topic) subscription.
+///
+/// Subscription IDs are allocated monotonically by the
+/// [`FanoutEngine`] and are unique within a single engine instance.
+/// They are used to cancel subscriptions via
+/// [`FanoutEngine::unsubscribe`] and are returned to the caller by
+/// [`FanoutEngine::subscribe`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SubscriptionId(pub u64);
 
-/// What a subscriber wants to receive.
+/// Specifies what a subscriber wants to receive from a topic.
+///
+/// Passed to [`FanoutEngine::subscribe`] to indicate the subscriber's
+/// delivery preference. The fanout engine currently treats all intents
+/// identically (all subscribers receive every delivered frame), but
+/// the intent is preserved so that higher layers (e.g. the broker
+/// implementation) can adjust replay and snapshot behavior.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SubscribeIntent {
-    /// New messages after subscription.
+    /// Only receive new messages published after the subscription is
+    /// established. Historical messages are not replayed.
     Live,
-    /// From a specific offset.
+    /// Replay historical messages starting from the specified offset,
+    /// then continue receiving live messages.
     Replay {
-        /// Starting offset for replay.
+        /// The offset from which to begin replaying. Messages with
+        /// offsets greater than or equal to this value will be
+        /// delivered, followed by any new live messages.
         from: i64,
     },
-    /// Snapshot then live.
+    /// Capture a snapshot of the topic's current state, deliver it to
+    /// the subscriber, then switch to live delivery.
     SnapshotThenLive,
-    /// Only the latest state.
+    /// Receive only the most recent state of the topic (latest message
+    /// or snapshot). Does not subscribe to ongoing live delivery.
     Latest,
-    /// System notices only.
+    /// Receive only system-level notices (e.g. topic metadata changes,
+    /// administrative messages). Regular data messages are not
+    /// delivered.
     Passive,
-    /// Temporary; cleaned up on disconnect.
+    /// A temporary subscription that is automatically cleaned up when
+    /// the connection disconnects. Useful for one-off queries or
+    /// fire-and-forget operations.
     Ephemeral,
 }
 
-/// A registered subscription.
+/// A registered subscription record.
+///
+/// Contains all metadata about a subscription, including its unique
+/// identifier, the topic it is subscribed to, the subscriber's intent,
+/// and whether the subscription has been cancelled. Instances are
+/// returned to callers and stored in the broker's subscription
+/// tracking structures.
 #[derive(Debug, Clone)]
 pub struct Subscription {
-    /// Unique subscription id.
+    /// Unique identifier for this subscription, allocated by the
+    /// [`FanoutEngine`].
     pub id: SubscriptionId,
-    /// Topic name.
+    /// The name of the topic this subscription is listening to.
     pub topic: String,
-    /// What this subscriber wants.
+    /// The subscriber's delivery intent (live, replay, snapshot, etc.).
     pub intent: SubscribeIntent,
-    /// `true` if the subscription has been told to stop.
+    /// Whether the subscription has been told to stop. When `true`,
+    /// no further messages will be delivered to the associated sink.
     pub cancelled: bool,
 }
 
-/// Connection handle used by the fanout engine to deliver messages.
+/// A shared, type-erased handle to a connection that can receive
+/// fanned-out messages.
+///
+/// This is an `Arc<dyn FanoutSink>`, allowing the fanout engine to
+/// deliver frames to any transport without knowing the concrete type.
+/// The `Arc` enables sharing a single sink across multiple
+/// subscriptions if needed.
 pub type ConnectionSink = Arc<dyn FanoutSink>;
 
-/// Sink trait — implemented by the connection to receive fanned-out
-/// frames. The fanout engine does not know the transport type.
+/// Trait for a connection that can receive fanned-out frames.
+///
+/// Implementors represent a single client connection (TCP, WebSocket,
+/// in-process channel, etc.). The fanout engine calls
+/// [`deliver`](FanoutSink::deliver) for each message that matches
+/// the subscriber's topic and intent. The implementation is
+/// responsible for queuing, serializing, or writing the frame to the
+/// underlying transport.
+///
+/// # Thread safety
+///
+/// Implementations must be both [`Send`] and [`Sync`] because the
+/// fanout engine may invoke `deliver` from any async task.
 pub trait FanoutSink: Send + Sync {
     /// Deliver a serialized frame to this sink.
+    ///
+    /// The `frame` is a pre-serialized [`bytes::Bytes`] buffer
+    /// (typically produced by
+    /// [`serialize_frame_for_fanout`](crate::broker::broker::serialize_frame_for_fanout))
+    /// that the sink can write directly to its transport.
+    ///
+    /// Returns `Ok(())` on success, or a [`FanoutError`] if delivery
+    /// fails (e.g. the connection is closed or backpressured).
     fn deliver(&self, frame: bytes::Bytes) -> Result<(), FanoutError>;
-    /// Unique identifier for this sink.
+
+    /// Return a unique identifier for this sink.
+    ///
+    /// Used by the fanout engine to group subscriptions by connection,
+    /// enabling bulk cleanup via [`FanoutEngine::drop_sink`]. The ID
+    /// must be unique across all active sinks; see
+    /// [`new_sink_id`] for a UUID-derived allocation strategy.
     fn id(&self) -> u64;
 }
 
-/// Errors that can occur during fanout delivery.
+/// Errors that can occur during fanout delivery to a sink.
+///
+/// The fanout engine treats these errors as non-fatal: a delivery
+/// failure to one subscriber does not prevent delivery to others.
+/// The caller is responsible for cleaning up subscriptions whose
+/// sinks have been closed.
 #[derive(Debug, thiserror::Error)]
 pub enum FanoutError {
-    /// The sink has been closed and should be removed.
+    /// The sink has been closed and should be removed from the fanout
+    /// engine. This typically means the underlying TCP connection or
+    /// channel has been dropped.
     #[error("sink closed")]
     Closed,
-    /// The sink's send queue is full.
+    /// The sink's internal send queue is full and cannot accept more
+    /// messages at this time. The caller may choose to retry later,
+    /// drop the message, or disconnect the slow subscriber.
     #[error("sink backpressured: queue={queue_bytes}, max={max_bytes}")]
     Backpressured {
-        /// Current queue depth in bytes.
+        /// Current number of bytes queued in the sink's buffer.
         queue_bytes: usize,
-        /// Maximum queue capacity in bytes.
+        /// Maximum queue capacity in bytes configured for this sink.
         max_bytes: usize,
     },
 }
 
-/// In-process fanout engine. Stores subscriptions grouped by topic.
+/// In-process fanout engine that manages subscriptions and delivers
+/// published messages to all active subscribers of a topic.
+///
+/// The engine maintains two indexes for efficient lookup:
+///
+/// - **by topic**: maps a topic name to a list of `(SubscriptionId,
+///   ConnectionSink)` pairs, enabling fast fanout delivery.
+/// - **by subscription ID**: maps a [`SubscriptionId`] to its topic
+///   and sink, enabling fast unsubscription and sink cleanup.
+///
+/// Both indexes use [`DashMap`] for concurrent shard-level access
+/// without a global lock.
+///
+/// # Usage
+///
+/// ```ignore
+/// use std::sync::Arc;
+/// use rifts::broker::fanout::{FanoutEngine, SubscribeIntent};
+///
+/// let engine = FanoutEngine::new();
+/// let sink: Arc<dyn FanoutSink> = /* ... */;
+/// let id = engine.subscribe("orders", SubscribeIntent::Live, sink);
+/// let delivered = engine.deliver("orders", bytes::Bytes::from_static(b"hello"));
+/// assert_eq!(delivered, 1);
+/// ```
 pub struct FanoutEngine {
-    /// topic → (subscription_id, sink)
+    /// Maps topic name to a list of (subscription_id, sink) pairs.
+    /// Used during fanout delivery to iterate over all subscribers
+    /// of a given topic.
     by_topic: DashMap<String, Vec<(SubscriptionId, ConnectionSink)>>,
-    /// subscription_id → (topic, sink)
+    /// Maps subscription_id to (topic, sink). Used for fast
+    /// unsubscription and sink-level cleanup.
     by_id: DashMap<SubscriptionId, (String, ConnectionSink)>,
-    /// Monotonic subscription id allocator.
+    /// Monotonically increasing counter for allocating unique
+    /// subscription IDs.
     seq: AtomicU64,
 }
 
@@ -101,7 +233,7 @@ impl Default for FanoutEngine {
 }
 
 impl FanoutEngine {
-    /// Create an empty fanout engine.
+    /// Create an empty fanout engine with no registered subscriptions.
     pub fn new() -> Self {
         Self {
             by_topic: DashMap::new(),
@@ -110,7 +242,24 @@ impl FanoutEngine {
         }
     }
 
-    /// Add a new subscription. Returns the subscription id.
+    /// Register a new subscription for a topic.
+    ///
+    /// Adds the `sink` to the fanout list for the given `topic` and
+    /// records the mapping from the allocated [`SubscriptionId`] back
+    /// to the topic and sink. The `intent` parameter is stored for
+    /// informational purposes but does not currently affect delivery
+    /// behavior.
+    ///
+    /// Returns the allocated [`SubscriptionId`], which the caller can
+    /// later pass to [`unsubscribe`](FanoutEngine::unsubscribe) to
+    /// cancel the subscription.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` — The topic name to subscribe to.
+    /// * `intent` — The subscriber's delivery preference.
+    /// * `sink` — A shared handle to the connection that will receive
+    ///   fanned-out frames.
     pub fn subscribe(
         &self,
         topic: &str,
@@ -126,9 +275,14 @@ impl FanoutEngine {
         id
     }
 
-    /// Remove a subscription. Returns `Some(topic_name)` if the
-    /// subscription existed, so the caller can adjust per-topic
-    /// counters.
+    /// Remove a subscription by its ID.
+    ///
+    /// Removes the subscription from both the topic-to-subscribers
+    /// index and the subscription-ID-to-topic index. Returns
+    /// `Some(topic_name)` if the subscription existed, allowing the
+    /// caller to decrement per-topic subscriber counters. Returns
+    /// `None` if the subscription was not found (already cancelled
+    /// or never registered).
     pub fn unsubscribe(&self, id: SubscriptionId) -> Option<String> {
         if let Some((_, (topic, _sink))) = self.by_id.remove(&id) {
             if let Some(mut list) = self.by_topic.get_mut(&topic) {
@@ -140,7 +294,16 @@ impl FanoutEngine {
         }
     }
 
-    /// Drop all subscriptions owned by `sink_id`.
+    /// Drop all subscriptions owned by a particular connection sink.
+    ///
+    /// Iterates over all registered subscriptions, finds those whose
+    /// sink's [`id`](FanoutSink::id) matches `sink_id`, and removes
+    /// them. Returns a list of topic names that had at least one
+    /// subscription removed, so the caller can decrement per-topic
+    /// subscriber counts.
+    ///
+    /// This is typically called when a client connection is closed,
+    /// to clean up all of its subscriptions in a single operation.
     pub fn drop_sink(&self, sink_id: u64) -> Vec<String> {
         let mut topics = Vec::new();
         let ids: Vec<SubscriptionId> = self
@@ -157,9 +320,26 @@ impl FanoutEngine {
         topics
     }
 
-    /// Deliver a single serialized frame to all subscribers of `topic`
-    /// whose intent covers it. Returns the number of successful
-    /// deliveries.
+    /// Deliver a single serialized frame to all subscribers of a topic.
+    ///
+    /// Looks up all subscribers registered for the given `topic` and
+    /// calls [`FanoutSink::deliver`] on each one with a clone of the
+    /// `frame`. Returns the number of successful deliveries. Failed
+    /// deliveries (where the sink returned an error) are silently
+    /// skipped; the caller should clean up stale subscriptions
+    /// separately.
+    ///
+    /// # Arguments
+    ///
+    /// * `topic` — The topic name whose subscribers should receive
+    ///   the frame.
+    /// * `frame` — The serialized frame bytes to deliver.
+    ///
+    /// # Returns
+    ///
+    /// The count of sinks that accepted the frame without error. A
+    /// return value of `0` means either the topic has no subscribers
+    /// or all deliveries failed.
     pub fn deliver(&self, topic: &str, frame: bytes::Bytes) -> usize {
         let mut ok = 0;
         if let Some(list) = self.by_topic.get(topic) {
@@ -172,18 +352,36 @@ impl FanoutEngine {
         ok
     }
 
-    /// Total number of registered subscriptions.
+    /// Return the total number of active subscriptions across all
+    /// topics.
+    ///
+    /// This is the number of entries in the subscription-ID-to-topic
+    /// index. A single connection may have multiple subscriptions
+    /// (one per topic), so this count may exceed the number of
+    /// distinct connections.
     pub fn subscription_count(&self) -> usize {
         self.by_id.len()
     }
 
-    /// Number of distinct sinks subscribed to a topic.
+    /// Return the number of distinct subscriptions registered for a
+    /// specific topic.
+    ///
+    /// Returns `0` if the topic has no subscribers or does not exist
+    /// in the index.
     pub fn topic_subscriber_count(&self, topic: &str) -> usize {
         self.by_topic.get(topic).map(|l| l.len()).unwrap_or(0)
     }
 }
 
-/// Build a fresh connection sink id (uuid-derived u64) for tagging.
+/// Generate a fresh, unique connection sink identifier.
+///
+/// Produces a `u64` derived from the first 8 bytes of a new UUID v4,
+/// interpreted as a little-endian unsigned integer. The probability
+/// of collision is negligible for typical deployment sizes.
+///
+/// This ID is used to tag connection sinks so that the fanout engine
+/// can group subscriptions by connection and clean them up in bulk
+/// via [`FanoutEngine::drop_sink`].
 pub fn new_sink_id() -> u64 {
     let u = Uuid::new_v4();
     let bytes = u.as_bytes();
@@ -192,7 +390,11 @@ pub fn new_sink_id() -> u64 {
     u64::from_le_bytes(buf)
 }
 
-/// Optional helper for tests: a sink that just counts deliveries.
+/// Test utilities for the fanout engine.
+///
+/// This module provides mock sink implementations that are useful
+/// for unit testing broker and fanout logic without real network
+/// connections.
 pub mod test_sink {
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -200,15 +402,26 @@ pub mod test_sink {
 
     use super::{FanoutError, FanoutSink};
 
-    /// A test sink that counts deliveries and records messages.
+    /// A test sink that counts deliveries and records message payloads.
+    ///
+    /// Useful in unit tests to verify that the correct number of
+    /// messages were delivered and that the payload content matches
+    /// expectations. The sink always accepts deliveries (never returns
+    /// an error) and stores all received frames in an internal log.
     pub struct CountingSink {
+        /// Unique identifier returned by [`FanoutSink::id`].
         id: u64,
+        /// Atomic counter tracking the total number of deliveries.
         delivered: AtomicU64,
+        /// Ordered log of all received message payloads.
         log: Mutex<Vec<Vec<u8>>>,
     }
 
     impl CountingSink {
-        /// Create a new counting sink with the given id.
+        /// Create a new counting sink with the given unique `id`.
+        ///
+        /// The sink starts with zero deliveries and an empty message
+        /// log.
         pub fn new(id: u64) -> Self {
             Self {
                 id,
@@ -216,11 +429,13 @@ pub mod test_sink {
                 log: Mutex::new(Vec::new()),
             }
         }
-        /// Number of messages delivered.
+        /// Return the total number of messages that have been
+        /// delivered to this sink.
         pub fn count(&self) -> u64 {
             self.delivered.load(Ordering::SeqCst)
         }
-        /// Snapshot of delivered messages.
+        /// Return a snapshot of all message payloads that have been
+        /// delivered to this sink, in delivery order.
         pub fn messages(&self) -> Vec<Vec<u8>> {
             self.log.lock().clone()
         }

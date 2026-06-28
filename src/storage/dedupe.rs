@@ -1,4 +1,34 @@
-//! Dedupe store — drop messages already seen within a window (spec §11.2).
+//! # Message Deduplication Store
+//!
+//! This module implements message deduplication, which detects and discards
+//! duplicate messages within a configurable time window. This corresponds to
+//! **specification section 11.2**.
+//!
+//! ## How Deduplication Works
+//!
+//! Every message carries a `dedupe_key` (typically the message ID). The
+//! deduplication store records each key the first time it is seen along with an
+//! expiry timestamp computed from `now + window`. When the same key arrives
+//! again within the window, [`DedupeStore::check_and_record`] returns `false`,
+//! signaling the caller to skip the message. If the recorded entry has already
+//! expired, the message is treated as fresh and the window is extended.
+//!
+//! ## Implementations
+//!
+//! - [`MemoryDedupeStore`] -- an in-memory deduplication table backed by
+//!   `DashMap`. Uses the `entry()` API for atomic insert-or-update, making it
+//!   safe for concurrent access without external locking. Suitable for
+//!   single-process deployments.
+//! - [`SledDedupeStore`] -- a durable deduplication store backed by
+//!   [`SledEngine`](crate::storage::SledEngine). Requires the `sled` Cargo
+//!   feature. Suitable when deduplication state must survive broker restarts.
+//!
+//! ## Expiry Sweeping
+//!
+//! Both implementations expose a [`DedupeStore::sweep`] method that removes all
+//! entries whose expiry timestamp has passed. Callers should invoke `sweep`
+//! periodically (e.g. via a timer) to prevent unbounded growth of the
+//! deduplication table in memory or on disk.
 
 use std::time::Duration;
 
@@ -6,25 +36,72 @@ use dashmap::DashMap;
 
 use crate::now_ms;
 
-/// Trait for deduplication.
+/// Trait defining the contract for message deduplication stores.
+///
+/// Implementations record which message keys have been seen recently and
+/// reject duplicates that arrive within a configurable time window. This
+/// trait is the core abstraction that enables both in-memory and durable
+/// deduplication strategies to be used interchangeably by the broker.
 pub trait DedupeStore: Send + Sync {
-    /// Returns `true` if the key is fresh (process the message);
-    /// `false` if it has been seen within the window.
+    /// Check whether `key` under `topic` is fresh and, if so, record it.
+    ///
+    /// Returns `true` if the key has not been seen within `window` (or its
+    /// previous record has expired), meaning the message should be processed.
+    /// Returns `false` if the key is a duplicate within the active window,
+    /// meaning the message should be skipped.
+    ///
+    /// The operation is atomic: the check and the record happen in a single
+    /// step so that concurrent callers racing on the same key will never both
+    /// see a "fresh" result.
+    ///
+    /// # Parameters
+    ///
+    /// - `topic` -- the topic namespace for the key.
+    /// - `key` -- the deduplication key (typically a message ID).
+    /// - `window` -- the duration for which a seen key remains valid.
     fn check_and_record(&self, topic: &str, key: &str, window: Duration) -> bool;
 
-    /// Drop expired entries. Returns count removed.
+    /// Remove all entries whose expiry timestamp has passed.
+    ///
+    /// Returns the number of entries that were removed. Call this
+    /// periodically (e.g. from a background timer) to reclaim memory or
+    /// disk space consumed by stale deduplication records.
     fn sweep(&self) -> usize;
 }
 
 // ── Memory-backed ────────────────────────────────────────────
 
-/// In-memory dedupe store, backed by a `DashMap`.
+/// In-memory deduplication store backed by a concurrent `DashMap`.
+///
+/// Each entry maps a `(topic, key)` pair to an absolute expiry timestamp
+/// in milliseconds. The `DashMap::entry()` API guarantees atomicity: when
+/// two threads race on the same key, exactly one closure executes, avoiding
+/// the check-then-act race that a two-step `get_mut` + `insert` would have.
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::time::Duration;
+/// use rifts::storage::{DedupeStore, MemoryDedupeStore};
+///
+/// let store = MemoryDedupeStore::new();
+/// let window = Duration::from_secs(60);
+///
+/// assert!(store.check_and_record("orders", "msg-42", window));   // fresh
+/// assert!(!store.check_and_record("orders", "msg-42", window));  // duplicate
+/// ```
 #[derive(Debug, Default)]
 pub struct MemoryDedupeStore {
+    /// Maps `(topic, key)` to an absolute expiry timestamp in milliseconds.
     inner: DashMap<(String, String), i64>,
 }
 
 impl MemoryDedupeStore {
+    /// Create a new, empty in-memory deduplication store.
+    ///
+    /// The store starts with no entries and will grow as messages are
+    /// recorded. Use [`DedupeStore::sweep`] periodically to remove
+    /// expired entries and reclaim memory.
     pub fn new() -> Self {
         Self::default()
     }
@@ -35,9 +112,10 @@ impl DedupeStore for MemoryDedupeStore {
         let now = now_ms();
         let expires = now + window.as_millis() as i64;
         let k = (topic.to_string(), key.to_string());
-        // DashMap 6.x 的 entry() 是原子的：and_modify 与 or_insert_with 闭包
-        // 互斥——同一 key 只有一个闭包会执行。这避免了原先 get_mut → insert
-        // 两步之间的竞争窗口。
+        // DashMap 6.x entry() is atomic: the and_modify and or_insert_with
+        // closures are mutually exclusive -- only one closure executes per
+        // key. This eliminates the race window between a two-step
+        // get_mut -> insert approach.
         let mut is_fresh = false;
         self.inner
             .entry(k)
@@ -76,23 +154,57 @@ impl DedupeStore for MemoryDedupeStore {
 
 #[cfg(feature = "sled")]
 mod sled_impl {
+    //! Sled-backed deduplication store implementation.
+    //!
+    //! This sub-module provides [`SledDedupeStore`], a durable
+    //! deduplication store that persists entries to disk via a
+    //! [`SledEngine`](crate::storage::SledEngine). Because the state
+    //! survives broker restarts, it is suitable for production deployments
+    //! where duplicate detection must continue across process lifetimes.
+
     use super::*;
     use crate::storage::encode;
     use crate::storage::engine::SledEngine;
     use crate::storage::engine::StorageEngine;
 
-    /// Sled-backed dedupe store.
+    /// Durable deduplication store backed by a [`SledEngine`].
+    ///
+    /// Each deduplication entry is stored as a key-value pair where the key
+    /// is produced by [`encode::dedupe_key`] and the value is the 8-byte
+    /// big-endian expiry timestamp. Because sled persists data to disk, the
+    /// deduplication state survives broker restarts.
+    ///
+    /// # Key Layout
+    ///
+    /// Key: `<topic>\x00<message_id>\x00`
+    /// Value: `<expiry_timestamp: i64, big-endian>`
     pub struct SledDedupeStore {
+        /// The underlying byte-oriented storage engine.
         engine: SledEngine,
     }
 
     impl SledDedupeStore {
+        /// Create a new sled-backed deduplication store from the given engine.
+        ///
+        /// The engine should be a dedicated tree for deduplication entries,
+        /// opened from the same `sled::Db` instance used by other stores.
+        ///
+        /// # Parameters
+        ///
+        /// - `engine` -- a [`SledEngine`] instance (typically a dedicated tree
+        ///   for deduplication entries).
         pub fn new(engine: SledEngine) -> Self {
             Self { engine }
         }
     }
 
     impl DedupeStore for SledDedupeStore {
+        /// Check whether `key` under `topic` is fresh and, if so, record it
+        /// in the sled tree.
+        ///
+        /// The implementation reads the existing expiry (if any) from the
+        /// engine, compares it to the current time, and either returns
+        /// `false` (duplicate) or writes a new expiry and returns `true`.
         fn check_and_record(&self, topic: &str, key: &str, window: Duration) -> bool {
             let now = now_ms();
             let expires = now + window.as_millis() as i64;
@@ -109,6 +221,12 @@ mod sled_impl {
             true
         }
 
+        /// Scan all deduplication entries and remove those whose expiry
+        /// timestamp has passed.
+        ///
+        /// This performs a full prefix scan over the entire key space (empty
+        /// prefix), filters for expired entries, and deletes them one by
+        /// one. Returns the count of removed entries.
         fn sweep(&self) -> usize {
             let now = now_ms();
             let expired: Vec<Vec<u8>> = self

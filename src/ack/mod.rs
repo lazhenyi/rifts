@@ -1,4 +1,27 @@
-//! Acknowledgement system — spec §12.
+//! Acknowledgement system (Rift spec section 12).
+//!
+//! This module implements the server-side acknowledgement tracking used to
+//! confirm to publishers that their messages have been received, persisted,
+//! or delivered. The acknowledgement system has three components:
+//!
+//! 1. **[`AckStatus`]** — a status enum describing the outcome of a message
+//!    (received, persisted, delivered, failed, etc.).
+//!
+//! 2. **[`AckPolicy`]** — an enum describing the level of acknowledgement
+//!    guarantee requested by the publisher (none, server-only, quorum, etc.).
+//!
+//! 3. **[`AckManager`]** — a per-session tracker that records outstanding
+//!    (sent-but-not-acked) message ids and their deadlines, allowing the
+//!    server to reap timed-out messages.
+//!
+//! # Lifecycle
+//!
+//! When a publisher sends a data frame with the `REQUIRES_ACK` flag set:
+//!
+//! 1. The broker publishes the message and returns an outcome.
+//! 2. The server creates an [`Ack`] and sends it back as an ack frame.
+//! 3. The publisher responds with an ack control frame to confirm receipt.
+//! 4. The server calls [`AckManager::complete`] to clear the tracking entry.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -9,21 +32,43 @@ use crate::now_ms;
 use parking_lot::Mutex;
 use uuid::Uuid;
 
-/// Status of an acknowledgement (spec §12.1).
+/// Status of an acknowledgement (Rift spec section 12.1).
+///
+/// Each status represents a stage in the message processing pipeline,
+/// from initial receipt through final delivery or failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckStatus {
+    /// The server has received the message but has not yet processed it.
     Received,
+
+    /// The message has been accepted by the server (semantic validation passed).
     Accepted,
+
+    /// The message has been durably persisted (written to the replay log
+    /// or external store).
     Persisted,
+
+    /// The message has been delivered to all (or a quorum of) subscribers.
     Delivered,
+
+    /// The message has been processed by a subscriber (end-to-end acknowledgement).
     Processed,
+
+    /// The message was rejected (schema mismatch, policy violation, etc.).
     Rejected,
+
+    /// The message expired (TTL exceeded) before it could be delivered.
     Expired,
+
+    /// The message is a duplicate of one already seen (deduplication window).
     Duplicate,
+
+    /// The message could not be delivered due to an internal error.
     Failed,
 }
 
 impl AckStatus {
+    /// Return the lowercase wire representation of this status.
     pub fn as_str(self) -> &'static str {
         match self {
             AckStatus::Received => "received",
@@ -39,31 +84,73 @@ impl AckStatus {
     }
 }
 
-/// Acknowledgement strategy (spec §12.3).
+/// Acknowledgement policy (Rift spec section 12.3).
+///
+/// The policy determines the level of delivery guarantee the server
+/// must achieve before sending an acknowledgement back to the publisher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckPolicy {
+    /// No acknowledgement is sent. The publisher fire-and-forgets.
     None,
+
+    /// The server acknowledges receipt (before persistence or delivery).
     Server,
+
+    /// The server acknowledges after the message is durably persisted.
     Persisted,
+
+    /// The server acknowledges after a quorum of replicas has persisted
+    /// the message (distributed deployments).
     Quorum,
+
+    /// The server acknowledges after the message has been delivered to
+    /// all subscribers.
     Subscriber,
+
+    /// The server acknowledges after the application layer confirms
+    /// processing (end-to-end acknowledgement).
     Application,
 }
 
 /// Acknowledgement payload sent to the peer.
+///
+/// Contains all the information the publisher needs to correlate the
+/// acknowledgement with the original message and determine the outcome.
 #[derive(Debug, Clone)]
 pub struct Ack {
+    /// Unique acknowledgement id, generated as a UUID v4.
     pub ack_id: String,
+
+    /// The message id this acknowledgement corresponds to.
     pub message_id: String,
+
+    /// The status of the acknowledgement.
     pub status: AckStatus,
+
+    /// The broker-assigned offset of the persisted message, if applicable.
     pub offset: Option<i64>,
+
+    /// Human-readable reason for the status (e.g. an error message for
+    /// `Failed` or `Rejected`).
     pub reason: Option<String>,
+
+    /// Machine-readable error code, if applicable.
     pub error_code: Option<String>,
+
+    /// Suggested retry delay in milliseconds (used with rate-limiting
+    /// or overload responses).
     pub retry_after_ms: Option<u32>,
+
+    /// Server-side timestamp in milliseconds since the Unix epoch at
+    /// which the acknowledgement was generated.
     pub server_time: i64,
 }
 
 impl Ack {
+    /// Create a new acknowledgement for the given message id and status.
+    ///
+    /// A unique `ack_id` is generated automatically. The `server_time`
+    /// is set to `now_ms()`.
     pub fn new(message_id: impl Into<String>, status: AckStatus) -> Self {
         Self {
             ack_id: Uuid::new_v4().to_string(),
@@ -77,11 +164,19 @@ impl Ack {
         }
     }
 
+    /// Attach a broker-assigned offset to the acknowledgement.
+    ///
+    /// This is used when the message has been persisted and the publisher
+    /// needs to know the exact offset for resume or audit purposes.
     pub fn with_offset(mut self, offset: i64) -> Self {
         self.offset = Some(offset);
         self
     }
 
+    /// Attach a human-readable reason string to the acknowledgement.
+    ///
+    /// Typically used for error statuses (`Failed`, `Rejected`) to convey
+    /// the failure cause back to the publisher.
     pub fn with_reason(mut self, reason: impl Into<String>) -> Self {
         self.reason = Some(reason.into());
         self
@@ -89,8 +184,17 @@ impl Ack {
 }
 
 /// Tracks outstanding (sent-but-not-acked) frames per session.
+///
+/// The `AckManager` is shared across all connections via
+/// [`SharedAckManager`] (an `Arc<AckManager>`). Each session's outstanding
+/// messages are stored as a map from `message_id` to deadline timestamp.
+///
+/// # Thread safety
+///
+/// The inner map is protected by a [`parking_lot::Mutex`] which is held
+/// only briefly for insertions, removals, and reaps.
 pub struct AckManager {
-    /// session_id → message_id → deadline
+    /// Map from session id to (message id → deadline in ms since epoch).
     outstanding: Mutex<HashMap<String, HashMap<String, i64>>>,
 }
 
@@ -101,13 +205,17 @@ impl Default for AckManager {
 }
 
 impl AckManager {
+    /// Create a new, empty acknowledgement manager.
     pub fn new() -> Self {
         Self {
             outstanding: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Mark a frame as awaiting acknowledgement.
+    /// Mark a message as awaiting acknowledgement for a given session.
+    ///
+    /// The `timeout` is added to the current time to compute the deadline
+    /// after which the message is considered timed out.
     pub fn track(&self, session_id: &str, message_id: &str, timeout: Duration) {
         let deadline = now_ms() + timeout.as_millis() as i64;
         self.outstanding
@@ -117,8 +225,11 @@ impl AckManager {
             .insert(message_id.to_string(), deadline);
     }
 
-    /// Mark a message as acknowledged; returns `true` if the message
-    /// was being tracked.
+    /// Mark a message as acknowledged.
+    ///
+    /// Returns `true` if the message was being tracked (and is now
+    /// removed); `false` if it was not found (already acked or never
+    /// tracked).
     pub fn complete(&self, session_id: &str, message_id: &str) -> bool {
         self.outstanding
             .lock()
@@ -127,8 +238,11 @@ impl AckManager {
             .is_some()
     }
 
-    /// Find timed-out message ids for a session; returns the expired
-    /// ids and removes them from the tracking set.
+    /// Find and remove timed-out messages for a session.
+    ///
+    /// Returns the list of message ids whose deadline has passed. The
+    /// returned ids are removed from the tracking set so they will not
+    /// be reported again.
     pub fn reap_timeouts(&self, session_id: &str) -> Vec<String> {
         let now = now_ms();
         let mut g = self.outstanding.lock();
@@ -147,13 +261,19 @@ impl AckManager {
         expired
     }
 
-    /// Drop everything for a session.
+    /// Drop all tracking state for a session.
+    ///
+    /// Called when a connection is torn down so that the session's
+    /// outstanding entries do not leak.
     pub fn forget(&self, session_id: &str) {
         self.outstanding.lock().remove(session_id);
     }
 }
 
-/// Shared ack manager.
+/// Type alias for a shared, reference-counted [`AckManager`].
+///
+/// Passed to each [`Connection`](crate::connection::Connection) at
+/// construction time so that all connections share the same manager.
 pub type SharedAckManager = Arc<AckManager>;
 
 #[cfg(test)]

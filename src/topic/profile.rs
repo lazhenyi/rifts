@@ -1,36 +1,79 @@
-//! Topic profile — spec §9.2.
+//! Topic profile (Rift spec section 9.2).
+//!
+//! A [`TopicProfile`] bundles all the configurable policies for a single topic
+//! into one value: retention, ordering, publisher/subscriber limits, rate
+//! limits, and replay/snapshot capabilities. Profiles are stored alongside
+//! each topic entry in the [`TopicStore`](crate::topic::store::TopicStore)
+//! and can be updated at runtime (subject to the broker's policy).
 
 use std::time::Duration;
 
 use crate::topic::ordering::OrderingPolicy;
 use crate::topic::retention::RetentionPolicy;
 
-/// A topic profile defines the policy for a single topic.
+/// A topic profile defines every configurable policy for a single topic.
+///
+/// The default profile uses global topic ordering, latest-value retention,
+/// a 10 000 subscriber/publisher limit, no rate limiting, and a 5-minute
+/// replay window.
 #[derive(Debug, Clone)]
 pub struct TopicProfile {
-    /// Profile name (human-readable).
+    /// Human-readable profile name (e.g. `"default"`, `"chat"`, `"metrics"`).
     pub name: String,
-    /// Retention policy.
+
+    /// How long messages are retained in the replay log before eviction.
     pub retention: RetentionPolicy,
-    /// Ordering policy.
+
+    /// The ordering guarantee applied to message delivery.
     pub ordering: OrderingPolicy,
-    /// Maximum number of subscribers.
+
+    /// Maximum number of concurrent subscribers allowed on this topic.
+    /// Attempts to subscribe beyond this limit are rejected with
+    /// [`TopicReject::SubscriberLimit`](crate::error::TopicReject::SubscriberLimit).
     pub max_subscribers: usize,
-    /// Maximum number of concurrent publishers.
+
+    /// Maximum number of concurrent publishers allowed on this topic.
+    /// Attempts to publish beyond this limit are rejected with
+    /// [`TopicReject::PublisherLimit`](crate::error::TopicReject::PublisherLimit).
     pub max_publishers: usize,
-    /// Per-publisher rate limit (messages per second). `None` = no limit.
+
+    /// Per-publisher rate limit in messages per second. `None` means no
+    /// limit is enforced per publisher.
     pub rate_limit_per_publisher: Option<u32>,
-    /// Per-topic total rate limit (messages per second). `None` = no limit.
+
+    /// Aggregate rate limit for the entire topic in messages per second.
+    /// `None` means no topic-wide limit is enforced.
     pub rate_limit_total: Option<u32>,
-    /// Whether replay is supported.
+
+    /// Whether late-joining subscribers can replay messages from the
+    /// retention log. When `false`, only live messages are delivered.
     pub replay_enabled: bool,
-    /// Whether snapshots are supported.
+
+    /// Whether the broker maintains a latest-value snapshot for this
+    /// topic. Snapshots allow new subscribers to receive the current
+    /// state immediately without waiting for the next live message.
     pub snapshot_enabled: bool,
-    /// Replay window — how long messages remain replayable.
+
+    /// Duration for which messages remain available for replay after
+    /// they are published. Only relevant when `replay_enabled` is `true`.
     pub replay_window: Duration,
 }
 
 impl Default for TopicProfile {
+    /// Returns the default topic profile.
+    ///
+    /// | Field                    | Default value           |
+    /// |--------------------------|-------------------------|
+    /// | `name`                   | `"default"`             |
+    /// | `retention`              | `Latest`                |
+    /// | `ordering`               | `Topic`                 |
+    /// | `max_subscribers`        | 10 000                  |
+    /// | `max_publishers`         | 10 000                  |
+    /// | `rate_limit_per_publisher` | `None` (no limit)     |
+    /// | `rate_limit_total`       | `None` (no limit)       |
+    /// | `replay_enabled`         | `true`                  |
+    /// | `snapshot_enabled`       | `true`                  |
+    /// | `replay_window`          | 300 seconds (5 minutes) |
     fn default() -> Self {
         Self {
             name: "default".into(),

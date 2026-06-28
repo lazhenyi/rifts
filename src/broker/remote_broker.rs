@@ -1,9 +1,50 @@
-//! Remote broker — a `Broker` implementation that connects to an
-//! external broker node over TCP.
+//! Remote broker — spec section 22 (distributed broker, Phase 2a).
 //!
-//! The external broker node must speak the wire protocol defined in
-//! [`crate::broker::wire`].  This crate does not provide the broker
-//! node; users write their own in any language / stack.
+//! This module provides a [`Broker`] implementation that connects to an
+//! external broker node over a single TCP connection. The external node
+//! must speak the wire protocol defined in [`crate::broker::wire`] —
+//! a length-prefixed CBOR-framed protocol that serializes [`WireMsg`]
+//! variants for request/response and push delivery.
+//!
+//! # Connection model
+//!
+//! The [`RemoteBroker`] opens a single TCP connection and splits it into
+//! a framed writer half and a framed reader half. The writer half is
+//! protected by a Tokio [`tokio::sync::Mutex`] for serialized access,
+//! while a background reader task continuously parses incoming frames
+//! and dispatches them:
+//!
+//! - **Push messages** (`WireMsg::Deliver`) are routed to a local
+//!   sink map (sink ID to an mpsc channel), which feeds a background
+//!   task per subscription that delivers to the actual [`FanoutSink`].
+//! - **Response messages** are matched to pending requests via a
+//!   first-in-first-out queue of oneshot sender channels.
+//!
+//! # FIFO response matching
+//!
+//! The current [`WireMsg`] design does not carry a `request_id` field
+//! on response variants. As a result, the reader task dispatches
+//! responses to the oldest pending request (the first entry in the
+//! pending map). This is safe under the current design where only one
+//! in-flight request is supported per `RemoteBroker`, but concurrent
+//! requests will require protocol changes to add request correlation.
+//!
+//! # Timeout and error handling
+//!
+//! Each request has a 30-second timeout. If the broker node does not
+//! respond within this window, the pending entry is removed and a
+//! [`RiftError::System`] is returned. If the TCP connection breaks,
+//! the reader task exits and pending oneshot senders are dropped,
+//! causing waiting requests to receive a "connection closed" error.
+//!
+//! # Sink lifecycle
+//!
+//! On `subscribe`, the `RemoteBroker` allocates a local sink ID (via
+//! [`crate::broker::fanout::new_sink_id`]), registers an mpsc channel
+//! in the sinks map, and spawns a background task that reads from the
+//! channel and delivers to the actual [`FanoutSink`]. When the sink
+//! is dropped (via `drop_sink`), the channel is closed and the entry
+//! is removed from the sinks map.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,29 +65,71 @@ use crate::error::{Result, RiftError, SystemReject};
 
 /// A `Broker` that talks to an external broker node over framed TCP.
 ///
-/// Opens a single TCP connection for both request/response and push
-/// delivery.  Push messages (`Deliver`) are routed to a local fanout
-/// map of sink IDs → channels.
+/// Opens a single TCP connection for both request/response operations
+/// and push delivery from the broker. Push messages (`Deliver`) are
+/// routed to a local fanout map of sink IDs to mpsc channels, which
+/// feed dedicated Tokio tasks that deliver to the actual connection
+/// sinks.
+///
+/// # Thread safety
+///
+/// The remote broker is [`Send`] and [`Sync`] and can be shared across
+/// async tasks via `Arc<RemoteBroker>`. All shared state uses
+/// concurrent data structures ([`DashMap`], [`AtomicU32`], Tokio
+/// channels).
+///
+/// # Examples
+///
+/// ```ignore
+/// use std::net::SocketAddr;
+/// use rifts::broker::RemoteBroker;
+///
+/// let addr: SocketAddr = "127.0.0.1:9001".parse().unwrap();
+/// let broker = RemoteBroker::connect(addr).await.unwrap();
+/// ```
 pub struct RemoteBroker {
-    /// Writer half of the framed TCP connection (serialised).
+    /// Writer half of the framed TCP connection, protected by a Tokio
+    /// mutex so that only one task writes at a time. The framed
+    /// transport encodes each [`WireMsg`] as a 4-byte big-endian
+    /// length prefix followed by CBOR data.
     framed: Arc<Mutex<futures_util::stream::SplitSink<Framed<TcpStream, WireCodec>, WireMsg>>>,
-    /// Pending requests: request_id → reply channel.
+    /// Map of pending requests: `request_id` to a oneshot reply
+    /// channel. The reader task removes and fires the matching sender
+    /// when a response arrives.
     pending: Arc<DashMap<u32, oneshot::Sender<WireMsg>>>,
-    /// Monotonic request id.
+    /// Monotonic counter for allocating unique request IDs.
     next_id: AtomicU32,
-    /// Local sink map: sink_id → channel.
+    /// Local sink map: `sink_id` to an mpsc channel. Push messages
+    /// from the broker node are dispatched to the matching channel,
+    /// which a dedicated background task forwards to the actual
+    /// [`FanoutSink`].
     sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>>,
-    /// Handle for the background reader task.
+    /// Handle for the background reader task. When the remote broker
+    /// is dropped, this handle will be cancelled by Tokio, stopping
+    /// the reader.
     _reader_handle: tokio::task::JoinHandle<()>,
 }
 
 impl RemoteBroker {
-    /// Connect to a broker node at `addr`.
+    /// Connect to a broker node at the given socket address.
     ///
-    /// Spawns a background reader task that parses `WireMsg` frames
-    /// from the connection and dispatches:
-    /// - `Deliver` push messages to the matching local sink's channel
-    /// - response messages to the matching pending request's oneshot
+    /// Establishes a TCP connection to `addr`, wraps it in a
+    /// [`Framed`] transport using the [`WireCodec`], and spawns a
+    /// background reader task that continuously parses incoming
+    /// [`WireMsg`] frames and dispatches them:
+    ///
+    /// - `Deliver` push messages are routed to the matching local
+    ///   sink's mpsc channel (identified by `sink_id`).
+    /// - All response variants are dispatched to the oldest pending
+    ///   request's oneshot channel.
+    ///
+    /// # Arguments
+    ///
+    /// * `addr` — The socket address of the external broker node.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the TCP connection cannot be established.
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr)
             .await
@@ -101,7 +184,25 @@ impl RemoteBroker {
         })
     }
 
-    /// Send a request and wait for the response.
+    /// Send a [`WireMsg`] request to the broker node and wait for the
+    /// matching response.
+    ///
+    /// Allocates a unique request ID, registers a oneshot channel in
+    /// the pending map, writes the framed request to the TCP
+    /// connection, and awaits the response on the oneshot receiver.
+    ///
+    /// The request has a 30-second timeout. If the broker does not
+    /// respond in time, the pending entry is removed and a system
+    /// error is returned.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` — The request message to send.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the write fails, the connection is closed
+    /// before a response arrives, or the request times out.
     async fn request(&self, msg: WireMsg) -> Result<WireMsg> {
         let id = self
             .next_id
@@ -191,7 +292,9 @@ impl Broker for RemoteBroker {
     }
 
     async fn unsubscribe(&self, _id: SubscriptionId) -> Result<bool> {
-        // Remote broker handles subscriber tracking.
+        // Remote broker handles subscriber tracking. The local side
+        // does not maintain its own subscription registry for remote
+        // subscriptions.
         Ok(true)
     }
 
@@ -259,6 +362,7 @@ impl Broker for RemoteBroker {
     }
 
     async fn dec_publisher(&self, _topic: &str) {
-        // Remote broker manages its own state.
+        // The remote broker node manages its own publisher tracking
+        // state. The local side does not maintain a publisher count.
     }
 }

@@ -1,23 +1,50 @@
-//! Wire-format frame encoder/decoder shared by all transports.
+//! Wire-format frame encoder and decoder shared by all transports.
 //!
-//! Binary layout:
+//! This module handles the lowest-level serialization: converting between
+//! [`Frame`](crate::frame::Frame) values and the byte sequences that travel
+//! over the network. Every transport adapter (WebSocket, bridge, etc.)
+//! delegates to the functions in this module.
+//!
+//! # Binary wire format
+//!
+//! The binary layout is fixed-size header followed by a variable-length
+//! payload:
 //!
 //! ```text
-//! 1 byte   frame_type tag  (C/D/A/F/E)
-//! 1 byte   codec tag       (J/B)
-//! 2 bytes  flags (big endian)
-//! 8 bytes  frame_id
-//! 8 bytes  timestamp
-//! 4 bytes  payload length
-//! N bytes  payload
+//! 1 byte   — frame_type tag  (C=control, D=data, A=ack, F=flow, E=error)
+//! 1 byte   — codec tag       (J=JSON, B=CBOR)
+//! 2 bytes  — flags, big-endian u16 bitmask
+//! 8 bytes  — frame_id, big-endian u64
+//! 8 bytes  — timestamp, big-endian i64 (milliseconds since epoch)
+//! 4 bytes  — payload length, big-endian u32
+//! N bytes  — payload
 //! ```
+//!
+//! Total fixed header overhead: 24 bytes. The payload length is always
+//! included even when the payload is empty (length = 0).
+//!
+//! # Text / JSON envelope format
+//!
+//! When the transport uses a text WebSocket frame the frame is serialized
+//! as a JSON object with the following fields:
+//!
+//! - `type` — `"control"`, `"data"`, `"ack"`, `"flow"`, or `"error"`.
+//! - `codec` — `"json"` or `"cbor"`.
+//! - `frame_id`, `flags`, `timestamp`, `payload` — as in the binary format.
+//! - `session_id`, `stream_id`, `topic`, `event`, `message_id`,
+//!   `correlation_id`, `trace_id` — optional string metadata fields.
+//! - `ttl_ms` — optional TTL in milliseconds.
 
 use bytes::{Bytes, BytesMut};
 
 use crate::error::{FrameReject, Result, RiftError};
 use crate::frame::{Codec as FrameCodec, Frame, FrameFlags, FrameType};
 
-/// Encode a `Frame` into the binary wire format.
+/// Encode a [`Frame`] into the binary wire format.
+///
+/// The resulting [`Bytes`] buffer is 24 + `payload.len()` bytes long
+/// and can be sent directly over any byte-oriented transport (WebSocket
+/// binary frame, TCP, etc.).
 pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
     let payload = frame.payload.as_ref().cloned().unwrap_or_default();
     let mut buf = BytesMut::with_capacity(24 + payload.len());
@@ -31,6 +58,11 @@ pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
 }
 
 /// Decode a binary frame from the wire format.
+///
+/// The input buffer must be at least 24 bytes long (the fixed header).
+/// The payload length is read from the header and the buffer must
+/// contain the full payload. Returns a structured [`FrameReject`] error
+/// on malformed or truncated input.
 pub fn decode_binary_frame(buf: &[u8]) -> Result<Frame> {
     if buf.len() < 24 {
         return Err(RiftError::Frame(FrameReject::FrameInvalid(format!(
@@ -79,7 +111,12 @@ pub fn decode_binary_frame(buf: &[u8]) -> Result<Frame> {
     })
 }
 
-/// Decode a JSON text frame envelope.
+/// Decode a frame from a JSON text envelope.
+///
+/// This is used when the transport delivers text (non-binary) WebSocket
+/// frames. The envelope is a JSON object whose fields correspond to the
+/// [`Frame`] struct fields. Unknown or missing fields are ignored or set
+/// to their default values.
 pub fn decode_text_frame(buf: &[u8]) -> Result<Frame> {
     let value: serde_json::Value = serde_json::from_slice(buf)
         .map_err(|e| RiftError::Frame(FrameReject::FrameInvalid(format!("json envelope: {e}"))))?;

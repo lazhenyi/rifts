@@ -1,71 +1,177 @@
-//! Server configuration. Defaults follow the recommended values in
-//! spec §27.1 ("普通 Web 应用" — ordinary Web application).
+//! # Server Configuration (`ServerConfig`)
+//!
+//! This module defines all tunable parameters for the Rift server, including:
+//! - Payload size limits
+//! - Per-connection topic subscription limits
+//! - Outbound queue byte limits
+//! - Heartbeat policy
+//! - Idle timeout
+//! - Client reconnect interval hints
+//! - Replay window and deduplication window
+//! - Maximum authentication failure count
+//! - Codec preference list
+//! - Default profile for auto-created topics
+//!
+//! ## Defaults
+//!
+//! All default values follow the specification section 27.1
+//! ("Typical Web Application" recommended values):
+//!
+//! | Parameter | Default |
+//! |-----------|---------|
+//! | `max_payload_bytes` | 65,536 (64 KiB) |
+//! | `max_topics_per_connection` | 128 |
+//! | `max_send_queue_bytes` | 1,048,576 (1 MiB) |
+//! | `idle_timeout` | 300 s |
+//! | `replay_window` | 300 s |
+//! | `dedupe_window` | 60 s |
+//! | `max_auth_failures` | 3 |
+//!
+//! ## Usage
+//!
+//! ```rust
+//! use rifts::config::ServerConfig;
+//! use std::time::Duration;
+//!
+//! let config = ServerConfig {
+//!     max_payload_bytes: 128 * 1024,
+//!     idle_timeout: Duration::from_secs(600),
+//!     ..ServerConfig::default()
+//! };
+//! ```
 
 use std::time::Duration;
 
 use crate::protocol::heartbeat::HeartbeatPolicy;
 
-/// Server-side configuration.
+/// Global server configuration.
+///
+/// Set via [`RiftServer::builder()`](crate::RiftServer::builder), this configuration
+/// spans the entire server lifetime and cannot be changed at runtime.
+///
+/// Each field has its own semantics; see individual field documentation for details.
 #[derive(Debug, Clone)]
 pub struct ServerConfig {
-    /// Maximum payload size in bytes (spec §27.1 default: 65536).
+    /// Maximum payload size in bytes for a single frame.
+    ///
+    /// Frames exceeding this limit are rejected at the decoding stage
+    /// (returning [`ErrorCode::PayloadTooLarge`]).
+    /// Specification section 27.1 recommends a default of 65,536 bytes (64 KiB).
     pub max_payload_bytes: usize,
 
-    /// Maximum number of topic subscriptions per connection
-    /// (spec §27.1 default: 128).
+    /// Maximum number of topics a single connection can subscribe to simultaneously.
+    ///
+    /// New subscribe requests are rejected by the server when this limit is exceeded.
+    /// Specification section 27.1 recommends a default of 128.
     pub max_topics_per_connection: usize,
 
-    /// Maximum per-connection outbound send queue size in bytes
-    /// (spec §27.1 default: 1 MiB).
+    /// Maximum byte size of the outbound send queue per connection.
+    ///
+    /// When the outbound queue accumulates beyond this threshold, the connection
+    /// enters a "slow consumer" state, triggering backpressure (dropping volatile
+    /// messages or pausing publishers).
+    /// Specification section 27.1 recommends a default of 1,048,576 (1 MiB).
     pub max_send_queue_bytes: usize,
 
-    /// Heartbeat policy.
+    /// Heartbeat policy controlling ping/pong intervals and timeout detection.
+    ///
+    /// See [`HeartbeatPolicy`] for details.
     pub heartbeat: HeartbeatPolicy,
 
-    /// Connection idle timeout — closed if no traffic within this window.
+    /// Connection idle timeout.
+    ///
+    /// If no frames (including heartbeats) are received within this time window,
+    /// the server actively closes the connection.
+    /// Default: 300 seconds.
     pub idle_timeout: Duration,
 
-    /// Base reconnect interval for client guidance.
+    /// Suggested initial reconnect wait time for the client (in milliseconds).
+    ///
+    /// The server communicates this value to the client via the Welcome frame;
+    /// the client uses it as the base interval for exponential backoff.
+    /// Default: 500 ms.
     pub reconnect_base_ms: u32,
 
-    /// Maximum reconnect interval for client guidance.
+    /// Suggested maximum reconnect wait time for the client (in milliseconds).
+    ///
+    /// This caps the exponential backoff to prevent the client from
+    /// unboundedly increasing its wait time.
+    /// Default: 15,000 ms (15 seconds).
     pub reconnect_max_ms: u32,
 
-    /// Replay window — how long offsets are kept for replay (spec §27.1
-    /// default: 300 s).
+    /// Replay window duration.
+    ///
+    /// The server retains message offsets within this time range, allowing
+    /// clients to request replay of missed messages after reconnecting.
+    /// Offsets outside this window are cleaned up.
+    /// Specification section 27.1 recommends a default of 300 seconds.
     pub replay_window: Duration,
 
-    /// Dedupe window — how long a dedupe_key is remembered.
+    /// Deduplication window duration.
+    ///
+    /// Within this time range, messages with the same `dedupe_key` are
+    /// detected as duplicates and discarded.
+    /// After the window expires, the key is cleared, allowing the same key
+    /// to be accepted again.
+    /// Default: 60 seconds.
     pub dedupe_window: Duration,
 
-    /// Maximum number of failed authentication attempts before the
-    /// connection is closed.
+    /// Maximum number of consecutive authentication failures per connection.
+    ///
+    /// Once this threshold is reached, the server closes the connection and
+    /// disallows immediate reconnection.
+    /// Default: 3 failures.
     pub max_auth_failures: u32,
 
-    /// Optional list of allowed codec names for negotiation.
-    /// If empty, all supported codecs are offered.
+    /// Codec negotiation whitelist.
+    ///
+    /// During the Hello phase, this list of available codecs is presented to
+    /// the client. If empty (the default), all compiled-in codecs are offered.
     pub codec_offer: Vec<CodecOffer>,
 
-    /// Default topic profile applied when a topic is auto-created on
-    /// first subscribe.
+    /// Default profile applied when a topic is auto-created on first subscribe.
+    ///
+    /// Individual topics can override these settings.
     pub default_topic_profile: DefaultTopicProfile,
 }
 
-/// Codecs offered to the client during hello negotiation.
+/// Available codecs offered to the client during the Hello phase.
+///
+/// Each variant corresponds to a wire serialization format. The client selects
+/// one before the Welcome phase, and it is used for all subsequent frame
+/// encoding and decoding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodecOffer {
+    /// [JSON](https://www.json.org/) text encoding — easy to debug, widest compatibility.
     Json,
+    /// [CBOR](https://cbor.io/) binary encoding — smaller footprint, faster parsing.
     Cbor,
 }
 
-/// Default topic profile applied on auto-create.
+/// Default profile used when a topic is auto-created on first subscribe.
+///
+/// When a client first subscribes to a topic that does not yet exist, the
+/// server automatically creates the topic and its associated storage using
+/// this profile. All fields can be dynamically overridden afterward.
 #[derive(Debug, Clone)]
 pub struct DefaultTopicProfile {
+    /// Message retention policy (e.g., keep latest N messages, time-based retention, keep forever).
     pub retention: crate::topic::retention::RetentionPolicy,
+    /// Message ordering policy (topic-global ordering or per-key partitioned ordering).
     pub ordering: crate::topic::ordering::OrderingPolicy,
+    /// Maximum number of subscribers for the topic; new subscribers are rejected once the limit is reached.
     pub max_subscribers: usize,
+    /// Maximum number of publishers for the topic; new publishers are rejected once the limit is reached.
     pub max_publishers: usize,
+    /// Whether historical message replay is enabled.
+    ///
+    /// When enabled, new subscribers can request consumption of historical
+    /// messages by specifying an offset.
     pub replay_enabled: bool,
+    /// Whether topic-level snapshots are enabled.
+    ///
+    /// When enabled, publishers can set snapshots, and new subscribers
+    /// automatically receive the latest snapshot upon joining.
     pub snapshot_enabled: bool,
 }
 

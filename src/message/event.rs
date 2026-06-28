@@ -1,30 +1,67 @@
-//! Event message — spec §8 `event`.
+//! # Event -- Business Event Messages (spec section 8)
+//!
+//! Events are the most commonly used message type in the publish/subscribe model.
+//! A publisher sends an event to a topic, and all subscribers receive it according to the delivery semantics.
+//!
+//! ## Typical Use Cases
+//!
+//! - Chat messages: `event = "chat.message.created"`
+//! - Data changes: `event = "user.profile.updated"`
+//! - Notification pushes: `event = "notification.push"`
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{MessageReject, Result, RiftError};
 
-/// Business event published to a topic.
+/// A business event published to a topic.
+///
+/// Events are the core data unit of the Rift protocol. Each event carries a business payload,
+/// an optional deduplication key, an ordering key, and a TTL.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
-    /// Event name (e.g. `chat.message.created`).
+    /// Event name that identifies the business type of the message.
+    ///
+    /// A dotted hierarchical format is recommended, e.g. `"chat.message.created"`.
     pub event: String,
-    /// Message id (ULID, UUIDv7, etc.).
+
+    /// Globally unique message ID.
+    ///
+    /// ULID or UUID v7 (time-ordered) is recommended; used for deduplication and acknowledgment correlation.
     pub message_id: String,
-    /// Schema id `{domain}.{name}@{major}.{minor}`.
+
+    /// Schema identifier, formatted as `{domain}.{name}@{major}.{minor}`.
+    ///
+    /// Used for version management and payload validation. E.g. `"chat.message.created@1.0"`.
     pub schema: String,
-    /// Business payload.
+
+    /// Business payload in JSON format, whose structure is defined by `schema`.
     pub payload: serde_json::Value,
-    /// Optional dedupe key.
+
+    /// Deduplication key (optional).
+    ///
+    /// When set, the server rejects duplicate messages with the same `dedupe_key` within
+    /// the deduplication window (see [`ServerConfig::dedupe_window`](crate::config::ServerConfig)).
+    /// Suitable for idempotent publish scenarios.
     pub dedupe_key: Option<String>,
-    /// Optional ordering key.
+
+    /// Ordering key (optional).
+    ///
+    /// Within the same topic, messages sharing the same `ordering_key` are strictly ordered.
+    /// Messages with different `ordering_key` values have no ordering guarantees.
+    /// Suitable for partitioned-ordering scenarios.
     pub ordering_key: Option<String>,
-    /// Optional time-to-live in milliseconds.
+
+    /// Message time-to-live in milliseconds (optional).
+    ///
+    /// Messages that exceed their TTL are discarded before delivery. `None` means no TTL.
     pub ttl_ms: Option<u32>,
 }
 
 impl Event {
+    /// Creates a new Event instance.
+    ///
+    /// `dedupe_key`, `ordering_key`, and `ttl_ms` default to `None`.
     pub fn new(
         event: impl Into<String>,
         message_id: impl Into<String>,
@@ -42,7 +79,11 @@ impl Event {
         }
     }
 
-    /// Approximate encoded size, used for queue accounting.
+    /// Estimates the encoded byte size for queue space accounting.
+    ///
+    /// **Note**: This value is approximate, based on a JSON encoding estimate;
+    /// actual CBOR encoding may be smaller. Used for admission control in
+    /// [`ServerConfig::max_send_queue_bytes`](crate::config::ServerConfig).
     pub fn size_hint(&self) -> usize {
         self.event.len()
             + self.message_id.len()
@@ -53,12 +94,14 @@ impl Event {
     }
 }
 
-/// Helper for converting an `Event` to/from a raw `Bytes` payload
-/// (used for the on-wire `payload` field of a frame).
+/// Serializes an Event to JSON bytes for use in a frame's `payload` field.
 pub fn encode_event_body(e: &Event) -> Result<Bytes> {
     Ok(Bytes::from(serde_json::to_vec(e)?))
 }
 
+/// Deserializes an Event from JSON bytes.
+///
+/// An empty byte sequence returns a `MessageReject::Rejected` error.
 pub fn decode_event_body(bytes: &[u8]) -> Result<Event> {
     if bytes.is_empty() {
         return Err(RiftError::Message(MessageReject::Rejected(
