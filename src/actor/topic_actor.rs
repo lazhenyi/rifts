@@ -10,7 +10,6 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Semaphore, mpsc};
-use tracing::warn;
 use uuid::Uuid;
 
 use crate::actor::messages::TopicMsg;
@@ -73,22 +72,15 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
 
     /// Run the actor loop.  Returns when the mpsc receiver is closed
     /// or a `Shutdown` message is received.
+    ///
+    /// On panic inside `handle_message`, the panic propagates and the
+    /// task ends. `TopicRegistry::get_or_spawn` detects the closed
+    /// channel and spawns a fresh actor on the next call.
     pub async fn run(mut self, mut rx: mpsc::Receiver<TopicMsg>) {
         while let Some(msg) = rx.recv().await {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.handle_message(msg)));
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(_)) => {
-                    // Error already sent back via oneshot.
-                }
-                Err(_panic) => {
-                    warn!(
-                        topic = %self.topic_name,
-                        "topic actor panicked — continuing"
-                    );
-                }
-            }
+            // Errors are already reported via the per-message oneshot
+            // channel; nothing to handle here.
+            let _ = self.handle_message(msg);
         }
     }
 

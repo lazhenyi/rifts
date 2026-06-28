@@ -1,6 +1,7 @@
 //! Per-connection state machine — drives the Rift/1 connection
 //! lifecycle (spec §5).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -93,6 +94,10 @@ pub struct Connection {
     /// Negotiated codec.
     pub codec: Arc<dyn Codec>,
     in_flight_bytes: Arc<AtomicUsize>,
+    /// Topics this connection has published to. Used on connection
+    /// close to release per-topic publisher counts back to the broker
+    /// (so the slots can be reused by future publishers).
+    published_topics: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl Connection {
@@ -123,6 +128,7 @@ impl Connection {
             sink_id: crate::broker::fanout::new_sink_id(),
             codec: Arc::new(JsonCodec),
             in_flight_bytes: Arc::new(AtomicUsize::new(0)),
+            published_topics: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -185,6 +191,9 @@ impl Connection {
         let session_r = session.clone();
         let codec_r = self.codec.clone();
         let out_tx_r = self.out_tx.clone();
+        let in_flight_r = self.in_flight_bytes.clone();
+        let max_bytes_r = self.backpressure.max_bytes();
+        let published_topics_r = Arc::new(parking_lot::Mutex::new(HashSet::new()));
         let conn_id = self.conn_id;
         let reader_handle = tokio::spawn(async move {
             reader_task(
@@ -195,6 +204,9 @@ impl Connection {
                 metrics_r,
                 codec_r,
                 out_tx_r,
+                in_flight_r,
+                max_bytes_r,
+                published_topics_r,
                 conn_id,
             )
             .await
@@ -215,6 +227,12 @@ impl Connection {
         self.broker.drop_sink(self.sink_id).await;
         self.ack_manager.forget(session.id.as_str());
         self.resume.tracker.forget(&session.id);
+        // Release per-topic publisher slots so the limit isn't
+        // permanently consumed by this connection.
+        let topics: Vec<String> = self.published_topics.lock().drain().collect();
+        for topic in topics {
+            self.broker.dec_publisher(&topic).await;
+        }
         self.metrics.inc(&self.metrics.connection_close_total);
         self.metrics
             .active_connections
@@ -226,6 +244,15 @@ impl Connection {
     }
 
     /// Drive the hello → auth → resume/start → ready handshake.
+    ///
+    /// **Note**: the resume decision is computed and recorded in
+    /// metrics, but the outcome does not affect this session. The
+    /// client is always treated as a cold start. Cross-connection
+    /// resume is the responsibility of a future `SessionManager`
+    /// layer that shares session state across `accept_and_spawn`
+    /// invocations; today every `Connection::run` creates a fresh
+    /// session and the new session's epoch (always 1) is what the
+    /// client must match.
     async fn handshake(
         &self,
         transport: &mut Box<dyn TransportConnection>,
@@ -333,12 +360,22 @@ async fn writer_task(
             }
             Err(e) => {
                 warn!("write error: {}", e);
+                // Release the bytes for the frame that failed to write;
+                // without this, in_flight_bytes grows monotonically and
+                // eventually triggers spurious backpressure on a
+                // reconnect using a new Connection instance.
+                in_flight_bytes.fetch_sub(bytes, Ordering::SeqCst);
                 // Release the transport so the reader stops too.
                 *transport_slot.lock().await = None;
                 break;
             }
         }
     }
+    // Defensive: when the writer exits (channel closed or transport
+    // dropped) zero the counter. At this point the Connection is
+    // about to be dropped, so no other code can be mutating the
+    // counter.
+    in_flight_bytes.store(0, Ordering::SeqCst);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -350,6 +387,9 @@ async fn reader_task(
     metrics: Arc<Metrics>,
     codec: Arc<dyn Codec>,
     out_tx: mpsc::Sender<Frame>,
+    in_flight_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
+    published_topics: Arc<parking_lot::Mutex<HashSet<String>>>,
     conn_id: u64,
 ) -> Result<()> {
     loop {
@@ -373,8 +413,17 @@ async fn reader_task(
 
         match frame.frame_type {
             FrameType::Control => {
-                if let Err(e) =
-                    handle_control(&out_tx, &broker, &frame, &session, &codec, &metrics).await
+                if let Err(e) = handle_control(
+                    &out_tx,
+                    &broker,
+                    &frame,
+                    &session,
+                    &codec,
+                    &metrics,
+                    &in_flight_bytes,
+                    max_bytes,
+                )
+                .await
                 {
                     warn!(conn = conn_id, "control error: {}", e);
                     let _ = send_error_frame(&out_tx, &frame, e).await;
@@ -394,6 +443,11 @@ async fn reader_task(
                 let msg_id = frame.message_id.clone();
                 match broker.publish(&frame).await {
                     Ok(outcome) => {
+                        // Track this topic so the connection can release
+                        // its publisher slot on close.
+                        if let Some(t) = frame.topic.as_ref() {
+                            published_topics.lock().insert(t.clone());
+                        }
                         if requires_ack {
                             let status = if outcome.duplicate {
                                 AckStatus::Duplicate
@@ -428,6 +482,7 @@ async fn reader_task(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_control(
     out_tx: &mpsc::Sender<Frame>,
     broker: &Arc<dyn Broker>,
@@ -435,6 +490,8 @@ async fn handle_control(
     _session: &Arc<Session>,
     codec: &Arc<dyn Codec>,
     _metrics: &Arc<Metrics>,
+    in_flight_bytes: &Arc<AtomicUsize>,
+    max_bytes: usize,
 ) -> Result<()> {
     let body = frame
         .payload
@@ -485,6 +542,8 @@ async fn handle_control(
             };
             let sink: Arc<dyn FanoutSink> = Arc::new(MpscSink {
                 tx: out_tx.clone(),
+                in_flight_bytes: in_flight_bytes.clone(),
+                max_bytes,
                 id: crate::broker::fanout::new_sink_id(),
             });
             let id = broker.subscribe(&topic, intent, sink).await?;
@@ -542,11 +601,20 @@ async fn handle_control(
 
 struct MpscSink {
     tx: mpsc::Sender<Frame>,
+    in_flight_bytes: Arc<AtomicUsize>,
+    max_bytes: usize,
     id: u64,
 }
 
 impl FanoutSink for MpscSink {
     fn deliver(&self, frame: bytes::Bytes) -> std::result::Result<(), FanoutError> {
+        let len = frame.len();
+        if self.in_flight_bytes.load(Ordering::SeqCst) + len > self.max_bytes {
+            return Err(FanoutError::Backpressured {
+                queue_bytes: self.in_flight_bytes.load(Ordering::SeqCst),
+                max_bytes: self.max_bytes,
+            });
+        }
         let f = Frame {
             frame_type: FrameType::Data,
             codec: FrameCodec::Json,
@@ -554,13 +622,17 @@ impl FanoutSink for MpscSink {
             flags: FrameFlags::empty(),
             ..Frame::default()
         };
-        self.tx.try_send(f).map_err(|e| match e {
-            mpsc::error::TrySendError::Full(_) => FanoutError::Backpressured {
-                queue_bytes: 0,
-                max_bytes: 0,
-            },
-            mpsc::error::TrySendError::Closed(_) => FanoutError::Closed,
-        })
+        match self.tx.try_send(f) {
+            Ok(()) => {
+                self.in_flight_bytes.fetch_add(len, Ordering::SeqCst);
+                Ok(())
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(FanoutError::Backpressured {
+                queue_bytes: self.in_flight_bytes.load(Ordering::SeqCst),
+                max_bytes: self.max_bytes,
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(FanoutError::Closed),
+        }
     }
     fn id(&self) -> u64 {
         self.id
@@ -750,7 +822,15 @@ fn decode_hello_payload(payload: &Option<Bytes>) -> Result<(Hello, Option<String
             .and_then(|x| x.as_str())
             .unwrap_or("")
             .to_string(),
-        version: obj.get("version").and_then(|x| x.as_u64()).unwrap_or(0) as u16,
+        version: match obj.get("version").and_then(|x| x.as_u64()) {
+            Some(v) if v <= u16::MAX as u64 => v as u16,
+            Some(v) => {
+                return Err(RiftError::Frame(crate::error::FrameReject::FrameInvalid(
+                    format!("hello version out of range: {v}"),
+                )));
+            }
+            None => 0,
+        },
         client_id: obj
             .get("client_id")
             .and_then(|x| x.as_str())

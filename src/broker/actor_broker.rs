@@ -59,6 +59,7 @@ impl<
         intent: SubscribeIntent,
         sink: ConnectionSink,
     ) -> Result<SubscriptionId> {
+        let sink_id = sink.id();
         let actor = self.registry.get_or_spawn(topic);
         let (tx, rx) = oneshot::channel();
         actor.send(TopicMsg::Subscribe {
@@ -66,23 +67,58 @@ impl<
             intent,
             reply_to: tx,
         })?;
-        rx.await.map_err(|_| {
-            RiftError::System(crate::error::SystemReject::Internal("actor died".into()))
-        })?
+        let id = rx
+            .await
+            .map_err(|_| {
+                RiftError::System(crate::error::SystemReject::Internal("actor died".into()))
+            })??;
+        // Record the subscription in the registry's reverse indices so
+        // `unsubscribe` / `drop_sink` / `subscriber_count` can locate
+        // the right actor without a broadcast.
+        self.registry.register_subscription(id, topic, sink_id);
+        Ok(id)
     }
 
-    async fn unsubscribe(&self, _id: SubscriptionId) -> Result<bool> {
-        // Unsubscribe requires knowing which topic the id belongs to.
-        // In the actor model, the caller is expected to track this.
-        // A full implementation would maintain a sid→topic index.
-        Ok(false)
+    async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
+        let Some(topic) = self.registry.topic_for_subscription(&id) else {
+            return Ok(false);
+        };
+        let actor = self.registry.get_or_spawn(&topic);
+        let (tx, rx) = oneshot::channel();
+        actor.send(TopicMsg::Unsubscribe { id, reply_to: tx })?;
+        let removed = rx
+            .await
+            .map_err(|_| RiftError::System(crate::error::SystemReject::Internal(
+                "actor died".into(),
+            )))??;
+        if removed {
+            self.registry.unregister_subscription(&id);
+        }
+        Ok(removed)
     }
 
-    async fn drop_sink(&self, _sink_id: u64) -> usize {
-        // DropSink is broadcast to all actors.  A full implementation
-        // would iterate all actors with a `DropSink` message.
-        // For the minimal impl, return 0.
-        0
+    async fn drop_sink(&self, sink_id: u64) -> usize {
+        let sids = self.registry.subs_for_sink(sink_id);
+        let mut total = 0;
+        for sid in sids {
+            let Some(topic) = self.registry.topic_for_subscription(&sid) else {
+                continue;
+            };
+            let actor = self.registry.get_or_spawn(&topic);
+            let (tx, rx) = oneshot::channel();
+            if actor
+                .send(TopicMsg::DropSink {
+                    sink_id,
+                    reply_to: tx,
+                })
+                .is_ok()
+                && let Ok(n) = rx.await
+            {
+                total += n;
+            }
+            self.registry.unregister_subscription(&sid);
+        }
+        total
     }
 
     async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {
@@ -108,8 +144,7 @@ impl<
     }
 
     async fn subscriber_count(&self, topic: &str) -> usize {
-        let _ = topic;
-        0 // Not tracked at broker level in actor model.
+        self.registry.count_subscriptions_for_topic(topic)
     }
 
     async fn head_offset(&self, topic: &str) -> i64 {
@@ -117,5 +152,13 @@ impl<
         let (tx, rx) = oneshot::channel();
         actor.send(TopicMsg::HeadOffset { reply_to: tx }).ok();
         rx.await.unwrap_or(0)
+    }
+
+    async fn dec_publisher(&self, _topic: &str) {
+        // ActorBroker tracks publisher counts inside each TopicActor;
+        // a full implementation would send a ConnectionClosed message
+        // so the actor can decrement its own counter. For now this is
+        // a no-op so the slot is eventually released only on actor
+        // restart.
     }
 }

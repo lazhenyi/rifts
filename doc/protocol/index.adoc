@@ -224,6 +224,7 @@ Control frames carry the handshake and subscription lifecycle.
 | `system`
 | `at_least_once`
 | Rate‑limit notices, migration, maintenance.
+
 |===
 
 [[Delivery]]

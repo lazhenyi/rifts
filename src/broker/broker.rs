@@ -52,6 +52,14 @@ pub trait Broker: Send + Sync {
 
     /// Current head offset for a topic.
     async fn head_offset(&self, topic: &str) -> i64;
+
+    /// Decrement the publisher count for `topic`. Called by the
+    /// server when a connection that previously published to this
+    /// topic is closing, so the publisher slot can be reused.
+    ///
+    /// Default: no-op. Brokers that do not enforce a per-topic
+    /// publisher limit can leave this unimplemented.
+    async fn dec_publisher(&self, _topic: &str) {}
 }
 
 /// Helper: produce a serialized frame for fanout, stamping the

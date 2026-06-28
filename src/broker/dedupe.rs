@@ -37,17 +37,23 @@ impl DedupeStore {
         let now = now_ms();
         let expires = now + window.as_millis() as i64;
         let k = (topic.to_string(), key.to_string());
-        if let Some(mut entry) = self.inner.get_mut(&k) {
-            if *entry.value() <= now {
-                *entry.value_mut() = expires;
-                true
-            } else {
-                false
-            }
-        } else {
-            self.inner.insert(k, expires);
-            true
-        }
+        // DashMap 6.x 的 entry() 是原子的：and_modify 与 or_insert_with 闭包
+        // 互斥——同一 key 只有一个闭包会执行。这避免了原先 get_mut → insert
+        // 两步之间的竞争窗口。
+        let mut is_fresh = false;
+        self.inner
+            .entry(k)
+            .and_modify(|v| {
+                if *v <= now {
+                    *v = expires;
+                    is_fresh = true;
+                }
+            })
+            .or_insert_with(|| {
+                is_fresh = true;
+                expires
+            });
+        is_fresh
     }
 
     /// Drop expired entries. Returns number of removed entries.
@@ -108,5 +114,22 @@ mod tests {
         // Manually expire it.
         d.inner.insert(("t".into(), "k".into()), 0);
         assert_eq!(d.sweep(), 1);
+    }
+
+    #[test]
+    fn concurrent_dedup_returns_one_fresh() {
+        use std::sync::Arc;
+        use std::thread;
+        let store = Arc::new(DedupeStore::new());
+        let w = Duration::from_secs(60);
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let s = store.clone();
+                thread::spawn(move || s.check_and_record("t", "k", w))
+            })
+            .collect();
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let fresh_count = results.iter().filter(|&&b| b).count();
+        assert_eq!(fresh_count, 1, "exactly one thread should see fresh");
     }
 }

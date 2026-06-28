@@ -6,9 +6,9 @@
 //! subscriber a serialized frame ready to write to the transport.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
-use parking_lot::Mutex;
 use uuid::Uuid;
 
 /// Identifies a single (connection, topic) subscription.
@@ -82,7 +82,8 @@ pub struct FanoutEngine {
     by_topic: DashMap<String, Vec<(SubscriptionId, ConnectionSink)>>,
     /// subscription_id → (topic, sink)
     by_id: DashMap<SubscriptionId, (String, ConnectionSink)>,
-    seq: Mutex<u64>,
+    /// Monotonic subscription id allocator.
+    seq: AtomicU64,
 }
 
 impl std::fmt::Debug for FanoutEngine {
@@ -105,7 +106,7 @@ impl FanoutEngine {
         Self {
             by_topic: DashMap::new(),
             by_id: DashMap::new(),
-            seq: Mutex::new(0),
+            seq: AtomicU64::new(0),
         }
     }
 
@@ -116,10 +117,7 @@ impl FanoutEngine {
         _intent: SubscribeIntent,
         sink: ConnectionSink,
     ) -> SubscriptionId {
-        let mut seq = self.seq.lock();
-        *seq += 1;
-        let id = SubscriptionId(*seq);
-        drop(seq);
+        let id = SubscriptionId(self.seq.fetch_add(1, Ordering::Relaxed) + 1);
         self.by_topic
             .entry(topic.to_string())
             .or_default()

@@ -12,23 +12,24 @@ use std::sync::atomic::AtomicU32;
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
-use tokio::io::AsyncWriteExt;
+use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio_util::codec::Framed;
 
 use crate::broker::broker::{Broker, PublishOutcome};
 use crate::broker::fanout::{ConnectionSink, SubscribeIntent, SubscriptionId};
-use crate::broker::wire::WireMsg;
-use crate::error::{Result, RiftError};
+use crate::broker::wire::{WireCodec, WireMsg};
+use crate::error::{Result, RiftError, SystemReject};
 
 /// A `Broker` that talks to an external broker node over framed TCP.
 ///
 /// Opens a single TCP connection for both request/response and push
-/// delivery.  Push messages (`Deliver`) are routed to a local
-/// fanout map of sink IDs → channels.
+/// delivery.  Push messages (`Deliver`) are routed to a local fanout
+/// map of sink IDs → channels.
 pub struct RemoteBroker {
-    /// Write half of the TCP connection (serialised).
-    writer: Mutex<tokio::io::WriteHalf<TcpStream>>,
+    /// Writer half of the framed TCP connection (serialised).
+    framed: Arc<Mutex<futures_util::stream::SplitSink<Framed<TcpStream, WireCodec>, WireMsg>>>,
     /// Pending requests: request_id → reply channel.
     pending: Arc<DashMap<u32, oneshot::Sender<WireMsg>>>,
     /// Monotonic request id.
@@ -42,42 +43,53 @@ pub struct RemoteBroker {
 impl RemoteBroker {
     /// Connect to a broker node at `addr`.
     ///
-    /// Spawns a background reader task that dispatches incoming
-    /// responses and push messages.
+    /// Spawns a background reader task that parses `WireMsg` frames
+    /// from the connection and dispatches:
+    /// - `Deliver` push messages to the matching local sink's channel
+    /// - response messages to the matching pending request's oneshot
     pub async fn connect(addr: SocketAddr) -> Result<Self> {
         let stream = TcpStream::connect(addr)
             .await
-            .map_err(|e| RiftError::System(crate::error::SystemReject::Internal(e.to_string())))?;
-        let (reader, writer) = tokio::io::split(stream);
+            .map_err(|e| RiftError::System(SystemReject::Internal(e.to_string())))?;
+        let (framed_writer, mut framed_reader) = Framed::new(stream, WireCodec).split::<WireMsg>();
+        let framed = Arc::new(Mutex::new(framed_writer));
         let pending: Arc<DashMap<u32, oneshot::Sender<WireMsg>>> = Arc::new(DashMap::new());
         let sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
 
         // Spawn reader task.
-        let _pending_reader = pending.clone();
-        let _sinks_reader = sinks.clone();
+        let pending_r = pending.clone();
+        let sinks_r = sinks.clone();
         let reader_handle = tokio::spawn(async move {
-            // Reader task: reads framed messages from the broker connection.
-            // In a full implementation this would parse the length-prefixed
-            // CBOR frames and route responses to pending requests and push
-            // messages to local sinks.  The current stub just keeps the
-            // connection alive.
-            let mut buf = vec![0u8; 4096];
-            let mut read_half = reader;
-            loop {
-                match tokio::io::AsyncReadExt::read(&mut read_half, &mut buf).await {
-                    Ok(0) => break, // EOF
-                    Ok(_) => {
-                        // In a full implementation, accumulate bytes,
-                        // parse frames, and dispatch.
+            while let Some(msg_result) = framed_reader.next().await {
+                let Ok(msg) = msg_result else { break; };
+                match msg {
+                    WireMsg::Deliver { sink_id, payload, .. } => {
+                        if let Some(tx) = sinks_r.get(&sink_id) {
+                            let _ = tx.send(payload).await;
+                        }
                     }
-                    Err(_) => break,
+                    // All response variants dispatch to pending. The
+                    // current WireMsg design does not carry a
+                    // request_id on response variants (see wire.rs),
+                    // so we use a FIFO assumption: pop the first
+                    // pending entry. This is safe under a single
+                    // in-flight request per RemoteBroker; concurrent
+                    // requests are not supported until a request_id
+                    // is added to all response variants.
+                    response => {
+                        let first_key = pending_r.iter().next().map(|e| *e.key());
+                        if let Some(id) = first_key
+                            && let Some((_, tx)) = pending_r.remove(&id)
+                        {
+                            let _ = tx.send(response);
+                        }
+                    }
                 }
             }
-            drop(read_half);
         });
 
         Ok(Self {
-            writer: Mutex::new(writer),
+            framed,
             pending,
             next_id: AtomicU32::new(1),
             sinks,
@@ -93,31 +105,26 @@ impl RemoteBroker {
         let (tx, rx) = oneshot::channel();
         self.pending.insert(id, tx);
 
-        // Write.
-        let mut payload = Vec::new();
-        ciborium::into_writer(&msg, &mut payload).map_err(|e| {
-            RiftError::Frame(crate::error::FrameReject::FrameInvalid(e.to_string()))
+        // Write the framed request.
+        let mut framed = self.framed.lock().await;
+        framed.send(msg).await.map_err(|e| {
+            RiftError::System(SystemReject::Internal(format!("send: {e}")))
         })?;
-        let len = (payload.len() as u32).to_be_bytes();
-        let mut writer = self.writer.lock().await;
-        writer
-            .write_all(&len)
-            .await
-            .map_err(|e| RiftError::System(crate::error::SystemReject::Internal(e.to_string())))?;
-        writer
-            .write_all(&payload)
-            .await
-            .map_err(|e| RiftError::System(crate::error::SystemReject::Internal(e.to_string())))?;
+        drop(framed);
 
         // Wait for response.
         match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
             Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(_)) => Err(RiftError::System(crate::error::SystemReject::Internal(
+            Ok(Err(_)) => Err(RiftError::System(SystemReject::Internal(
                 "broker connection closed".into(),
             ))),
-            Err(_) => Err(RiftError::System(crate::error::SystemReject::Internal(
-                "broker request timed out".into(),
-            ))),
+            Err(_) => {
+                // Remove the pending entry so it does not leak.
+                self.pending.remove(&id);
+                Err(RiftError::System(SystemReject::Internal(
+                    "broker request timed out".into(),
+                )))
+            }
         }
     }
 }
@@ -133,9 +140,9 @@ impl Broker for RemoteBroker {
         match resp {
             WireMsg::PublishResult { outcome } => Ok(outcome),
             WireMsg::Error { code, message } => Err(RiftError::System(
-                crate::error::SystemReject::Internal(format!("broker error: {code} — {message}")),
+                SystemReject::Internal(format!("broker error: {code} — {message}")),
             )),
-            _ => Err(RiftError::System(crate::error::SystemReject::Internal(
+            _ => Err(RiftError::System(SystemReject::Internal(
                 "unexpected broker response".into(),
             ))),
         }
@@ -170,9 +177,9 @@ impl Broker for RemoteBroker {
         match resp {
             WireMsg::SubscribeResult { id } => Ok(SubscriptionId(id)),
             WireMsg::Error { code, message } => Err(RiftError::System(
-                crate::error::SystemReject::Internal(format!("broker error: {code} — {message}")),
+                SystemReject::Internal(format!("broker error: {code} — {message}")),
             )),
-            _ => Err(RiftError::System(crate::error::SystemReject::Internal(
+            _ => Err(RiftError::System(SystemReject::Internal(
                 "unexpected broker response".into(),
             ))),
         }
@@ -200,9 +207,9 @@ impl Broker for RemoteBroker {
         match resp {
             WireMsg::ReplayResult { entries } => Ok(entries),
             WireMsg::Error { code, message } => Err(RiftError::System(
-                crate::error::SystemReject::Internal(format!("broker error: {code} — {message}")),
+                SystemReject::Internal(format!("broker error: {code} — {message}")),
             )),
-            _ => Err(RiftError::System(crate::error::SystemReject::Internal(
+            _ => Err(RiftError::System(SystemReject::Internal(
                 "unexpected broker response".into(),
             ))),
         }
@@ -216,7 +223,7 @@ impl Broker for RemoteBroker {
             .await?;
         match resp {
             WireMsg::SnapshotResult { snapshot } => Ok(snapshot),
-            _ => Err(RiftError::System(crate::error::SystemReject::Internal(
+            _ => Err(RiftError::System(SystemReject::Internal(
                 "unexpected broker response".into(),
             ))),
         }
@@ -244,5 +251,9 @@ impl Broker for RemoteBroker {
             Ok(WireMsg::HeadOffsetResult { offset }) => offset,
             _ => 0,
         }
+    }
+
+    async fn dec_publisher(&self, _topic: &str) {
+        // Remote broker manages its own state.
     }
 }

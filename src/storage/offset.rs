@@ -93,7 +93,27 @@ mod sled_impl {
     impl OffsetStore for SledOffsetStore {
         fn alloc(&self, topic: &str) -> i64 {
             let mut cache = self.cache.lock().unwrap();
-            let next = cache.get(topic).map(|h| h + 1).unwrap_or(1);
+            let next = if let Some(&h) = cache.get(topic) {
+                h + 1
+            } else {
+                // Cache miss: fall back to the engine so a topic that
+                // was written by a previous process instance does not
+                // have its offset sequence reset to 1 (which would
+                // violate monotonicity).
+                let key = encode::offset_key(topic);
+                let real_head = self
+                    .engine
+                    .get(&key)
+                    .and_then(|v| {
+                        if v.len() >= 8 {
+                            Some(i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0);
+                real_head + 1
+            };
             cache.insert(topic.to_string(), next);
             let key = encode::offset_key(topic);
             self.engine.put(&key, &next.to_be_bytes());

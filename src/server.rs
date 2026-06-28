@@ -55,8 +55,11 @@ pub struct RiftServerBuilder {
     config: ServerConfig,
     auth: Option<Arc<dyn AuthProvider>>,
     broker: Option<Arc<dyn Broker>>,
+    /// Transport is set by `websocket_transport()`; `None` means the
+    /// server is in framework mode and must be driven via
+    /// `accept_and_spawn`.
     #[cfg(feature = "websocket")]
-    transport: Option<Box<dyn TransportFactory>>,
+    transport: Option<Arc<dyn TransportFactory>>,
     metrics: Option<Arc<Metrics>>,
 }
 
@@ -92,13 +95,13 @@ impl RiftServerBuilder {
     }
 
     /// Set WebSocket as the standalone transport (requires feature
-    /// `websocket`).
+    /// `websocket`). The factory is built in `build()` so that any
+    /// `config()` call after this point is honoured.
     #[cfg(feature = "websocket")]
     pub fn websocket_transport(mut self) -> Self {
-        let max_msg = self.config.max_payload_bytes;
-        self.transport = Some(Box::new(WebSocketFactory {
-            max_message_size: max_msg,
-        }));
+        // Placeholder; the real factory is constructed in `build()`
+        // with the current `config.max_payload_bytes`.
+        self.transport = Some(Arc::new(WebSocketFactory { max_message_size: 0 }));
         self
     }
 
@@ -124,18 +127,24 @@ impl RiftServerBuilder {
         let auth = self
             .auth
             .unwrap_or_else(|| Arc::new(crate::session::TokenAuth::new()));
+
+        // Reconstruct the WebSocket factory with the *current*
+        // `config.max_payload_bytes` so that any `config()` call made
+        // after `websocket_transport()` is honoured.
+        #[cfg(feature = "websocket")]
+        let transport = self.transport.as_ref().map(|_| {
+            Arc::new(WebSocketFactory {
+                max_message_size: self.config.max_payload_bytes,
+            }) as Arc<dyn TransportFactory>
+        });
+
         Ok(RiftServer {
             config: self.config,
             auth,
             broker,
             metrics,
             #[cfg(feature = "websocket")]
-            transport: Arc::from(self.transport.ok_or_else(|| {
-                RiftError::Config(ConfigError::Invalid {
-                    field: "transport",
-                    message: "transport is required for standalone mode".to_string(),
-                })
-            })?),
+            transport,
             next_conn_id: Arc::new(AtomicU64::new(1)),
         })
     }
@@ -154,8 +163,10 @@ pub struct RiftServer {
     auth: Arc<dyn AuthProvider>,
     broker: Arc<dyn Broker>,
     metrics: Arc<Metrics>,
+    /// Standalone transport factory. `None` in framework mode (the
+    /// server is driven via `accept_and_spawn`).
     #[cfg(feature = "websocket")]
-    transport: Arc<dyn TransportFactory>,
+    transport: Option<Arc<dyn TransportFactory>>,
     next_conn_id: Arc<AtomicU64>,
 }
 
@@ -166,10 +177,21 @@ impl RiftServer {
     }
 
     /// Bind and run the server in standalone mode, blocking until
-    /// `shutdown` is notified. Requires feature `websocket`.
+    /// `shutdown` is notified. Requires feature `websocket` and a
+    /// transport set on the builder (call
+    /// `builder.websocket_transport()` before `build()`).
     #[cfg(feature = "websocket")]
     pub async fn run(&self, addr: SocketAddr, shutdown: Arc<tokio::sync::Notify>) -> Result<()> {
-        let mut listener = self.transport.build(addr).await?;
+        let transport = self.transport.as_ref().ok_or_else(|| {
+            RiftError::Config(ConfigError::Invalid {
+                field: "transport",
+                message:
+                    "no transport configured; call builder.websocket_transport() before build(), \
+                     or use accept_and_spawn() for framework mode"
+                        .to_string(),
+            })
+        })?;
+        let mut listener = transport.build(addr).await?;
         info!(addr = ?listener.local_addr()?, "rift server listening");
 
         loop {

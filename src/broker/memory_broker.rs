@@ -311,6 +311,12 @@ impl<
     async fn head_offset(&self, topic: &str) -> i64 {
         self.offsets.head(topic)
     }
+
+    async fn dec_publisher(&self, topic: &str) {
+        if let Some(entry) = self.store.get(topic) {
+            entry.dec_publisher();
+        }
+    }
 }
 
 impl<
