@@ -270,3 +270,141 @@ impl AuthProvider for MyAuth {
     }
 }
 ----
+
+== Custom TopicProfile
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+use rifts::{
+    RiftServer, TopicProfile, RetentionPolicy, OrderingPolicy,
+};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    // A topic profile for a chat room: keep last 500 messages,
+    // ordered by topic, replay enabled, max 200 subscribers.
+    let profile = TopicProfile {
+        retention:       RetentionPolicy::Count(500),
+        ordering:        OrderingPolicy::Topic,
+        max_subscribers: 200,
+        max_publishers:  50,
+        replay_enabled:  true,
+        snapshot_enabled: true,
+        ..TopicProfile::default()
+    };
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .default_topic_profile(profile)
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== Metrics Export (Prometheus)
+
+[source,rust]
+----
+use std::sync::Arc;
+use std::time::Duration;
+use rifts::{RiftServer, Metrics};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    let metrics = Arc::new(Metrics::new());
+
+    // Spawn a background task that snapshots metrics every 15 s.
+    let m = metrics.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+            println!(
+                "conns={} msgs_in={} msgs_out={} dropped={} queue_depth={}",
+                m.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+                m.messages_in_total.load(std::sync::atomic::Ordering::Relaxed),
+                m.messages_out_total.load(std::sync::atomic::Ordering::Relaxed),
+                m.messages_dropped_total.load(std::sync::atomic::Ordering::Relaxed),
+                m.send_queue_depth.load(std::sync::atomic::Ordering::Relaxed),
+            );
+        }
+    });
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .metrics(metrics)
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== Flow Control: Per‑Connection Rate Limiting
+
+[source,rust]
+----
+use std::sync::Arc;
+use rifts::{
+    RiftServer, ServerConfig,
+    flow::RateLimiter,
+};
+use tokio::sync::Notify;
+
+#[tokio::main]
+async fn main() -> rifts::Result<()> {
+    // Limit each connection to 100 messages/sec with burst of 200.
+    let limiter = Arc::new(RateLimiter::new(100, 200));
+
+    let config = ServerConfig {
+        max_send_queue_bytes: 512 * 1024, // 512 KiB send queue
+        ..ServerConfig::default()
+    };
+
+    let shutdown = Arc::new(Notify::new());
+    RiftServer::builder()
+        .websocket_transport()
+        .config(config)
+        .rate_limiter(limiter)
+        .build()?
+        .run("0.0.0.0:9000".parse().unwrap(), shutdown)
+        .await?;
+
+    Ok(())
+}
+----
+
+== Trace Context Propagation
+
+[source,rust]
+----
+use rifts::trace::TraceContext;
+
+fn handle_incoming_frame(incoming: TraceContext) {
+    // Create a child span for server-side processing.
+    let server_span = incoming.child();
+    println!(
+        "trace_id={:?} span_id={:?} parent={:?}",
+        server_span.trace_id,
+        server_span.span_id,
+        server_span.parent_span_id,
+    );
+
+    // Pass server_span to downstream calls (DB, RPC, etc.).
+    do_work(server_span);
+}
+
+fn do_work(ctx: TraceContext) {
+    let db_span = ctx.child();
+    // ... use db_span for database query tracing
+}
+----
