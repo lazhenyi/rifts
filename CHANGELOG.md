@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.1] — 2026-06-28
+
+### Fixed
+
+- **sled feature** — 52 compilation errors in sled-backed storage resolved.
+  Missing `StorageEngine` trait imports and `encode` module paths fixed
+  across `dedupe`, `log`, `offset`, and `snapshot` sled implementations.
+- **clippy** — all allow flags removed; `large_enum_variant` fixed by
+  boxing `WireTopicMsg::Publish.frame`; `module_inception` allow moved to
+  correct module; `collapsible_if` resolved with let-chains.
+- **CI** — build matrix now covers `sled` and `sled,websocket` features;
+  test and lint jobs use `--all-features`.
+
+### Added
+
+- **Example** — `examples/websocket_server.rs` with `tracing-subscriber`
+  dev-dependency.
+
 ## [0.2.0] — 2026-06-28
 
 ### Added

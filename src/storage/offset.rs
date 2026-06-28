@@ -56,7 +56,9 @@ impl OffsetStore for MemoryOffsetStore {
 #[cfg(feature = "sled")]
 mod sled_impl {
     use super::*;
+    use crate::storage::encode;
     use crate::storage::engine::SledEngine;
+    use crate::storage::engine::StorageEngine;
     use std::sync::Mutex;
 
     /// Sled-backed offset store.  One key per topic: `<topic>\x00head`.

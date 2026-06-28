@@ -103,7 +103,9 @@ impl SnapshotStore for MemorySnapshotStore {
 #[cfg(feature = "sled")]
 mod sled_impl {
     use super::*;
+    use crate::storage::encode;
     use crate::storage::engine::SledEngine;
+    use crate::storage::engine::StorageEngine;
 
     /// Sled-backed snapshot store.
     pub struct SledSnapshotStore {

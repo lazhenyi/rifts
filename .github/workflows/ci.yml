@@ -21,6 +21,8 @@ jobs:
           - axum
           - warp
           - all-frameworks
+          - sled
+          - "sled,websocket"
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +46,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Run tests
-        run: cargo test
+        run: cargo test --all-features
 
   lint:
     name: Lint
@@ -62,7 +64,7 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --no-deps -- -D warnings -A clippy::large_enum_variant -A clippy::module_inception
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
   docs:
     name: Docs

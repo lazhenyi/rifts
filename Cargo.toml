@@ -1,6 +1,6 @@
 [package]
 name = "rifts"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 authors = ["Zhenyi <434836402@qq.com>"]
 description = "Rift Realtime Protocol / 1.0 — server-side implementation"
@@ -56,3 +56,6 @@ actix-web = { version = "4", optional = true }
 actix-ws = { version = "0.3", optional = true }
 warp = { version = "0.3", optional = true }
 ntex = { version = "2", optional = true, features = ["ws"] }
+
+[dev-dependencies]
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

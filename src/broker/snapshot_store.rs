@@ -157,7 +157,7 @@ mod tests {
         // Capture with 0-ms TTL → expires immediately.
         snaps.capture("t", &store, Some(Duration::from_millis(0)));
         // Manually set expires_at to 0.
-        if let Some(mut snap) = snaps.inner.write().get_mut("t") {
+        if let Some(snap) = snaps.inner.write().get_mut("t") {
             snap.expires_at = Some(0);
         }
         assert!(snaps.get("t").is_none());

@@ -71,7 +71,9 @@ impl DedupeStore for MemoryDedupeStore {
 #[cfg(feature = "sled")]
 mod sled_impl {
     use super::*;
+    use crate::storage::encode;
     use crate::storage::engine::SledEngine;
+    use crate::storage::engine::StorageEngine;
 
     /// Sled-backed dedupe store.
     pub struct SledDedupeStore {
@@ -89,12 +91,12 @@ mod sled_impl {
             let now = now_ms();
             let expires = now + window.as_millis() as i64;
             let k = encode::dedupe_key(topic, key);
-            if let Some(existing) = self.engine.get(&k) {
-                if existing.len() >= 8 {
-                    let prev = i64::from_be_bytes(existing[..8].try_into().unwrap_or([0; 8]));
-                    if prev > now {
-                        return false;
-                    }
+            if let Some(existing) = self.engine.get(&k)
+                && existing.len() >= 8
+            {
+                let prev = i64::from_be_bytes(existing[..8].try_into().unwrap_or([0; 8]));
+                if prev > now {
+                    return false;
                 }
             }
             self.engine.put(&k, &expires.to_be_bytes());

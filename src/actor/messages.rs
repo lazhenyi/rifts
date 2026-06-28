@@ -73,7 +73,7 @@ impl std::fmt::Debug for TopicMsg {
 pub enum WireTopicMsg {
     Publish {
         request_id: u32,
-        frame: Frame,
+        frame: Box<Frame>,
     },
     Subscribe {
         request_id: u32,
