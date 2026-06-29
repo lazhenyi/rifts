@@ -140,16 +140,15 @@ mod tests {
         assert_eq!(r, ResumeDecision::Replaying);
     }
 
-    #[test]
-    fn topic_offsets_from_store() {
+    #[tokio::test]
+    async fn topic_offsets_from_store() {
         use crate::storage::{MemoryOffsetStore, OffsetStore};
         let m = ResumeManager::new();
         let store = TopicStore::new();
         let offsets = MemoryOffsetStore::new();
         let entry = store.get_or_create("t", TopicProfile::default()).unwrap();
-        // Use OffsetStore for authoritative offsets.
-        let o1 = offsets.alloc("t");
-        let o2 = offsets.alloc("t");
+        let o1 = offsets.alloc("t").await;
+        let o2 = offsets.alloc("t").await;
         entry.append(crate::topic::store::LogEntry {
             offset: o1,
             publisher_session: None,

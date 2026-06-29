@@ -277,34 +277,42 @@ fn session_idle_tracking() {
 
 // ── Dedupe store ──────────────────────────────────────────────────────────────
 
-#[test]
-fn dedupe_store_concurrent_single_fresh() {
+#[tokio::test]
+async fn dedupe_store_concurrent_single_fresh() {
     let store = Arc::new(MemoryDedupeStore::new());
     let w = Duration::from_secs(60);
-    let handles: Vec<_> = (0..16)
-        .map(|_| {
-            let s = store.clone();
-            std::thread::spawn(move || s.check_and_record("t", "racing-key", w))
-        })
-        .collect();
-    let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-    let fresh_count = results.iter().filter(|&&b| b).count();
+    let mut handles = Vec::new();
+    for _ in 0..16 {
+        let s = store.clone();
+        handles.push(tokio::spawn(async move {
+            s.check_and_record("t", "racing-key", w).await
+        }));
+    }
+    let mut fresh_count = 0;
+    for h in handles {
+        if h.await.unwrap() {
+            fresh_count += 1;
+        }
+    }
     assert_eq!(fresh_count, 1, "exactly one thread must see fresh");
 }
 
-#[test]
-fn dedupe_store_sweep_cleans_expired() {
+#[tokio::test]
+async fn dedupe_store_sweep_cleans_expired() {
     let store = MemoryDedupeStore::new();
-    // Record with zero window so it's immediately expired, then sweep.
-    store.check_and_record("t", "k", Duration::from_secs(0));
-    // Entry will have expired essentially immediately; sweep removes it.
-    let swept = store.sweep();
+    store
+        .check_and_record("t", "k", Duration::from_secs(0))
+        .await;
+    let swept = store.sweep().await;
     assert!(
         swept >= 1,
         "sweeping immediately-expired entries should remove at least 1"
     );
-    // After sweep, the key should be fresh again.
-    assert!(store.check_and_record("t", "k", Duration::from_secs(60)));
+    assert!(
+        store
+            .check_and_record("t", "k", Duration::from_secs(60))
+            .await
+    );
 }
 
 // ── Topic limits ──────────────────────────────────────────────────────────────

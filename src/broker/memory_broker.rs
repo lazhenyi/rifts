@@ -303,12 +303,13 @@ impl<
         if !self
             .dedupe
             .check_and_record(topic, message_id, self.dedupe_window)
+            .await
         {
             duplicate = true;
         }
 
         // Allocate offset.
-        let offset = self.offsets.alloc(topic);
+        let offset = self.offsets.alloc(topic).await;
 
         // Build log entry.
         let entry = LogEntry {
@@ -331,7 +332,9 @@ impl<
 
         // Persist to log store with retention from topic profile.
         let profile = route.entry.profile.read().clone();
-        self.log.append(topic, entry.clone(), profile.retention);
+        self.log
+            .append(topic, entry.clone(), profile.retention)
+            .await;
 
         // Record snapshot if enabled. Capture a fresh snapshot through the
         // configured `SnapshotStore` rather than the previous no-op, so
@@ -339,7 +342,8 @@ impl<
         // `Broker::snapshot()`.
         if profile.snapshot_enabled {
             self.snapshots
-                .capture(topic, &self.store, profile.snapshot_ttl);
+                .capture(topic, &self.store, profile.snapshot_ttl)
+                .await;
         }
 
         // Fan out to subscribers (not duplicates).
@@ -409,17 +413,14 @@ impl<
         Ok(self
             .log
             .range(topic, from, to)
+            .await
             .into_iter()
             .map(|e| e.payload)
             .collect())
     }
 
     async fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>> {
-        // Delegate to the configured `SnapshotStore` so the returned
-        // snapshot has a stable `snapshot_id` derived from the actual
-        // persisted state, rather than a random UUID synthesized on
-        // every call.
-        Ok(self.snapshots.get(topic))
+        Ok(self.snapshots.get(topic).await)
     }
 
     async fn subscriber_count(&self, topic: &str) -> usize {
@@ -427,7 +428,7 @@ impl<
     }
 
     async fn head_offset(&self, topic: &str) -> i64 {
-        self.offsets.head(topic)
+        self.offsets.head(topic).await
     }
 
     async fn dec_publisher(&self, topic: &str) {
@@ -437,11 +438,7 @@ impl<
     }
 
     async fn maintain(&self) -> usize {
-        let swept = self.dedupe.sweep();
-        if swept > 0 {
-            tracing::debug!(swept, "dedupe sweep completed");
-        }
-        swept
+        self.dedupe.sweep().await
     }
 }
 

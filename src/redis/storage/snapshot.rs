@@ -1,17 +1,8 @@
-//! Redis-backed snapshot store.
-//!
-//! Uses a Redis Hash per topic:
-//!
-//! ```text
-//! Key:  rift:snapshot:{topic}    (Hash)
-//! Fields: snapshot_id, topic, base_offset, payload, created_at, expires_at
-//! ```
-//!
-//! Each topic stores one active snapshot at a time. Capturing a new
-//! snapshot overwrites the previous one via `HSET`.
+//! Redis-backed snapshot store. All methods are async.
 
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use redis::AsyncCommands;
 
@@ -20,18 +11,12 @@ use crate::redis::connection::RedisPool;
 use crate::storage::{SnapshotStore, StoredSnapshot};
 use crate::topic::TopicStore;
 
-/// Redis-backed snapshot store.
-///
-/// Snapshots are stored as Redis Hashes. Serialization uses hex
-/// encoding for the payload and string/int representation for
-/// metadata fields.
 #[derive(Clone)]
 pub struct RedisSnapshotStore {
     pool: RedisPool,
 }
 
 impl RedisSnapshotStore {
-    /// Create a new Redis-backed snapshot store.
     pub fn new(pool: RedisPool) -> Self {
         Self { pool }
     }
@@ -39,17 +24,11 @@ impl RedisSnapshotStore {
     fn snapshot_key(&self, topic: &str) -> String {
         self.pool.topic_key("snapshot", topic)
     }
-
-    fn block_on<F>(&self, f: F) -> F::Output
-    where
-        F: std::future::Future,
-    {
-        tokio::runtime::Handle::current().block_on(f)
-    }
 }
 
+#[async_trait]
 impl SnapshotStore for RedisSnapshotStore {
-    fn capture(
+    async fn capture(
         &self,
         topic: &str,
         store: &TopicStore,
@@ -73,65 +52,55 @@ impl SnapshotStore for RedisSnapshotStore {
         let key = self.snapshot_key(topic);
         let payload_hex = hex_encode(&snap.payload);
         let expires_str = snap.expires_at.map(|e| e.to_string()).unwrap_or_default();
-        let snap_id = snap.snapshot_id.clone();
-        let snap_topic = snap.topic.clone();
-        let base_offset = snap.base_offset;
-        let created_at = snap.created_at;
 
-        self.block_on(async {
-            let mut conn = self.pool.conn().clone();
-            let _: Result<(), _> = redis::cmd("HSET")
+        let mut conn = self.pool.conn().clone();
+        let _: Result<(), _> = redis::cmd("HSET")
+            .arg(&key)
+            .arg("snapshot_id")
+            .arg(&snap.snapshot_id)
+            .arg("topic")
+            .arg(&snap.topic)
+            .arg("base_offset")
+            .arg(snap.base_offset)
+            .arg("payload")
+            .arg(&payload_hex)
+            .arg("created_at")
+            .arg(snap.created_at)
+            .arg("expires_at")
+            .arg(&expires_str)
+            .query_async(&mut conn)
+            .await;
+
+        if let Some(ttl) = ttl {
+            let _: Result<(), _> = redis::cmd("EXPIRE")
                 .arg(&key)
-                .arg("snapshot_id")
-                .arg(&snap_id)
-                .arg("topic")
-                .arg(&snap_topic)
-                .arg("base_offset")
-                .arg(base_offset)
-                .arg("payload")
-                .arg(&payload_hex)
-                .arg("created_at")
-                .arg(created_at)
-                .arg("expires_at")
-                .arg(&expires_str)
+                .arg(ttl.as_secs().max(1) as usize)
                 .query_async(&mut conn)
                 .await;
-
-            if let Some(ttl) = ttl {
-                let _: Result<(), _> = redis::cmd("EXPIRE")
-                    .arg(&key)
-                    .arg(ttl.as_secs().max(1) as usize)
-                    .query_async(&mut conn)
-                    .await;
-            }
-        });
+        }
 
         Some(snap)
     }
 
-    fn get(&self, topic: &str) -> Option<StoredSnapshot> {
+    async fn get(&self, topic: &str) -> Option<StoredSnapshot> {
         let key = self.snapshot_key(topic);
-        let fields: Vec<String> = self.block_on(async {
-            let mut conn = self.pool.conn().clone();
-            redis::cmd("HMGET")
-                .arg(&key)
-                .arg("snapshot_id")
-                .arg("topic")
-                .arg("base_offset")
-                .arg("payload")
-                .arg("created_at")
-                .arg("expires_at")
-                .query_async(&mut conn)
-                .await
-                .unwrap_or_default()
-        });
+        let mut conn = self.pool.conn().clone();
+        let fields: Vec<String> = redis::cmd("HMGET")
+            .arg(&key)
+            .arg("snapshot_id")
+            .arg("topic")
+            .arg("base_offset")
+            .arg("payload")
+            .arg("created_at")
+            .arg("expires_at")
+            .query_async(&mut conn)
+            .await
+            .unwrap_or_default();
 
         if fields.len() < 6 || fields[0].is_empty() {
             return None;
         }
 
-        let snapshot_id = fields[0].clone();
-        let topic_name = fields[1].clone();
         let base_offset: i64 = fields[2].parse().unwrap_or(0);
         let payload = hex_decode(&fields[3]);
         let created_at: i64 = fields[4].parse().unwrap_or(0);
@@ -148,8 +117,8 @@ impl SnapshotStore for RedisSnapshotStore {
         }
 
         Some(StoredSnapshot {
-            snapshot_id,
-            topic: topic_name,
+            snapshot_id: fields[0].clone(),
+            topic: fields[1].clone(),
             base_offset,
             payload,
             created_at,
@@ -157,18 +126,13 @@ impl SnapshotStore for RedisSnapshotStore {
         })
     }
 
-    fn remove(&self, topic: &str) {
+    async fn remove(&self, topic: &str) {
         let key = self.snapshot_key(topic);
-        let _: Result<(), _> = self.block_on(async {
-            let mut conn = self.pool.conn().clone();
-            redis::cmd("DEL").arg(&key).query_async(&mut conn).await
-        });
+        let mut conn = self.pool.conn().clone();
+        let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
     }
 
-    fn list(&self) -> Vec<StoredSnapshot> {
-        // Listing all snapshot keys requires SCAN which is not
-        // implemented for this store. Return empty; listing is not
-        // a hot-path operation.
+    async fn list(&self) -> Vec<StoredSnapshot> {
         Vec::new()
     }
 }

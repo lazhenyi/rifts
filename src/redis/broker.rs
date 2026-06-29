@@ -129,18 +129,19 @@ impl<
         let (topic, message_id) = self.validate_publish(frame)?;
         crate::topic::store::validate_name(topic)?;
 
-        // Dedupe via Redis set.
+        // Dedupe via Redis.
         let dedupe_window = Duration::from_secs(60);
         let mut duplicate = false;
         if !self
             .dedupe
             .check_and_record(topic, message_id, dedupe_window)
+            .await
         {
             duplicate = true;
         }
 
         // Allocate offset via Redis hash.
-        let offset = self.offsets.alloc(topic);
+        let offset = self.offsets.alloc(topic).await;
 
         // Append to Redis log.
         let entry = crate::topic::store::LogEntry {
@@ -153,11 +154,13 @@ impl<
             timestamp: frame.timestamp,
             appended_at: None,
         };
-        self.log.append(
-            topic,
-            entry,
-            crate::topic::retention::RetentionPolicy::Durable,
-        );
+        self.log
+            .append(
+                topic,
+                entry,
+                crate::topic::retention::RetentionPolicy::Durable,
+            )
+            .await;
 
         // Fan out locally.
         if !duplicate {
@@ -200,13 +203,14 @@ impl<
         Ok(self
             .log
             .range(topic, from, to)
+            .await
             .into_iter()
             .map(|e| e.payload)
             .collect())
     }
 
     async fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>> {
-        Ok(self.snapshots.get(topic))
+        Ok(self.snapshots.get(topic).await)
     }
 
     async fn subscriber_count(&self, topic: &str) -> usize {
@@ -214,6 +218,6 @@ impl<
     }
 
     async fn head_offset(&self, topic: &str) -> i64 {
-        self.offsets.head(topic)
+        self.offsets.head(topic).await
     }
 }
