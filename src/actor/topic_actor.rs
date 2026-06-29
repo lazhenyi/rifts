@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::actor::messages::TopicMsg;
 use crate::broker::broker::PublishOutcome;
 use crate::broker::fanout::{ConnectionSink, SubscribeIntent, SubscriptionId};
-use crate::error::{Result, RiftError};
+use crate::error::{Result, RiftError, TopicReject};
 use crate::frame::Frame;
 use crate::message::MessageClass;
 use crate::now_ms;
@@ -233,6 +233,16 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
                 intent,
                 reply_to,
             } => {
+                // Enforce the per-topic subscriber limit. Without
+                // this check, a single topic could accumulate an
+                // unbounded number of subscribers and exhaust
+                // memory.
+                if self.subscribers.len() >= self.profile.max_subscribers {
+                    let _ = reply_to.send(Err(RiftError::Topic(TopicReject::SubscriberLimit(
+                        self.topic_name.clone(),
+                    ))));
+                    return Ok(());
+                }
                 let id = SubscriptionId(self.next_sub_id);
                 self.next_sub_id += 1;
                 self.subscribers.insert(id, LocalSink { sink, intent });
@@ -243,6 +253,13 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
                 let _ = reply_to.send(Ok(ok));
             }
             TopicMsg::Replay { from, to, reply_to } => {
+                // Honor `replay_enabled` on the topic profile. If
+                // disabled, return an empty payload list rather
+                // than leaking historical messages.
+                if !self.profile.replay_enabled {
+                    let _ = reply_to.send(Ok(Vec::new()));
+                    return Ok(());
+                }
                 let entries = self.log.range(&self.topic_name, from, to);
                 let payloads: Vec<Bytes> = entries.into_iter().map(|e| e.payload).collect();
                 let _ = reply_to.send(Ok(payloads));
@@ -338,13 +355,16 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
             offset,
             publisher_session: frame.session_id.clone(),
             message_id: message_id.to_string(),
-            class: frame
-                .event
-                .clone()
-                .unwrap_or_else(|| MessageClass::Event.as_str().to_string()),
+            // `class` is the message class discriminator, not the
+            // event name. The current Frame shape does not carry an
+            // explicit class, so default to Event.
+            class: MessageClass::Event.as_str().to_string(),
             event: frame.event.clone(),
             payload: frame.payload.clone().unwrap_or_default(),
             timestamp: frame.timestamp,
+            // Server-side append time is stamped by `LogStore::append`
+            // (or by `TopicEntry::append` for the in-memory path).
+            appended_at: None,
         };
         self.log
             .append(&self.topic_name, entry, self.profile.retention);

@@ -104,11 +104,21 @@ impl<M> LocalActorRef<M> {
     /// # Returns
     ///
     /// * `Ok(())` -- the message was enqueued successfully.
-    /// * `Err(RiftError::System)` -- the channel is closed or full.
+    /// * `Err(RiftError::System(SystemReject::Overloaded))` -- the
+    ///   channel is full (backpressure; the caller may retry).
+    /// * `Err(RiftError::System(SystemReject::Internal))` -- the
+    ///   channel is closed (the actor task has exited).
     pub fn send(&self, msg: M) -> Result<()> {
-        self.tx.try_send(msg).map_err(|_| {
-            RiftError::System(crate::error::SystemReject::Internal("actor died".into()))
-        })
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.tx.try_send(msg) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => {
+                Err(RiftError::System(crate::error::SystemReject::Overloaded))
+            }
+            Err(TrySendError::Closed(_)) => Err(RiftError::System(
+                crate::error::SystemReject::Internal("actor died".into()),
+            )),
+        }
     }
 
     /// Returns `true` if the actor's receive half has been dropped.

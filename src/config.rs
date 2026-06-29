@@ -173,6 +173,9 @@ pub struct DefaultTopicProfile {
     /// When enabled, publishers can set snapshots, and new subscribers
     /// automatically receive the latest snapshot upon joining.
     pub snapshot_enabled: bool,
+    /// Optional TTL for snapshots produced on this topic.
+    /// `None` means snapshots never expire and are simply replaced.
+    pub snapshot_ttl: Option<std::time::Duration>,
 }
 
 impl Default for ServerConfig {
@@ -203,6 +206,7 @@ impl Default for DefaultTopicProfile {
             max_publishers: 10_000,
             replay_enabled: true,
             snapshot_enabled: true,
+            snapshot_ttl: None,
         }
     }
 }

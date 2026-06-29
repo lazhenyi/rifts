@@ -173,12 +173,17 @@ impl TokenAuth {
     pub fn register(&self, token: impl Into<String>, ctx: AuthContext) {
         let token = token.into();
         let client_id = ctx.client_id.0.clone();
-        self.by_client
-            .write()
-            .entry(client_id)
-            .or_default()
-            .push(token.clone());
-        self.tokens.write().insert(token, ctx);
+        // Insert into the forward map first; the reverse index
+        // records the token only if the forward map actually
+        // changed (avoids pushing duplicate tokens on re-registration).
+        let inserted = self.tokens.write().insert(token.clone(), ctx).is_none();
+        if inserted {
+            self.by_client
+                .write()
+                .entry(client_id)
+                .or_default()
+                .push(token);
+        }
     }
 }
 

@@ -74,11 +74,10 @@ pub fn validate_name(name: &str) -> Result<()> {
             "name contains control characters".into(),
         )));
     }
-    if !name.is_ascii() && std::str::from_utf8(name.as_bytes()).is_err() {
-        return Err(RiftError::Topic(TopicReject::InvalidName(
-            "name is not valid UTF-8".into(),
-        )));
-    }
+    // `name` is a `&str` so it is already guaranteed to be valid UTF-8;
+    // no extra check is needed here. The `is_control()` check above
+    // rejects ASCII control characters; non-ASCII characters are
+    // accepted as topic names.
     Ok(())
 }
 
@@ -121,6 +120,14 @@ pub struct LogEntry {
     /// Sender timestamp in milliseconds since the Unix epoch.
     /// If zero at append time the broker fills in `now_ms()`.
     pub timestamp: i64,
+
+    /// Server-side append timestamp in milliseconds since the Unix
+    /// epoch. Set by the broker when the entry is persisted; used by
+    /// retention policies so that a future or skewed publisher
+    /// timestamp cannot prevent an entry from being evicted.
+    /// `None` for entries persisted before this field was introduced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub appended_at: Option<i64>,
 }
 
 use bytes::Bytes;
@@ -241,9 +248,14 @@ impl TopicEntry {
     /// If `snapshot_enabled` is set on the profile the entry also replaces
     /// the latest snapshot.
     pub fn append(&self, mut entry: LogEntry) {
+        let now = now_ms();
         if entry.timestamp == 0 {
-            entry.timestamp = now_ms();
+            entry.timestamp = now;
         }
+        // Stamp the server-side append time. TTL retention in external
+        // stores (e.g. sled) uses this rather than the (possibly skewed
+        // or malicious) publisher timestamp.
+        entry.appended_at = Some(now);
         let profile = self.profile.read().clone();
         let mut log = self.log.write();
         log.push(entry.clone());
@@ -267,8 +279,12 @@ impl TopicEntry {
                 }
             }
             RetentionPolicy::Ttl(ttl) => {
-                let now = now_ms();
-                log.retain(|e| now - e.timestamp <= ttl.as_millis() as i64);
+                let ttl_ms = ttl.as_millis() as i64;
+                log.retain(|e| {
+                    // Prefer the broker's append time when present.
+                    let ts = e.appended_at.unwrap_or(e.timestamp);
+                    now - ts <= ttl_ms
+                });
             }
             RetentionPolicy::Latest => {
                 log.retain(|e| e.offset == entry.offset);
@@ -282,7 +298,8 @@ impl TopicEntry {
         }
     }
 
-    /// Return log entries whose offset is `>= from` and `<= to`.
+    /// Return log entries whose offset is in the half-open range
+    /// `[from, to)`.
     ///
     /// This is used by the replay path to fetch the range of messages
     /// a late-joining subscriber needs to catch up to the live stream.
@@ -291,7 +308,7 @@ impl TopicEntry {
         self.log
             .read()
             .iter()
-            .filter(|e| e.offset >= from && e.offset <= to)
+            .filter(|e| e.offset >= from && e.offset < to)
             .cloned()
             .collect()
     }
@@ -405,6 +422,7 @@ mod tests {
             event: Some("e".into()),
             payload: Bytes::copy_from_slice(payload),
             timestamp: 0,
+            appended_at: None,
         }
     }
 
@@ -484,9 +502,15 @@ mod tests {
         for i in 1..=5 {
             entry.append(sample_entry(i, b"x"));
         }
+        // `range` is half-open: [from, to).
         let got = entry.range(2, 4);
+        assert_eq!(got.iter().map(|e| e.offset).collect::<Vec<_>>(), vec![2, 3]);
+        let got_inclusive_end = entry.range(2, 5);
         assert_eq!(
-            got.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            got_inclusive_end
+                .iter()
+                .map(|e| e.offset)
+                .collect::<Vec<_>>(),
             vec![2, 3, 4]
         );
     }

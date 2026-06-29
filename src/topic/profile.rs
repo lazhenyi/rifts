@@ -54,6 +54,11 @@ pub struct TopicProfile {
     /// state immediately without waiting for the next live message.
     pub snapshot_enabled: bool,
 
+    /// Optional TTL for snapshots. `None` means snapshots do not
+    /// expire and are replaced on every new `snapshot_enabled`
+    /// publish. Only relevant when `snapshot_enabled` is `true`.
+    pub snapshot_ttl: Option<Duration>,
+
     /// Duration for which messages remain available for replay after
     /// they are published. Only relevant when `replay_enabled` is `true`.
     pub replay_window: Duration,
@@ -73,6 +78,7 @@ impl Default for TopicProfile {
     /// | `rate_limit_total`       | `None` (no limit)       |
     /// | `replay_enabled`         | `true`                  |
     /// | `snapshot_enabled`       | `true`                  |
+    /// | `snapshot_ttl`           | `None` (no expiry)      |
     /// | `replay_window`          | 300 seconds (5 minutes) |
     fn default() -> Self {
         Self {
@@ -85,6 +91,7 @@ impl Default for TopicProfile {
             rate_limit_total: None,
             replay_enabled: true,
             snapshot_enabled: true,
+            snapshot_ttl: None,
             replay_window: Duration::from_secs(300),
         }
     }

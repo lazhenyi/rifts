@@ -200,28 +200,54 @@ impl<
     /// A [`LocalActorRef<TopicMsg>`] handle that can be used to send
     /// messages to the actor.
     pub fn get_or_spawn(&self, topic: &str) -> LocalActorRef<TopicMsg> {
-        // Fast path: existing live actor.
-        if let Some(r) = self.actors.get(topic) {
-            if !r.is_closed() {
-                return r.clone();
+        // Atomic check-and-spawn: if a live actor exists, return it.
+        // If a dead actor exists, replace it. Otherwise, spawn a new
+        // one. The `entry()` API guarantees that the closure runs
+        // exactly once per key, so two concurrent callers cannot
+        // both spawn a new actor for the same topic.
+        let mut existing = None;
+        let actor_ref = match self.actors.entry(topic.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(mut occ) => {
+                if !occ.get().is_closed() {
+                    existing = Some(occ.get().clone());
+                } else {
+                    // Replace the dead entry with a fresh actor
+                    // before the closure returns so other
+                    // callers can find it.
+                    let (tx, rx) = mpsc::channel(256);
+                    let actor = TopicActor::new(
+                        topic.to_string(),
+                        self.default_profile.clone(),
+                        self.offsets.clone(),
+                        self.log.clone(),
+                        self.dedupe.clone(),
+                        self.snapshots.clone(),
+                        self.dedupe_window,
+                    );
+                    let new_ref = LocalActorRef::new(tx);
+                    tokio::spawn(async move { actor.run(rx).await });
+                    occ.insert(new_ref.clone());
+                    existing = Some(new_ref);
+                }
+                existing.unwrap()
             }
-            // Actor died — remove stale entry.
-            self.actors.remove(topic);
-        }
-        // Slow path: spawn.
-        let (tx, rx) = mpsc::channel(256);
-        let actor = TopicActor::new(
-            topic.to_string(),
-            self.default_profile.clone(),
-            self.offsets.clone(),
-            self.log.clone(),
-            self.dedupe.clone(),
-            self.snapshots.clone(),
-            self.dedupe_window,
-        );
-        let actor_ref = LocalActorRef::new(tx);
-        tokio::spawn(async move { actor.run(rx).await });
-        self.actors.insert(topic.to_string(), actor_ref.clone());
+            dashmap::mapref::entry::Entry::Vacant(vac) => {
+                let (tx, rx) = mpsc::channel(256);
+                let actor = TopicActor::new(
+                    topic.to_string(),
+                    self.default_profile.clone(),
+                    self.offsets.clone(),
+                    self.log.clone(),
+                    self.dedupe.clone(),
+                    self.snapshots.clone(),
+                    self.dedupe_window,
+                );
+                let new_ref = LocalActorRef::new(tx);
+                tokio::spawn(async move { actor.run(rx).await });
+                vac.insert(new_ref.clone());
+                new_ref
+            }
+        };
         actor_ref
     }
 

@@ -394,6 +394,7 @@ impl From<DefaultTopicProfile> for crate::topic::TopicProfile {
             rate_limit_total: None,
             replay_enabled: d.replay_enabled,
             snapshot_enabled: d.snapshot_enabled,
+            snapshot_ttl: d.snapshot_ttl,
             replay_window: std::time::Duration::from_secs(300),
         }
     }

@@ -235,6 +235,7 @@ mod tests {
             event: Some("e".into()),
             payload: bytes::Bytes::from_static(b"x"),
             timestamp: 0,
+            appended_at: None,
         });
         entry.append(crate::topic::store::LogEntry {
             offset: o2,
@@ -244,6 +245,7 @@ mod tests {
             event: Some("e".into()),
             payload: bytes::Bytes::from_static(b"x"),
             timestamp: 0,
+            appended_at: None,
         });
         let heads = m.topic_offsets(&store, &["t".to_string()]);
         assert_eq!(heads.get("t").copied(), Some(2));

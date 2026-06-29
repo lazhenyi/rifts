@@ -217,7 +217,10 @@ impl AckManager {
     /// The `timeout` is added to the current time to compute the deadline
     /// after which the message is considered timed out.
     pub fn track(&self, session_id: &str, message_id: &str, timeout: Duration) {
-        let deadline = now_ms() + timeout.as_millis() as i64;
+        // Use `saturating_add` so a pathologically large `timeout`
+        // (e.g. `Duration::MAX`) does not produce a negative
+        // deadline via `as i64` truncation.
+        let deadline = now_ms().saturating_add(timeout.as_millis().try_into().unwrap_or(i64::MAX));
         self.outstanding
             .lock()
             .entry(session_id.to_string())
