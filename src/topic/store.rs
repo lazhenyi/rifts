@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::RwLock;
 
@@ -129,8 +130,6 @@ pub struct LogEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub appended_at: Option<i64>,
 }
-
-use bytes::Bytes;
 
 /// Internal state of a single topic.
 ///
@@ -232,6 +231,52 @@ impl TopicEntry {
         self.publisher_count.fetch_sub(1, Ordering::Relaxed);
     }
 
+    /// Atomically reserve a subscriber slot: returns `true` and
+    /// increments the count if the topic is below its
+    /// `max_subscribers` limit, otherwise returns `false`
+    /// without changing the count. This replaces the previous
+    /// check-then-act pattern (`can_subscribe()` + `inc_subscriber()`)
+    /// which had a TOCTOU race.
+    pub fn try_inc_subscriber(&self) -> bool {
+        let limit = self.profile.read().max_subscribers as u64;
+        let mut cur = self.subscriber_count.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return false;
+            }
+            match self.subscriber_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    /// Atomically reserve a publisher slot, mirroring
+    /// [`try_inc_subscriber`](Self::try_inc_subscriber).
+    pub fn try_inc_publisher(&self) -> bool {
+        let limit = self.profile.read().max_publishers as u64;
+        let mut cur = self.publisher_count.load(Ordering::Relaxed);
+        loop {
+            if cur >= limit {
+                return false;
+            }
+            match self.publisher_count.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
     /// Append a new log entry to this topic, enforcing the retention policy.
     ///
     /// If the entry's `timestamp` is `0` it is filled in with `now_ms()`.
@@ -244,6 +289,9 @@ impl TopicEntry {
     /// - `Ttl(dur)` — entries older than `dur` are removed.
     /// - `Latest` — all entries except the one just appended are removed.
     /// - `Durable` — no in-memory eviction (the external store handles it).
+    /// - `None` — clears the entire log including the entry just
+    ///   appended. This is the documented "fire-and-forget"
+    ///   behavior: nothing is retained for replay.
     ///
     /// If `snapshot_enabled` is set on the profile the entry also replaces
     /// the latest snapshot.
@@ -257,6 +305,8 @@ impl TopicEntry {
         // or malicious) publisher timestamp.
         entry.appended_at = Some(now);
         let profile = self.profile.read().clone();
+        // Take the snapshot branch first so we can move `entry`
+        // rather than cloning it.
         let mut log = self.log.write();
         log.push(entry.clone());
         match profile.retention {
