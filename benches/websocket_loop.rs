@@ -95,7 +95,7 @@ fn bench_publish(c: &mut Criterion) {
                     let client = RiftClient::new(url, make_config());
                     let _ = client.connect().await;
                     let _ = client
-                        .subscribe("bench.topic", rifts::message::SubscribeMode::Live, None)
+                        .subscribe("bench.topic", rifts::message::SubscribeIntent::Live, None)
                         .await;
                     let _ = client
                         .publish("bench.topic", "bench.event", "json", payload, None)
@@ -122,7 +122,7 @@ fn bench_roundtrip(c: &mut Criterion) {
 
                 let mut ev_rx = client.subscribe_events();
                 let _ = client
-                    .subscribe("bench.topic", rifts::message::SubscribeMode::Live, None)
+                    .subscribe("bench.topic", rifts::message::SubscribeIntent::Live, None)
                     .await;
 
                 for i in 0..n {
