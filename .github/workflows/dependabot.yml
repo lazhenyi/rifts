@@ -1,0 +1,39 @@
+name: Dependabot
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # every Monday 09:00 UTC
+  workflow_dispatch: # manual trigger
+
+jobs:
+  update:
+    name: Check for dependency updates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-edit
+        run: cargo install cargo-edit
+
+      - name: Run cargo update
+        run: cargo update
+
+      - name: Check for outdated dependencies
+        run: cargo outdated --exit-code 1 || true
+
+      - name: Run tests with updated deps
+        run: cargo test --all-features
+
+      - name: Open PR if updates available
+        uses: peter-evans/create-pull-request@v7
+        with:
+          commit-message: "chore(deps): update dependencies"
+          branch: deps/auto-update
+          title: "chore(deps): weekly dependency update"
+          body: |
+            Automated dependency update via Dependabot workflow.
+            - Run `cargo update` to refresh Cargo.lock
+            - Tests pass: ${{ job.status }}
+          labels: dependencies
