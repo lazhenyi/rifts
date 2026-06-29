@@ -173,7 +173,7 @@ pub fn decide(
                 if *last < *head {
                     any_behind = true;
                 }
-                if *last < *head - 1 {
+                if *last < head.saturating_sub(1) {
                     all_within = false;
                 }
             }
