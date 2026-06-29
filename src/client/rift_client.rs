@@ -28,7 +28,7 @@ use super::subscriber::SubscriptionTracker;
 pub struct RiftClient {
     url: String,
     config: Arc<RwLock<RiftClientConfig>>,
-    inner: RwLock<Option<Arc<ConnectionInner>>>,
+    inner: Arc<RwLock<Option<Arc<ConnectionInner>>>>,
     event_tx: broadcast::Sender<ClientEvent>,
     subscriptions: Arc<Mutex<SubscriptionTracker>>,
     closed: Arc<AtomicBool>,
@@ -77,7 +77,7 @@ impl RiftClient {
         Self {
             url: url.into(),
             config: Arc::new(RwLock::new(config)),
-            inner: RwLock::new(None),
+            inner: Arc::new(RwLock::new(None)),
             event_tx,
             subscriptions: Arc::new(Mutex::new(SubscriptionTracker::new())),
             closed: Arc::new(AtomicBool::new(false)),
@@ -90,7 +90,12 @@ impl RiftClient {
     /// Connect to the Rift server, perform the Hello/Welcome/Ready handshake,
     /// and start the heartbeat loop. Returns after the Ready frame is received.
     pub async fn connect(&self) -> Result<()> {
-        if self.inner.read().await.is_some() {
+        // Atomic check-and-install: take the write lock once to read the
+        // current state and insert the new connection without a window
+        // where two concurrent `connect()` calls could each see "empty"
+        // and both open a WebSocket.
+        let mut guard = self.inner.write().await;
+        if guard.is_some() {
             return Err(ClientError::AlreadyConnected);
         }
         self.closed.store(false, Ordering::SeqCst);
@@ -104,14 +109,9 @@ impl RiftClient {
         )
         .await?;
 
-        *self.inner.write().await = Some(inner);
-
-        // Spawn reconnect monitor — captures the inner Arc so it gets
-        // dropped when disconnect_notify fires, releasing the connection.
-        let guard = self.inner.read().await;
-        let conn = guard.as_ref().ok_or(ClientError::NotConnected)?;
+        let conn = inner.clone();
         let disconnect_notify = conn.disconnect_notify.clone();
-        let inner_arc = conn.clone();
+        *guard = Some(inner);
         drop(guard);
         let event_tx = self.event_tx.clone();
         let config = Arc::clone(&self.config);
@@ -119,11 +119,17 @@ impl RiftClient {
         let closed = Arc::clone(&self.closed);
         let url = self.url.clone();
         let frame_ids = self.frame_ids.clone();
+        let inner_slot = self.inner.clone();
+        // Hold the inner Arc inside the monitor task; releasing
+        // it after disconnect frees the connection resources.
+        let _hold_arc = conn;
 
         tokio::spawn(async move {
             disconnect_notify.notified().await;
-            // Dropping inner_arc releases the connection resources
-            drop(inner_arc);
+            // Dropping the captured inner Arc releases the
+            // connection resources held by the reader / heartbeat
+            // tasks once they exit.
+            drop(_hold_arc);
             // Emit disconnect
             let _ = event_tx.send(ClientEvent::Disconnected {
                 code: 1006,
@@ -142,6 +148,7 @@ impl RiftClient {
                         &url,
                         &config,
                         &event_tx,
+                        inner_slot.as_ref(),
                         subscriptions,
                         closed,
                         frame_ids,
@@ -289,8 +296,25 @@ impl RiftClient {
             opts.priority,
         );
 
-        // Register pending reply
+        // Register the pending reply and pre-compute the cleanup
+        // closure so every error / drop path removes the entry.
         let (tx, rx) = oneshot::channel::<Reply>();
+        let pending_cid = correlation_id.clone();
+        let inner_for_cleanup = Arc::clone(&self.inner);
+        let cleanup = move || {
+            let inner_slot = inner_for_cleanup;
+            let cid = pending_cid;
+            tokio::spawn(async move {
+                let inner = inner_slot.read().await;
+                if let Some(conn) = inner.as_ref() {
+                    conn.pending_replies.lock().await.remove(&cid);
+                }
+            });
+        };
+        // Tracks whether the reply has been received. The match
+        // arms below either run `cleanup()` (on every error /
+        // timeout path) or succeed (on the `Ok(Ok(reply))` path);
+        // we never fall back to a guard.
         {
             let inner = self.inner.read().await;
             let conn = inner.as_ref().ok_or(ClientError::NotConnected)?;
@@ -298,22 +322,29 @@ impl RiftClient {
             pending.insert(correlation_id.clone(), tx);
         }
 
-        // Send the command frame
-        self.send_frame(frame).await?;
+        // Send the command frame. On any error here, the reply is
+        // never awaited, so clean up the entry immediately.
+        if let Err(e) = self.send_frame(frame).await {
+            cleanup();
+            return Err(e);
+        }
 
-        // Await reply or timeout
+        // Await reply or timeout.
         match tokio::time::timeout(Duration::from_millis(timeout_ms), rx).await {
             Ok(Ok(reply)) => Ok(reply),
             Ok(Err(_)) => {
-                // sender dropped — disconnect occurred
+                // Sender dropped -- connection closed. Clean up
+                // proactively (the reader task may have dropped
+                // the sender without removing the entry).
+                cleanup();
                 Err(ClientError::NotConnected)
             }
             Err(_) => {
-                // Clean up the pending entry
-                let inner = self.inner.read().await;
-                if let Some(conn) = inner.as_ref() {
-                    conn.pending_replies.lock().await.remove(&correlation_id);
-                }
+                // Timeout. The reply may still arrive later; the
+                // entry will be removed when the reader task
+                // attempts to dispatch the late reply to a
+                // dropped oneshot.
+                cleanup();
                 Err(ClientError::CommandTimeout(timeout_ms))
             }
         }
@@ -425,6 +456,7 @@ async fn try_reconnect(
     url: &str,
     config: &Arc<RwLock<RiftClientConfig>>,
     event_tx: &broadcast::Sender<ClientEvent>,
+    inner_slot: &RwLock<Option<Arc<ConnectionInner>>>,
     subscriptions: Arc<Mutex<SubscriptionTracker>>,
     closed: Arc<AtomicBool>,
     frame_ids: FrameIdCounter,
@@ -436,8 +468,12 @@ async fn try_reconnect(
             return;
         }
         let _ = event_tx.send(ClientEvent::Reconnecting { attempt });
-        // Exponential backoff capped at 5x base
-        let delay = base_delay * attempt.min(5);
+        // Exponential backoff with jitter: base * 2^(attempt-1),
+        // bounded by 32x base, plus up to base of random jitter.
+        let exp = base_delay.saturating_mul(1u32 << (attempt - 1).min(5));
+        let jitter =
+            Duration::from_millis(rand::random::<u64>() % base_delay.as_millis().max(1) as u64);
+        let delay = exp + jitter;
         tokio::time::sleep(delay).await;
         if closed.load(Ordering::SeqCst) {
             return;
@@ -456,8 +492,14 @@ async fn try_reconnect(
         )
         .await
         {
-            Ok(_inner) => {
+            Ok(new_inner) => {
                 tracing::info!(attempt, "reconnected");
+                // Store the new connection back into the shared slot
+                // so subsequent publish / subscribe / command calls
+                // see the reconnected state. Without this, the
+                // client would remain effectively disconnected even
+                // after a successful reconnect.
+                *inner_slot.write().await = Some(new_inner);
                 return;
             }
             Err(e) => {

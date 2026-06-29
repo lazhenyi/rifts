@@ -81,11 +81,14 @@ async fn heartbeat_loop(
     jitter_ms: u32,
 ) {
     let mut rng = StdRng::from_os_rng();
+    let mut consecutive_encode_failures = 0u32;
     loop {
-        // Add random jitter: [0, 2*jitter_ms]
+        // Add positive jitter in [0, jitter_ms] so the total wait
+        // is always >= ping_interval (the previous code subtracted
+        // jitter from the random value, which produced a wait that
+        // could be shorter than ping_interval).
         let jitter = if jitter_ms > 0 {
-            let j: u64 = rng.random_range(0..=jitter_ms as u64 * 2);
-            Duration::from_millis(j.saturating_sub(jitter_ms as u64))
+            Duration::from_millis(rng.random_range(0..=jitter_ms as u64))
         } else {
             Duration::ZERO
         };
@@ -97,8 +100,20 @@ async fn heartbeat_loop(
         let ping = ping_frame(id);
         let encoded = match encode_frame(&ping) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(e) => {
+                // Repeated encoding failures indicate a bug; log
+                // and break the loop so the connection is torn down
+                // rather than silently hanging.
+                tracing::warn!(error = %e, "ping encode failed");
+                consecutive_encode_failures += 1;
+                if consecutive_encode_failures >= 3 {
+                    tracing::error!("ping encode failed repeatedly; closing connection");
+                    break;
+                }
+                continue;
+            }
         };
+        consecutive_encode_failures = 0;
         {
             let mut w = writer.lock().await;
             if w.send(WsMessage::Binary(encoded.to_vec())).await.is_err() {
@@ -117,8 +132,16 @@ async fn heartbeat_loop(
         if current >= max_missed {
             tracing::warn!(missed = current, "heartbeat timeout — closing connection");
             let mut w = writer.lock().await;
-            // Close without frame details (tungstenite will use default close)
-            let _ = w.send(WsMessage::Close(None)).await;
+            // Send a structured close frame so server-side
+            // diagnostics can identify the cause.
+            let _ = w
+                .send(WsMessage::Close(Some(
+                    tokio_tungstenite::tungstenite::protocol::CloseFrame {
+                        code: tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode::Error,
+                        reason: "heartbeat timeout".into(),
+                    },
+                )))
+                .await;
             break;
         }
     }

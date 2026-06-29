@@ -13,7 +13,9 @@ use crate::frame::{Codec, Frame, FrameType};
 use crate::message::SubscribeMode;
 use crate::message::command::Reply;
 use crate::protocol::hello::{Ready, Welcome};
-use crate::transport::frame_codec::{decode_binary_frame, encode_frame};
+use crate::transport::frame_codec::{
+    DEFAULT_MAX_BINARY_PAYLOAD, decode_binary_frame, encode_frame,
+};
 
 use super::config::RiftClientConfig;
 use super::error::{ClientError, Result};
@@ -131,14 +133,27 @@ pub(crate) async fn connect(
     }
     drop(subs);
 
+    // Re-subscribe each tracked subscription. If a single frame fails
+    // to send, log a warning and continue so a single broken topic
+    // does not block the rest of the resubscribe set.
     for f in &frames {
-        let bytes = encode_frame(f)?;
-        inner
+        let bytes = match encode_frame(f) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to encode resubscribe frame");
+                continue;
+            }
+        };
+        if let Err(e) = inner
             .writer
             .lock()
             .await
             .send(WsMessage::Binary(bytes.to_vec()))
-            .await?;
+            .await
+        {
+            tracing::warn!(error = %e, "failed to send resubscribe frame");
+            continue;
+        }
     }
 
     // 9. Emit connected
@@ -164,7 +179,7 @@ async fn await_handshake(reader: &mut WsReader) -> Result<(Welcome, Ready)> {
 
         match msg {
             WsMessage::Binary(data) => {
-                let frame = decode_binary_frame(&data)?;
+                let frame = decode_binary_frame(&data, DEFAULT_MAX_BINARY_PAYLOAD)?;
                 if frame.frame_type != FrameType::Control {
                     continue;
                 }
@@ -290,10 +305,15 @@ async fn reader_task(
 
         match msg {
             WsMessage::Binary(data) => {
-                let frame = match decode_binary_frame(&data) {
+                let frame = match decode_binary_frame(&data, DEFAULT_MAX_BINARY_PAYLOAD) {
                     Ok(f) => f,
                     Err(e) => {
-                        let _ = event_tx.send(ClientEvent::Error(format!("decode: {e}")));
+                        // Use tracing::warn rather than broadcasting a
+                        // ClientEvent::Error, which would let a
+                        // misbehaving server flood the broadcast
+                        // channel (capacity 1024) and cause legitimate
+                        // events to be dropped.
+                        tracing::warn!(error = %e, "frame decode failed");
                         continue;
                     }
                 };
