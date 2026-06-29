@@ -103,7 +103,7 @@ impl TransportConnection for AxumWsConnection {
                 }
                 Message::Ping(_) | Message::Pong(_) => continue,
                 Message::Close(_) => {
-                    return Err(RiftError::Session(crate::error::SessionReject::Expired));
+                    return Err(RiftError::Session(crate::error::SessionReject::Closed));
                 }
             }
         }
