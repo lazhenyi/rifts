@@ -45,11 +45,7 @@ Topic::       Subscription, publish, permission, sharding, fanout, retention, sn
 
 | `broker`
 | Topic
-| `Broker` trait (async), `InMemoryBroker<O,L,D,S>`, `RemoteBroker` (TCP), `ActorBroker` (actors), `WireMsg` CBOR protocol, `FanoutEngine`, `DedupeStore`, `OffsetStore`, `SnapshotStore`.
-
-| `actor`
-| Topic
-| `TopicActor` (per‑topic task + catch_unwind), `TopicRegistry` (lazy spawn), `LocalActorRef<M>`, `RemoteActorRef<M>` (stub), `TopicMsg` enum (8 variants).
+| `Broker` trait (async), `InMemoryBroker<O,L,D,S>`, `GatewayMsg` CBOR protocol, `FanoutEngine`, `DedupeStore`, `OffsetStore`, `SnapshotStore`.
 
 | `storage`
 | Topic
@@ -139,14 +135,6 @@ Three implementations ship with the crate:
 | `InMemoryBroker<O,L,D,S>`
 | Single‑process, default
 | Generic over storage backends.  `DefaultBroker` = all memory.  `SledBroker` = all sled.
-
-| `RemoteBroker`
-| Gateway ↔ external broker node
-| Thin RPC adapter over framed CBOR TCP.  Users provide the broker node in any language.
-
-| `ActorBroker`
-| In‑process, per‑topic parallelism
-| Each topic is an independent Tokio task.  No locks — actor loop is single‑threaded.
 |===
 
 === InMemoryBroker Dataflow
@@ -172,55 +160,6 @@ Three implementations ship with the crate:
                                     │   task → WebSocket) │
                                     └────────────────────┘
 ----
-
-=== RemoteBroker Wire Protocol
-
-Gateway and external broker node communicate over a single TCP connection using
-length‑prefixed CBOR frames.  The `WireMsg` enum has 32 variants covering all
-`Broker` trait methods plus push delivery:
-
-[source,rust]
-----
-pub enum WireMsg {
-    Publish { frame: Frame },
-    Subscribe { topic: String, intent: SubscribeIntent, sink_id: u64 },
-    Unsubscribe { id: u64 },
-    DropSink { sink_id: u64 },
-    Replay { topic: String, from: i64, to: i64 },
-    Snapshot { topic: String },
-    // ... responses, errors, and Deliver push messages
-}
-----
-
-Each request gets a matching response variant.  Fanout uses `Deliver` push messages
-from broker to gateway.  The wire codec is `WireCodec` — a `tokio_util::codec::Decoder`
-+ `Encoder` pair.
-
-=== Actor Runtime
-
-For users who want in‑process per‑topic parallelism without a network hop:
-
-[source]
-----
-┌────────────────────────────────────────────┐
-│              TopicRegistry                 │
-│  DashMap<String, LocalActorRef<TopicMsg>>  │
-│                                            │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐ │
-│  │ room/1   │  │ room/2   │  │ user/42  │ │
-│  │ actor    │  │ actor    │  │ actor    │ │
-│  │ (tokio   │  │ (tokio   │  │ (tokio   │ │
-│  │  task)   │  │  task)   │  │  task)   │ │
-│  └──────────┘  └──────────┘  └──────────┘ │
-└────────────────────────────────────────────┘
-----
-
-- `TopicActor` owns one topic's state — `OffsetStore`, `LogStore`, `DedupeStore`,
-  `SnapshotStore`, subscriber map.  The actor loop processes one `TopicMsg` at a time.
-- `catch_unwind` wraps each message handler — one bad message cannot crash the topic.
-- If the actor task dies, `TopicRegistry::get_or_spawn` detects the closed channel
-  and spawns a fresh actor (lazy recreate).
-- `ActorBroker` implements `Broker` by delegating to `TopicRegistry`.
 
 == Flow Control
 
