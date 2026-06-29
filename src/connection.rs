@@ -562,7 +562,12 @@ impl Connection {
             crate::session::resume::ResumeOutcome::ColdStart => "cold_start",
             crate::session::resume::ResumeOutcome::Rejected => "rejected",
         });
-        let welcome = build_welcome_frame(&session, codec.frame_codec(), resume_result_str);
+        let welcome = build_welcome_frame(
+            &session,
+            codec.frame_codec(),
+            resume_result_str,
+            &self.config,
+        );
         transport.write_frame(&welcome).await?;
 
         // Replay missed messages for Partial / Replaying outcomes.
@@ -1029,6 +1034,7 @@ fn rift_error_to_code(err: &RiftError) -> &'static str {
         RiftError::Session(se) => match se {
             crate::error::SessionReject::NotFound(_) => ErrorCode::SessionNotFound.as_str(),
             crate::error::SessionReject::Expired => ErrorCode::SessionExpired.as_str(),
+            crate::error::SessionReject::Closed => ErrorCode::SessionExpired.as_str(),
             crate::error::SessionReject::Conflict { .. } => ErrorCode::SessionConflict.as_str(),
             crate::error::SessionReject::ResumeRejected(_) => ErrorCode::ResumeRejected.as_str(),
             crate::error::SessionReject::ReplayOffsetExpired { .. } => {
@@ -1114,12 +1120,26 @@ async fn send_ack_frame(
 ///
 /// Contains the assigned session id, epoch, negotiated codec,
 /// resume result, and server timestamp.
-fn build_welcome_frame(session: &Session, codec: FrameCodec, resume_result: Option<&str>) -> Frame {
+fn build_welcome_frame(
+    session: &Session,
+    codec: FrameCodec,
+    resume_result: Option<&str>,
+    config: &ServerConfig,
+) -> Frame {
     let mut body = serde_json::json!({
         "type": "welcome",
         "session_id": session.id.as_str(),
         "epoch": session.current_epoch(),
         "negotiated_codec": codec.name(),
+        // `resume_window_ms` advertises how long the server will
+        // retain a session's offset history for cross-connection
+        // resumption. Surfacing it lets clients make informed
+        // decisions about reconnect timing.
+        "resume_window_ms": config.replay_window.as_millis() as u32,
+        // Advertise the set of optional features the server
+        // supports so clients can negotiate capability-aware
+        // behavior on connect.
+        "features": config.supported_features(),
         "server_time": now_ms(),
     });
     if let Some(r) = resume_result {
