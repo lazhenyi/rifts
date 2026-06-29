@@ -8,7 +8,7 @@
 //!
 //! ```rust,no_run
 //! use rifts::client::{RiftClient, RiftClientConfig, ClientEvent};
-//! use rifts::message::SubscribeMode;
+//! use rifts::broker::SubscribeIntent;
 //!
 //! # async fn run() -> rifts::client::Result<()> {
 //! let client = RiftClient::new(
@@ -23,7 +23,7 @@
 //! let mut events = client.subscribe_events();
 //! client.connect().await?;
 //!
-//! client.subscribe("room/1", SubscribeMode::Live, None).await?;
+//! client.subscribe("room/1", SubscribeIntent::Live, None).await?;
 //! client.publish(
 //!     "room/1", "chat.message", "chat.message@1.0",
 //!     serde_json::json!({"text": "hello"}),
@@ -59,6 +59,6 @@ pub use rift_client::{CommandOpts, PublishOpts, RiftClient, StateOpts};
 
 // Re-export commonly used types for convenience.
 pub use crate::frame::{Codec, Frame, FrameFlags, FrameType, Priority};
-pub use crate::message::SubscribeMode;
+pub use crate::broker::SubscribeIntent;
 pub use crate::message::command::Reply;
 pub use crate::protocol::close::CloseCode;
