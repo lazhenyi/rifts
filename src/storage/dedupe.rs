@@ -29,12 +29,18 @@ pub trait DedupeStore: Send + Sync {
 
 // ── Memory-backed ────────────────────────────────────────────
 
+/// In-memory deduplication store backed by a concurrent [`DashMap`].
+///
+/// Each entry maps a `(topic, message_id)` tuple to an expiry timestamp
+/// (milliseconds since epoch). Entries past their expiry are pruned by
+/// [`sweep`](DedupeStore::sweep).
 #[derive(Debug, Default)]
 pub struct MemoryDedupeStore {
     inner: DashMap<(String, String), i64>,
 }
 
 impl MemoryDedupeStore {
+    /// Create a new, empty [`MemoryDedupeStore`].
     pub fn new() -> Self {
         Self::default()
     }
@@ -89,11 +95,16 @@ mod sled_impl {
     use crate::storage::engine::SledEngine;
     use crate::storage::engine::StorageEngine;
 
+    /// Sled-backed deduplication store.
+    ///
+    /// Uses atomic compare-and-swap on the underlying sled tree for correct
+    /// distributed deduplication semantics.
     pub struct SledDedupeStore {
         engine: SledEngine,
     }
 
     impl SledDedupeStore {
+        /// Create a new [`SledDedupeStore`] backed by the given sled engine.
         pub fn new(engine: SledEngine) -> Self {
             Self { engine }
         }
