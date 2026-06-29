@@ -43,6 +43,7 @@
 use std::time::Duration;
 
 use crate::protocol::heartbeat::HeartbeatPolicy;
+use crate::topic::TopicProfile;
 
 /// Global server configuration.
 ///
@@ -127,12 +128,12 @@ pub struct ServerConfig {
     ///
     /// During the Hello phase, this list of available codecs is presented to
     /// the client. If empty (the default), all compiled-in codecs are offered.
-    pub codec_offer: Vec<CodecOffer>,
+    pub codec_offer: Vec<crate::frame::Codec>,
 
     /// Default profile applied when a topic is auto-created on first subscribe.
     ///
     /// Individual topics can override these settings.
-    pub default_topic_profile: DefaultTopicProfile,
+    pub default_topic_profile: TopicProfile,
 
     /// Redis connection configuration (only available with feature `redis`).
     ///
@@ -141,6 +142,13 @@ pub struct ServerConfig {
     /// constructed from this configuration.
     #[cfg(feature = "redis")]
     pub redis: Option<RedisConfig>,
+
+    /// Cluster configuration (only available with feature `cluster`).
+    ///
+    /// When set, the server can use a [`ClusterBroker`](crate::cluster::ClusterBroker)
+    /// for TCP mesh cluster communication. If `None`, cluster mode is disabled.
+    #[cfg(feature = "cluster")]
+    pub cluster: Option<crate::cluster::config::ClusterConfig>,
 }
 
 /// Redis connection configuration for multi-instance deployments.
@@ -174,63 +182,6 @@ impl Default for RedisConfig {
     }
 }
 
-/// Available codecs offered to the client during the Hello phase.
-///
-/// Each variant corresponds to a wire serialization format. The client selects
-/// one before the Welcome phase, and it is used for all subsequent frame
-/// encoding and decoding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CodecOffer {
-    /// [JSON](https://www.json.org/) text encoding — easy to debug, widest compatibility.
-    Json,
-    /// [CBOR](https://cbor.io/) binary encoding — smaller footprint, faster parsing.
-    Cbor,
-}
-
-/// Default profile used when a topic is auto-created on first subscribe.
-///
-/// When a client first subscribes to a topic that does not yet exist, the
-/// server automatically creates the topic and its associated storage using
-/// this profile. All fields can be dynamically overridden afterward.
-#[derive(Debug, Clone)]
-pub struct DefaultTopicProfile {
-    /// Message retention policy (e.g., keep latest N messages, time-based retention, keep forever).
-    pub retention: crate::topic::retention::RetentionPolicy,
-    /// Message ordering policy (topic-global ordering or per-key partitioned ordering).
-    pub ordering: crate::topic::ordering::OrderingPolicy,
-    /// Maximum number of subscribers for the topic; new subscribers are rejected once the limit is reached.
-    pub max_subscribers: usize,
-    /// Maximum number of publishers for the topic; new publishers are rejected once the limit is reached.
-    pub max_publishers: usize,
-    /// Whether historical message replay is enabled.
-    ///
-    /// When enabled, new subscribers can request consumption of historical
-    /// messages by specifying an offset.
-    pub replay_enabled: bool,
-    /// Whether topic-level snapshots are enabled.
-    ///
-    /// When enabled, publishers can set snapshots, and new subscribers
-    /// automatically receive the latest snapshot upon joining.
-    pub snapshot_enabled: bool,
-    /// Optional TTL for snapshots produced on this topic.
-    /// `None` means snapshots never expire and are simply replaced.
-    pub snapshot_ttl: Option<std::time::Duration>,
-}
-
-impl DefaultTopicProfile {
-    /// Validate that the profile values are sensible. Returns
-    /// `Err` with a human-readable message on a problem.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_subscribers == 0 {
-            return Err("max_subscribers must be > 0");
-        }
-        if self.max_publishers == 0 {
-            return Err("max_publishers must be > 0");
-        }
-        Ok(())
-    }
-}
-
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -245,9 +196,11 @@ impl Default for ServerConfig {
             dedupe_window: Duration::from_secs(60),
             max_auth_failures: 3,
             codec_offer: Vec::new(),
-            default_topic_profile: DefaultTopicProfile::default(),
+            default_topic_profile: TopicProfile::default(),
             #[cfg(feature = "redis")]
             redis: None,
+            #[cfg(feature = "cluster")]
+            cluster: None,
         }
     }
 }
@@ -279,23 +232,6 @@ impl ServerConfig {
         self.heartbeat
             .validate()
             .map_err(|e| format!("heartbeat: {e}"))?;
-        self.default_topic_profile
-            .validate()
-            .map_err(|e| format!("default_topic_profile: {e}"))?;
         Ok(())
-    }
-}
-
-impl Default for DefaultTopicProfile {
-    fn default() -> Self {
-        Self {
-            retention: crate::topic::retention::RetentionPolicy::Latest,
-            ordering: crate::topic::ordering::OrderingPolicy::Topic,
-            max_subscribers: 10_000,
-            max_publishers: 10_000,
-            replay_enabled: true,
-            snapshot_enabled: true,
-            snapshot_ttl: None,
-        }
     }
 }
