@@ -178,6 +178,20 @@ pub struct DefaultTopicProfile {
     pub snapshot_ttl: Option<std::time::Duration>,
 }
 
+impl DefaultTopicProfile {
+    /// Validate that the profile values are sensible. Returns
+    /// `Err` with a human-readable message on a problem.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_subscribers == 0 {
+            return Err("max_subscribers must be > 0");
+        }
+        if self.max_publishers == 0 {
+            return Err("max_publishers must be > 0");
+        }
+        Ok(())
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -194,6 +208,40 @@ impl Default for ServerConfig {
             codec_offer: Vec::new(),
             default_topic_profile: DefaultTopicProfile::default(),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Set of capability flags advertised in the Welcome frame so
+    /// clients can negotiate feature-aware behaviour on connect.
+    /// Keep this list in sync with the implemented feature set.
+    pub fn supported_features(&self) -> Vec<&'static str> {
+        vec![
+            "replay",
+            "snapshot",
+            "resume",
+            "topic_profiles",
+            "backpressure",
+        ]
+    }
+
+    /// Validate the configuration and reject nonsensical values
+    /// such as zero heartbeat intervals. Returns `Err` with a
+    /// human-readable message; `Ok(())` on success.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_payload_bytes == 0 {
+            return Err("max_payload_bytes must be > 0".into());
+        }
+        if self.max_send_queue_bytes == 0 {
+            return Err("max_send_queue_bytes must be > 0".into());
+        }
+        self.heartbeat
+            .validate()
+            .map_err(|e| format!("heartbeat: {e}"))?;
+        self.default_topic_profile
+            .validate()
+            .map_err(|e| format!("default_topic_profile: {e}"))?;
+        Ok(())
     }
 }
 
