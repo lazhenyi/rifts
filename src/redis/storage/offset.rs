@@ -9,12 +9,17 @@ use async_trait::async_trait;
 use crate::redis::connection::RedisPool;
 use crate::storage::OffsetStore;
 
+/// Redis-backed monotonic offset store.
+///
+/// Uses `HINCRBY` on a shared Redis hash for atomic, distributed offset
+/// allocation across multiple server instances.
 #[derive(Clone)]
 pub struct RedisOffsetStore {
     pool: RedisPool,
 }
 
 impl RedisOffsetStore {
+    /// Create a new [`RedisOffsetStore`] backed by the given Redis connection pool.
     pub fn new(pool: RedisPool) -> Self {
         Self { pool }
     }
