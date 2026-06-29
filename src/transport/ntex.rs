@@ -92,7 +92,10 @@ where
                         }
                         Ok(ntex::ws::Message::Close(_)) => vec![b'C'],
                         Ok(_) => continue,
-                        Err(_) => break,
+                        Err(e) => {
+                            tracing::warn!(error = ?e, "ntex reader stream error");
+                            break;
+                        }
                     };
                     if tx.send(raw).await.is_err() {
                         break;
