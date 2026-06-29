@@ -28,7 +28,7 @@
 use std::collections::HashMap;
 
 use crate::error::{Result, RiftError, SessionReject};
-use crate::session::offset_tracker::{OffsetTracker, ResumeDecision, decide};
+use crate::session::offset_tracker::{ResumeDecision, decide};
 use crate::session::session::Session;
 use crate::topic::TopicStore;
 
