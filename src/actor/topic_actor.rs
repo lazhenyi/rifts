@@ -266,13 +266,21 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
             }
             TopicMsg::Snapshot { reply_to } => {
                 let latest = self.log.latest(&self.topic_name);
-                let snap = latest.map(|e| crate::storage::StoredSnapshot {
-                    snapshot_id: Uuid::new_v4().to_string(),
-                    topic: self.topic_name.clone(),
-                    base_offset: e.offset,
-                    payload: e.payload.clone(),
-                    created_at: now_ms(),
-                    expires_at: None,
+                let snap = latest.map(|e| {
+                    // Derive the snapshot_id deterministically from
+                    // the underlying entry's offset so repeated
+                    // snapshots of the same log state produce the
+                    // same id. Callers can correlate snapshots
+                    // across calls without scanning timestamps.
+                    let snapshot_id = format!("snap-{}", e.offset);
+                    crate::storage::StoredSnapshot {
+                        snapshot_id,
+                        topic: self.topic_name.clone(),
+                        base_offset: e.offset,
+                        payload: e.payload.clone(),
+                        created_at: now_ms(),
+                        expires_at: None,
+                    }
                 });
                 let _ = reply_to.send(Ok(snap));
             }
@@ -280,13 +288,14 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
                 let _ = reply_to.send(self.offsets.head(&self.topic_name));
             }
             TopicMsg::DropSink { sink_id, reply_to } => {
+                // Count first, then retain. Counting without
+                // allocating a Vec is materially cheaper for
+                // large subscriber sets.
                 let count = self
                     .subscribers
                     .iter()
                     .filter(|(_, sub)| sub.sink.id() == sink_id)
-                    .map(|(id, _)| *id)
-                    .collect::<Vec<_>>()
-                    .len();
+                    .count();
                 self.subscribers.retain(|_, sub| sub.sink.id() != sink_id);
                 let _ = reply_to.send(count);
             }
@@ -334,6 +343,17 @@ impl<O: OffsetStore, L: LogStore, D: DedupeStore, S: SnapshotStore> TopicActor<O
             return Err(RiftError::Frame(
                 crate::error::FrameReject::RequiredFieldMissing("topic"),
             ));
+        }
+        // Defensive: if the frame's topic doesn't match this
+        // actor's topic, refuse the publish. Without this check a
+        // misrouted frame could land in the wrong log and reach
+        // the wrong subscribers.
+        if let Some(t) = frame.topic.as_deref() {
+            if t != self.topic_name {
+                return Err(RiftError::Topic(crate::error::TopicReject::NotFound(
+                    t.to_string(),
+                )));
+            }
         }
         let message_id = frame.message_id.as_deref().ok_or_else(|| {
             RiftError::Frame(crate::error::FrameReject::RequiredFieldMissing(
