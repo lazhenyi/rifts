@@ -374,8 +374,16 @@ impl<
 
     async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
         if let Some(topic) = self.fanout.unsubscribe(id) {
-            if let Some(entry) = self.store.get(&topic) {
-                entry.dec_subscriber();
+            // If the topic entry is gone (explicitly removed) we
+            // cannot decrement its subscriber count. Log a warning
+            // so operators can spot the discrepancy; the
+            // subscription itself is already removed.
+            match self.store.get(&topic) {
+                Some(entry) => entry.dec_subscriber(),
+                None => tracing::warn!(
+                    topic = %topic,
+                    "topic entry missing during unsubscribe; subscriber counter not decremented",
+                ),
             }
             Ok(true)
         } else {
