@@ -47,7 +47,8 @@ use crate::config::ServerConfig;
 use crate::connection::Connection;
 use crate::error::Result;
 #[cfg(feature = "websocket")]
-use crate::error::{ConfigError, RiftError};
+use crate::error::ConfigError;
+use crate::error::RiftError;
 use crate::metrics::Metrics;
 use crate::session::AuthProvider;
 use crate::session::resume::ResumeManager;
