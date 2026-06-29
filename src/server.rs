@@ -227,6 +227,11 @@ impl RiftServerBuilder {
         self
     }
 
+    /// Finalize configuration and construct a [`RiftServer`].
+    ///
+    /// If no broker was set via [`builder`](RiftServer::builder) methods,
+    /// defaults to [`InMemoryBroker`](crate::broker::InMemoryBroker) with
+    /// the configured default topic profile.
     pub fn build(self) -> Result<RiftServer> {
         let metrics = self.metrics.unwrap_or_else(|| Arc::new(Metrics::new()));
         let config_max_payload = self.config.max_payload_bytes;
