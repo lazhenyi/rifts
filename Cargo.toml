@@ -36,6 +36,12 @@ tokio-frameworks = ["axum", "warp"]
 all-frameworks = ["axum", "actix-web", "warp", "ntex"]
 redis = ["dep:redis"]
 
+# TCP mesh cluster with auto-discovery and cross-node message routing.
+cluster = ["dep:rand"]
+
+# All cluster + Redis features enabled.
+all-cluster = ["cluster", "redis"]
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.24", features = ["url"], optional = true }
@@ -111,11 +117,6 @@ harness = false
 [[bench]]
 name = "broker_memory"
 path = "benches/broker_memory.rs"
-harness = false
-
-[[bench]]
-name = "broker_actor"
-path = "benches/broker_actor.rs"
 harness = false
 
 [[bench]]
