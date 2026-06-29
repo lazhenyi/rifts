@@ -63,3 +63,87 @@ ntex = { version = "2", optional = true, features = ["ws"] }
 
 [dev-dependencies]
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+tempfile = "3"
+
+[[bench]]
+name = "wire_frame"
+path = "benches/wire_frame.rs"
+harness = false
+
+[[bench]]
+name = "serde_codecs"
+path = "benches/serde_codecs.rs"
+harness = false
+
+[[bench]]
+name = "frame_model"
+path = "benches/frame_model.rs"
+harness = false
+
+[[bench]]
+name = "message_model"
+path = "benches/message_model.rs"
+harness = false
+
+[[bench]]
+name = "flow_control"
+path = "benches/flow_control.rs"
+harness = false
+
+[[bench]]
+name = "fanout"
+path = "benches/fanout.rs"
+harness = false
+
+[[bench]]
+name = "topic_store"
+path = "benches/topic_store.rs"
+harness = false
+
+[[bench]]
+name = "storage_memory"
+path = "benches/storage_memory.rs"
+harness = false
+
+[[bench]]
+name = "broker_memory"
+path = "benches/broker_memory.rs"
+harness = false
+
+[[bench]]
+name = "broker_actor"
+path = "benches/broker_actor.rs"
+harness = false
+
+[[bench]]
+name = "session_resume"
+path = "benches/session_resume.rs"
+harness = false
+
+[[bench]]
+name = "ack_metrics"
+path = "benches/ack_metrics.rs"
+harness = false
+
+[[bench]]
+name = "e2e_inprocess"
+path = "benches/e2e_inprocess.rs"
+harness = false
+
+[[bench]]
+name = "sled_store"
+path = "benches/sled_store.rs"
+harness = false
+required-features = ["sled"]
+
+[[bench]]
+name = "websocket_loop"
+path = "benches/websocket_loop.rs"
+harness = false
+required-features = ["client"]
+
+[[bench]]
+name = "throughput"
+path = "benches/throughput.rs"
+harness = false

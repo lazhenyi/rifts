@@ -60,7 +60,7 @@ fn frame_encode_decode_round_trip() {
         ..Frame::default()
     };
     let bytes = encode_frame(&f).unwrap();
-    let back = decode_binary_frame(&bytes).unwrap();
+    let back = decode_binary_frame(&bytes, rifts::DEFAULT_MAX_BINARY_PAYLOAD).unwrap();
     assert_eq!(back.frame_type, FrameType::Data);
     assert_eq!(back.codec, FrameCodec::Json);
     assert_eq!(back.frame_id, 42);
