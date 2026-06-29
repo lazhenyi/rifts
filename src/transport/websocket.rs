@@ -217,7 +217,7 @@ impl TransportConnection for WebSocketConnection {
                 }
                 WsMessage::Ping(_) | WsMessage::Pong(_) => continue,
                 WsMessage::Close(_close) => {
-                    return Err(RiftError::Session(crate::error::SessionReject::Expired));
+                    return Err(RiftError::Session(crate::error::SessionReject::Closed));
                 }
                 _ => continue,
             }
