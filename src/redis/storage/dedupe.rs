@@ -8,12 +8,18 @@ use async_trait::async_trait;
 use crate::redis::connection::RedisPool;
 use crate::storage::DedupeStore;
 
+/// Redis-backed deduplication store using per-key TTL.
+///
+/// Each message key is stored as a Redis set member with an expiry, providing
+/// distributed deduplication across multiple server instances sharing the same
+/// Redis cluster.
 #[derive(Clone)]
 pub struct RedisDedupeStore {
     pool: RedisPool,
 }
 
 impl RedisDedupeStore {
+    /// Create a new [`RedisDedupeStore`] backed by the given Redis connection pool.
     pub fn new(pool: RedisPool) -> Self {
         Self { pool }
     }
