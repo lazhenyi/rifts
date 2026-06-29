@@ -103,6 +103,13 @@ pub enum SessionReject {
     #[error("session expired")]
     Expired,
 
+    /// The connection was closed by the remote peer (normal
+    /// WebSocket close, not an idle-timeout). This is distinct
+    /// from `Expired` so callers can avoid triggering session
+    /// resumption logic in response to a clean shutdown.
+    #[error("session closed by peer")]
+    Closed,
+
     /// The client's epoch does not match the one recorded by the server.
     ///
     /// An epoch conflict indicates the server has restarted or undergone
