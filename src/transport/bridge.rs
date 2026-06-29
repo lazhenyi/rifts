@@ -137,7 +137,7 @@ impl TransportConnection for BridgeConnection {
         match raw.first() {
             Some(b'B') => decode_binary_frame(&raw[1..], DEFAULT_MAX_BINARY_PAYLOAD),
             Some(b'T') => decode_text_frame(&raw[1..]),
-            Some(b'C') => Err(RiftError::Session(crate::error::SessionReject::Expired)),
+            Some(b'C') => Err(RiftError::Session(crate::error::SessionReject::Closed)),
             _ => Err(RiftError::other(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "invalid bridge frame tag",
