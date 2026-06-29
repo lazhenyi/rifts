@@ -183,6 +183,12 @@ impl Ack {
     }
 }
 
+/// Default per-session cap on outstanding tracked messages. Tuned to
+/// accommodate bursty workloads (e.g. 10 K outstanding / session)
+/// while still bounding the worst-case memory consumption of a
+/// single misbehaving session.
+pub const DEFAULT_MAX_OUTSTANDING_PER_SESSION: usize = 10_000;
+
 /// Tracks outstanding (sent-but-not-acked) frames per session.
 ///
 /// The `AckManager` is shared across all connections via
@@ -196,6 +202,11 @@ impl Ack {
 pub struct AckManager {
     /// Map from session id to (message id → deadline in ms since epoch).
     outstanding: Mutex<HashMap<String, HashMap<String, i64>>>,
+    /// Per-session cap on outstanding ack-tracked messages. New
+    /// `track` calls beyond this limit return `false` so the caller
+    /// can reject / disconnect a client that is not consuming
+    /// acks fast enough.
+    max_outstanding_per_session: usize,
 }
 
 impl Default for AckManager {
@@ -207,8 +218,15 @@ impl Default for AckManager {
 impl AckManager {
     /// Create a new, empty acknowledgement manager.
     pub fn new() -> Self {
+        Self::with_capacity(DEFAULT_MAX_OUTSTANDING_PER_SESSION)
+    }
+
+    /// Create a new manager with a custom per-session outstanding
+    /// cap.
+    pub fn with_capacity(max_outstanding_per_session: usize) -> Self {
         Self {
             outstanding: Mutex::new(HashMap::new()),
+            max_outstanding_per_session,
         }
     }
 
@@ -216,16 +234,23 @@ impl AckManager {
     ///
     /// The `timeout` is added to the current time to compute the deadline
     /// after which the message is considered timed out.
-    pub fn track(&self, session_id: &str, message_id: &str, timeout: Duration) {
+    ///
+    /// Returns `false` (without recording) if the session already has
+    /// `max_outstanding_per_session` tracked messages; callers
+    /// should treat this as backpressure and either drop the
+    /// message or close the connection.
+    pub fn track(&self, session_id: &str, message_id: &str, timeout: Duration) -> bool {
         // Use `saturating_add` so a pathologically large `timeout`
         // (e.g. `Duration::MAX`) does not produce a negative
         // deadline via `as i64` truncation.
         let deadline = now_ms().saturating_add(timeout.as_millis().try_into().unwrap_or(i64::MAX));
-        self.outstanding
-            .lock()
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(message_id.to_string(), deadline);
+        let mut g = self.outstanding.lock();
+        let entry = g.entry(session_id.to_string()).or_default();
+        if entry.len() >= self.max_outstanding_per_session {
+            return false;
+        }
+        entry.insert(message_id.to_string(), deadline);
+        true
     }
 
     /// Mark a message as acknowledged.
