@@ -4,7 +4,7 @@
 //! sections 5.4 and 13. When a client reconnects after a transport
 //! interruption, it presents its `SessionId`, the epoch it last knew, and
 //! its last-acknowledged offsets. The [`ResumeManager`] validates these
-//! against the server's current state and returns a [`ResumeOutcome`]
+//! against the server's current state and returns a [`ResumeDecision`]
 //! telling the caller what action to take.
 //!
 //! ## Resume Flow
@@ -15,7 +15,7 @@
 //!    - Is the session still alive (not closed/expired)?
 //!    - Does the client's epoch match the server's current epoch?
 //!    - What do the client's offsets tell us about missed data?
-//! 4. A [`ResumeOutcome`] is returned and acted upon by the broker layer.
+//! 4. A [`ResumeDecision`] is returned and acted upon by the broker layer.
 //!
 //! ## Epoch Validation
 //!
@@ -28,58 +28,10 @@
 use std::collections::HashMap;
 
 use crate::error::{Result, RiftError, SessionReject};
-use crate::session::offset_tracker::{ResumeDecision, decide};
+use crate::session::offset_tracker::ResumeDecision;
+use crate::session::offset_tracker::decide;
 use crate::session::session::Session;
 use crate::topic::TopicStore;
-
-/// High-level outcome of a resume attempt.
-///
-/// This enum is the public-facing counterpart of
-/// [`ResumeDecision`](crate::session::offset_tracker::ResumeDecision),
-/// translated into actionable guidance for the server's broker layer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeOutcome {
-    /// Session fully resumed. The client's offsets match the server's
-    /// head and no replay is needed. The client may proceed normally.
-    Resumed,
-
-    /// Some topics required a replay. The client should process the
-    /// replayed frames before continuing with new subscriptions.
-    Partial,
-
-    /// The server is still replaying data to the client. The client
-    /// should wait until the replay completes before sending new
-    /// messages.
-    Replaying,
-
-    /// The client must pull a fresh snapshot for at least one topic
-    /// because the topic no longer exists on the server or its data
-    /// has been compacted away.
-    SnapshotRequired,
-
-    /// The client submitted empty offsets, indicating a cold start.
-    /// It must re-subscribe to all desired topics from scratch.
-    ColdStart,
-
-    /// The resume attempt was rejected (e.g., epoch mismatch, client
-    /// ahead of server). The client must establish a new session.
-    Rejected,
-}
-
-/// Convert a low-level [`ResumeDecision`] into the high-level
-/// [`ResumeOutcome`] used by the broker layer.
-impl From<ResumeDecision> for ResumeOutcome {
-    fn from(d: ResumeDecision) -> Self {
-        match d {
-            ResumeDecision::FullResume => ResumeOutcome::Resumed,
-            ResumeDecision::PartialResume => ResumeOutcome::Partial,
-            ResumeDecision::Replaying => ResumeOutcome::Replaying,
-            ResumeDecision::SnapshotRequired => ResumeOutcome::SnapshotRequired,
-            ResumeDecision::ColdStart => ResumeOutcome::ColdStart,
-            ResumeDecision::Rejected => ResumeOutcome::Rejected,
-        }
-    }
-}
 
 /// Resume manager that coordinates session resumption.
 ///
@@ -100,49 +52,30 @@ impl ResumeManager {
         Self {}
     }
 
-    /// Evaluate a resume attempt and return the appropriate outcome.
+    /// Evaluate a resume attempt and return the appropriate decision.
     ///
-    /// This method performs three checks in order:
+    /// This method performs two checks in order:
     ///
     /// 1. **Liveness** -- Is the session still alive (not in `Closed`
     ///    state)? Returns [`SessionReject::Expired`](crate::error::SessionReject::Expired)
     ///    if not.
-    /// 2. **Epoch match** -- Does `incoming_epoch` match the session's
-    ///    current epoch? Returns [`SessionReject::Conflict`](crate::error::SessionReject::Conflict)
-    ///    if not.
-    /// 3. **Offset analysis** -- Delegates to
+    /// 2. **Offset analysis** -- Delegates to
     ///    [`decide`](crate::session::offset_tracker::decide) to compare
     ///    the client's offsets against the server's head offsets.
-    ///
-    /// # Arguments
-    ///
-    /// * `session` -- The existing server-side session being resumed.
-    /// * `incoming_epoch` -- The epoch the client claims in its resume
-    ///   request.
-    /// * `last_offsets` -- The last offsets the client processed, keyed
-    ///   by topic name.
-    /// * `topic_offsets` -- The server's current head offsets per topic.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the session is expired.
     ///
     /// **Note**: epoch validation is performed by the caller
     /// ([`Connection::handshake`]) *before* the epoch is bumped for the
     /// new incarnation, so this method does not repeat the check.
-    /// Passing the bumped epoch here would trivially match
-    /// `session.current_epoch()` and make the check a no-op.
     pub fn evaluate(
         &self,
         session: &Session,
-        _server_epoch: u32,
         last_offsets: &HashMap<String, i64>,
         topic_offsets: &HashMap<String, i64>,
-    ) -> Result<ResumeOutcome> {
+    ) -> Result<ResumeDecision> {
         if !session.is_alive() {
             return Err(RiftError::Session(SessionReject::Expired));
         }
-        Ok(decide(last_offsets, topic_offsets).into())
+        Ok(decide(last_offsets, topic_offsets))
     }
 
     /// Compute the head offset per topic currently in the store.
@@ -177,23 +110,18 @@ mod tests {
     use crate::topic::profile::TopicProfile;
 
     #[test]
-    fn evaluate_no_longer_checks_epoch() {
-        // Epoch validation moved to Connection::handshake (performed
-        // *before* bump_epoch), so evaluate accepts any _server_epoch
-        // value without error.
+    fn evaluate_checks_liveness() {
         let m = ResumeManager::new();
         let s = Session::new(
             crate::session::session::SessionId::new(),
             ClientId::new("c"),
         );
-        s.bump_epoch(); // server at epoch 2
+        s.bump_epoch();
         let mut last = HashMap::new();
         last.insert("t".into(), 1);
         let mut head = HashMap::new();
         head.insert("t".into(), 5);
-        // Passing a mismatched epoch should now succeed — the caller is
-        // responsible for epoch validation before bumping.
-        let r = m.evaluate(&s, 1, &last, &head);
+        let r = m.evaluate(&s, &last, &head);
         assert!(r.is_ok());
     }
 
@@ -208,8 +136,8 @@ mod tests {
         last.insert("t".into(), 4);
         let mut head = HashMap::new();
         head.insert("t".into(), 5);
-        let r = m.evaluate(&s, s.current_epoch(), &last, &head).unwrap();
-        assert_eq!(r, ResumeOutcome::Replaying);
+        let r = m.evaluate(&s, &last, &head).unwrap();
+        assert_eq!(r, ResumeDecision::Replaying);
     }
 
     #[test]
