@@ -51,6 +51,6 @@ pub mod store;
 
 pub use auth::{AllowAllAuth, AuthContext, AuthHints, AuthProvider, TokenAuth};
 pub use offset_tracker::{OffsetTracker, ResumeDecision};
-pub use resume::{ResumeManager, ResumeOutcome};
+pub use resume::ResumeManager;
 pub use session::{ClientId, Session, SessionId, SessionState};
 pub use store::SessionStore;
