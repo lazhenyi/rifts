@@ -119,7 +119,7 @@ mod sled_impl {
             };
             cache.insert(topic.to_string(), next);
             let key = encode::offset_key(topic);
-            self.engine.put(&key, &next.to_be_bytes());
+            let _ = self.engine.put(&key, &next.to_be_bytes());
             next
         }
 
@@ -141,7 +141,7 @@ mod sled_impl {
 
         async fn remove(&self, topic: &str) {
             self.cache.lock().remove(topic);
-            self.engine.delete(&encode::offset_key(topic));
+            let _ = self.engine.delete(&encode::offset_key(topic));
         }
     }
 }

@@ -143,11 +143,11 @@ mod sled_impl {
             let key = encode::snapshot_key(topic, &stored.snapshot_id);
             match serde_json::to_vec(&stored) {
                 Ok(value) => {
-                    self.engine.put(&key, &value);
+                    let _ = self.engine.put(&key, &value);
                     let prefix = encode::snapshot_prefix(topic);
                     for (k, _) in self.engine.scan_prefix(&prefix) {
                         if k != key {
-                            self.engine.delete(&k);
+                            let _ = self.engine.delete(&k);
                         }
                     }
                 }
@@ -183,7 +183,7 @@ mod sled_impl {
         async fn remove(&self, topic: &str) {
             let prefix = encode::snapshot_prefix(topic);
             for (k, _) in self.engine.scan_prefix(&prefix) {
-                self.engine.delete(&k);
+                let _ = self.engine.delete(&k);
             }
         }
 

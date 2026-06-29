@@ -5,7 +5,6 @@
 //! All methods are async to avoid blocking the Tokio runtime.
 
 use async_trait::async_trait;
-use redis::AsyncCommands;
 
 use crate::redis::connection::RedisPool;
 use crate::storage::OffsetStore;

@@ -155,7 +155,7 @@ mod sled_impl {
                     .map(|(k, _)| k)
                     .collect();
                 for k in &expired {
-                    self.engine.delete(k);
+                    let _ = self.engine.delete(k);
                 }
                 total += expired.len();
             }

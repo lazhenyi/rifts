@@ -2,7 +2,6 @@
 //! All methods are async.
 
 use async_trait::async_trait;
-use redis::AsyncCommands;
 
 use crate::redis::connection::RedisPool;
 use crate::storage::LogStore;

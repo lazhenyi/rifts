@@ -144,7 +144,7 @@ mod sled_impl {
                     return;
                 }
             };
-            self.engine.put(&key, &value);
+            let _ = self.engine.put(&key, &value);
 
             match retention {
                 RetentionPolicy::Count(n) => {
@@ -152,7 +152,7 @@ mod sled_impl {
                     if all.len() > n {
                         let drop = all.len() - n;
                         for (k, _) in &all[..drop] {
-                            self.engine.delete(k);
+                            let _ = self.engine.delete(k);
                         }
                     }
                 }
@@ -168,21 +168,21 @@ mod sled_impl {
                             false
                         }
                     }) {
-                        self.engine.delete(k);
+                        let _ = self.engine.delete(k);
                     }
                 }
                 RetentionPolicy::Latest => {
                     let all = self.engine.scan_prefix(&encode::log_prefix(topic));
                     for (k, _) in all.iter() {
                         if *k != key {
-                            self.engine.delete(k);
+                            let _ = self.engine.delete(k);
                         }
                     }
                 }
                 RetentionPolicy::None => {
                     let all = self.engine.scan_prefix(&encode::log_prefix(topic));
                     for (k, _) in &all {
-                        self.engine.delete(k);
+                        let _ = self.engine.delete(k);
                     }
                 }
                 RetentionPolicy::Size(_) | RetentionPolicy::Durable => {}
@@ -214,7 +214,7 @@ mod sled_impl {
         async fn remove(&self, topic: &str) {
             let prefix = encode::log_prefix(topic);
             for (k, _) in self.engine.scan_prefix(&prefix) {
-                self.engine.delete(&k);
+                let _ = self.engine.delete(&k);
             }
         }
     }

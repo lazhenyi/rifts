@@ -101,7 +101,7 @@ fn bench_log_range(c: &mut Criterion) {
     for &n in &[10usize, 100] {
         group.bench_with_input(BenchmarkId::new("count", n), &n, |b, &n| {
             let store = MemoryLogStore::new();
-            for i in 0..n {
+            for _i in 0..n {
                 rt.block_on(store.append(
                     "bench.topic",
                     build_event_log_entry(n as i64, payload_of(64)),
@@ -178,7 +178,7 @@ fn bench_dedupe_sweep(c: &mut Criterion) {
                 || {
                     let store = MemoryDedupeStore::new();
                     let short_window = Duration::from_millis(0);
-                    for i in 0..n {
+                    for _i in 0..n {
                         rt.block_on(store.check_and_record(
                             "bench.topic",
                             &format!("key-{i}"),
