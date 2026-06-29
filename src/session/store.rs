@@ -58,9 +58,15 @@ impl SessionStore {
     /// Insert or replace a session in the store.
     ///
     /// If a session with the same ID already exists, it is replaced
-    /// and the old session is returned.
+    /// and the old session is returned. The old session's offset
+    /// history is also forgotten so it does not leak after a
+    /// session-id reuse.
     pub fn insert(&self, session: Arc<Session>) -> Option<Arc<Session>> {
-        self.inner.write().insert(session.id.0.clone(), session)
+        let old = self.inner.write().insert(session.id.0.clone(), session);
+        if let Some(ref prev) = old {
+            self.offset_tracker.forget(&prev.id);
+        }
+        old
     }
 
     /// Remove a session from the store and clean up its offset data.
