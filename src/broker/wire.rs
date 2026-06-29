@@ -68,6 +68,8 @@ pub enum WireMsg {
     /// out the message. The response is a [`PublishResult`](WireMsg::PublishResult)
     /// or an [`Error`](WireMsg::Error).
     Publish {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The frame to publish, containing topic, message ID,
         /// payload, and metadata.
         frame: Frame,
@@ -80,6 +82,8 @@ pub enum WireMsg {
     /// [`SubscribeResult`](WireMsg::SubscribeResult) with the
     /// allocated subscription ID, or an [`Error`](WireMsg::Error).
     Subscribe {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The topic name to subscribe to.
         topic: String,
         /// The subscriber's delivery preference (live, replay,
@@ -97,6 +101,8 @@ pub enum WireMsg {
     /// [`UnsubscribeResult`](WireMsg::UnsubscribeResult) indicating
     /// whether the subscription existed.
     Unsubscribe {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The subscription ID to cancel, as returned by
         /// [`SubscribeResult`](WireMsg::SubscribeResult).
         id: u64,
@@ -109,6 +115,8 @@ pub enum WireMsg {
     /// [`DropSinkResult`](WireMsg::DropSinkResult) with the count of
     /// removed subscriptions.
     DropSink {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The sink identifier whose subscriptions should be removed.
         sink_id: u64,
     },
@@ -120,6 +128,8 @@ pub enum WireMsg {
     /// [`ReplayResult`](WireMsg::ReplayResult) containing the payload
     /// bytes, or an [`Error`](WireMsg::Error).
     Replay {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The topic name to replay from.
         topic: String,
         /// Inclusive start offset.
@@ -133,6 +143,8 @@ pub enum WireMsg {
     /// The response is a [`SnapshotResult`](WireMsg::SnapshotResult)
     /// with an optional snapshot, or an [`Error`](WireMsg::Error).
     Snapshot {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The topic name to snapshot.
         topic: String,
     },
@@ -142,6 +154,8 @@ pub enum WireMsg {
     /// The response is a
     /// [`SubscriberCountResult`](WireMsg::SubscriberCountResult).
     SubscriberCount {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The topic name to query.
         topic: String,
     },
@@ -151,6 +165,8 @@ pub enum WireMsg {
     /// The response is a
     /// [`HeadOffsetResult`](WireMsg::HeadOffsetResult).
     HeadOffset {
+        /// Caller-assigned correlation id echoed in the response.
+        request_id: u32,
         /// The topic name to query.
         topic: String,
     },
@@ -161,6 +177,8 @@ pub enum WireMsg {
     /// Contains the outcome of the publish operation, including the
     /// assigned offset and whether the message was a duplicate.
     PublishResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The publish outcome with offset and duplicate flag.
         outcome: PublishOutcome,
     },
@@ -169,6 +187,8 @@ pub enum WireMsg {
     ///
     /// Contains the newly allocated subscription ID.
     SubscribeResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The subscription ID for the newly created subscription.
         id: u64,
     },
@@ -177,6 +197,8 @@ pub enum WireMsg {
     ///
     /// Indicates whether the subscription was found and removed.
     UnsubscribeResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// `true` if the subscription existed and was removed, `false`
         /// if it was not found.
         ok: bool,
@@ -186,6 +208,8 @@ pub enum WireMsg {
     ///
     /// Contains the number of subscriptions that were removed.
     DropSinkResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The number of subscriptions that were removed.
         count: usize,
     },
@@ -195,6 +219,8 @@ pub enum WireMsg {
     /// Contains the payload bytes for each message in the requested
     /// offset range.
     ReplayResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The payload bytes for each replayed message, in offset
         /// order.
         entries: Vec<Bytes>,
@@ -205,6 +231,8 @@ pub enum WireMsg {
     /// Contains the snapshot if one exists (and has not expired), or
     /// `None` if no snapshot is available.
     SnapshotResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The requested snapshot, or `None` if unavailable.
         snapshot: Option<StoredSnapshot>,
     },
@@ -214,6 +242,8 @@ pub enum WireMsg {
     ///
     /// Contains the number of active subscribers for the topic.
     SubscriberCountResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The subscriber count for the queried topic.
         count: usize,
     },
@@ -222,6 +252,8 @@ pub enum WireMsg {
     ///
     /// Contains the highest allocated offset for the topic.
     HeadOffsetResult {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// The head offset for the queried topic.
         offset: i64,
     },
@@ -231,6 +263,8 @@ pub enum WireMsg {
     /// Contains a machine-readable error code and a human-readable
     /// error message.
     Error {
+        /// Correlation id matching the original request.
+        request_id: u32,
         /// A short, machine-readable error code (e.g. "TOPIC_NOT_FOUND").
         code: String,
         /// A human-readable description of the error.
@@ -346,6 +380,7 @@ mod tests {
     fn round_trip_publish() {
         let mut codec = WireCodec::default();
         let msg = WireMsg::Publish {
+            request_id: 42,
             frame: Frame {
                 topic: Some("t".into()),
                 message_id: Some("m1".into()),
@@ -359,7 +394,8 @@ mod tests {
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
 
         match decoded {
-            WireMsg::Publish { frame } => {
+            WireMsg::Publish { request_id, frame } => {
+                assert_eq!(request_id, 42);
                 assert_eq!(frame.topic.as_deref(), Some("t"));
                 assert_eq!(frame.message_id.as_deref(), Some("m1"));
             }
@@ -371,6 +407,7 @@ mod tests {
     fn round_trip_publish_result() {
         let mut codec = WireCodec::default();
         let msg = WireMsg::PublishResult {
+            request_id: 7,
             outcome: PublishOutcome {
                 offset: 42,
                 duplicate: false,
@@ -382,7 +419,11 @@ mod tests {
         let decoded = codec.decode(&mut buf).unwrap().unwrap();
 
         match decoded {
-            WireMsg::PublishResult { outcome } => {
+            WireMsg::PublishResult {
+                request_id,
+                outcome,
+            } => {
+                assert_eq!(request_id, 7);
                 assert_eq!(outcome.offset, 42);
                 assert!(!outcome.duplicate);
             }
