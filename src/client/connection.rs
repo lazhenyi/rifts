@@ -10,7 +10,7 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::ack::AckStatus;
 use crate::frame::{Codec, Frame, FrameType};
-use crate::message::SubscribeMode;
+use crate::broker::SubscribeIntent;
 use crate::message::command::Reply;
 use crate::protocol::hello::{Ready, Welcome};
 use crate::transport::frame_codec::{
@@ -29,14 +29,15 @@ type WsWriter =
 type WsReader = futures_util::stream::SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Per-connection state. Dropped on disconnect and recreated on reconnect.
-#[allow(dead_code)]
 pub(crate) struct ConnectionInner {
     pub(crate) writer: Arc<Mutex<WsWriter>>,
     pub(crate) session_id: String,
     pub(crate) epoch: u32,
     pub(crate) ready: Ready,
+    #[allow(dead_code)]
     pub(crate) pending_replies: Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>,
     pub(crate) disconnect_notify: Arc<Notify>,
+    #[allow(dead_code)]
     pub(crate) heartbeat_state: Arc<HeartbeatState>,
 }
 
@@ -524,13 +525,13 @@ async fn dispatch_frame(
     }
 }
 
-fn mode_str(mode: SubscribeMode) -> &'static str {
+fn mode_str(mode: SubscribeIntent) -> &'static str {
     match mode {
-        SubscribeMode::Live => "live",
-        SubscribeMode::Replay => "replay",
-        SubscribeMode::SnapshotThenLive => "snapshot_then_live",
-        SubscribeMode::Latest => "latest",
-        SubscribeMode::Passive => "passive",
-        SubscribeMode::Ephemeral => "ephemeral",
+        SubscribeIntent::Live => "live",
+        SubscribeIntent::Replay { .. } => "replay",
+        SubscribeIntent::SnapshotThenLive => "snapshot_then_live",
+        SubscribeIntent::Latest => "latest",
+        SubscribeIntent::Passive => "passive",
+        SubscribeIntent::Ephemeral => "ephemeral",
     }
 }
