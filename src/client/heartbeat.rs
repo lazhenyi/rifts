@@ -3,8 +3,6 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use futures_util::SinkExt;
-use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -80,7 +78,6 @@ async fn heartbeat_loop(
     max_missed: u32,
     jitter_ms: u32,
 ) {
-    let mut rng = StdRng::from_os_rng();
     let mut consecutive_encode_failures = 0u32;
     loop {
         // Add positive jitter in [0, jitter_ms] so the total wait
@@ -88,7 +85,7 @@ async fn heartbeat_loop(
         // jitter from the random value, which produced a wait that
         // could be shorter than ping_interval).
         let jitter = if jitter_ms > 0 {
-            Duration::from_millis(rng.random_range(0..=jitter_ms as u64))
+            Duration::from_millis(rand::random_range(0..=jitter_ms as u64))
         } else {
             Duration::ZERO
         };
@@ -116,7 +113,7 @@ async fn heartbeat_loop(
         consecutive_encode_failures = 0;
         {
             let mut w = writer.lock().await;
-            if w.send(WsMessage::Binary(encoded.to_vec())).await.is_err() {
+            if w.send(WsMessage::Binary(encoded)).await.is_err() {
                 break;
             }
         }
