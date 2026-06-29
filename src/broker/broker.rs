@@ -11,13 +11,6 @@
 //!   storage backed by in-memory data structures. Ideal for development,
 //!   testing, and lightweight deployments that do not require persistence
 //!   across restarts.
-//! - [`RemoteBroker`](super::RemoteBroker) — connects to an external broker
-//!   node over a framed TCP connection using the wire protocol defined in
-//!   [`crate::broker::wire`]. Suitable for distributed deployments where
-//!   the gateway and broker run in separate processes.
-//! - [`ActorBroker`](super::ActorBroker) — delegates each topic to an
-//!   independent Tokio actor task via a [`TopicRegistry`](crate::actor::TopicRegistry),
-//!   allowing publishes to different topics to execute concurrently.
 //!
 //! # Frame serialization
 //!
