@@ -30,6 +30,7 @@ use redis::AsyncCommands;
 
 use crate::broker::broker::{Broker, PublishOutcome};
 use crate::broker::fanout::{ConnectionSink, SubscribeIntent, SubscriptionId};
+use crate::broker::router::{Route, TopicRouter};
 use crate::error::{MessageReject, Result, RiftError, SystemReject};
 use crate::frame::Frame;
 use crate::redis::connection::RedisPool;
