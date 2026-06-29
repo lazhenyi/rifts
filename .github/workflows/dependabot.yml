@@ -5,6 +5,10 @@ on:
     - cron: "0 9 * * 1" # every Monday 09:00 UTC
   workflow_dispatch: # manual trigger
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   update:
     name: Check for dependency updates
@@ -14,8 +18,10 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
-      - name: Install cargo-edit
-        run: cargo install cargo-edit
+      - name: Install cargo-edit and cargo-outdated
+        run: |
+          cargo install cargo-edit --locked
+          cargo install cargo-outdated --locked
 
       - name: Run cargo update
         run: cargo update
@@ -34,6 +40,6 @@ jobs:
           title: "chore(deps): weekly dependency update"
           body: |
             Automated dependency update via Dependabot workflow.
-            - Run `cargo update` to refresh Cargo.lock
-            - Tests pass: ${{ job.status }}
+            - `cargo update` refreshed Cargo.lock
+            - Tests: ${{ job.status }}
           labels: dependencies

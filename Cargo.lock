@@ -2337,7 +2337,6 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-tungstenite 0.24.0",
- "tokio-util",
  "tracing",
  "tracing-subscriber",
  "ulid",
@@ -2825,7 +2824,6 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
- "futures-util",
  "pin-project-lite",
  "tokio",
 ]

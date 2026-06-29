@@ -51,7 +51,6 @@ dashmap = "6"
 thiserror = "1"
 tracing = "0.1"
 async-trait = "0.1"
-tokio-util = { version = "0.7", features = ["rt", "codec"] }
 sled = { version = "0.34", optional = true }
 rand = { version = "0.9", optional = true }
 
