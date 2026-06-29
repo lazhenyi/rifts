@@ -290,12 +290,11 @@ impl<
                 .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.to_string())))?
         };
 
-        if !route.entry.can_publish() {
+        if !route.entry.try_inc_publisher() {
             return Err(RiftError::Topic(TopicReject::PublisherLimit(
                 topic.to_string(),
             )));
         }
-        route.entry.inc_publisher();
 
         // Dedupe.
         let mut duplicate = false;
@@ -362,12 +361,11 @@ impl<
             let route = router
                 .route(topic, None)
                 .ok_or_else(|| RiftError::Topic(TopicReject::NotFound(topic.to_string())))?;
-            if !route.entry.can_subscribe() {
+            if !route.entry.try_inc_subscriber() {
                 return Err(RiftError::Topic(TopicReject::SubscriberLimit(
                     topic.to_string(),
                 )));
             }
-            route.entry.inc_subscriber();
         }
         Ok(self.fanout.subscribe(topic, intent, sink))
     }
@@ -434,6 +432,14 @@ impl<
         if let Some(entry) = self.store.get(topic) {
             entry.dec_publisher();
         }
+    }
+
+    async fn maintain(&self) -> usize {
+        let swept = self.dedupe.sweep();
+        if swept > 0 {
+            tracing::debug!(swept, "dedupe sweep completed");
+        }
+        swept
     }
 }
 

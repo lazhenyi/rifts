@@ -27,7 +27,6 @@ impl SubscriptionTracker {
     }
 
     /// Returns the mode for a topic, if subscribed.
-    #[allow(dead_code)]
     pub(super) fn get(&self, topic: &str) -> Option<SubscribeIntent> {
         self.topics.get(topic).copied()
     }
@@ -38,14 +37,8 @@ impl SubscriptionTracker {
     }
 
     /// Returns the number of tracked subscriptions.
-    #[allow(dead_code)]
     pub(super) fn len(&self) -> usize {
         self.topics.len()
-    }
-
-    #[allow(dead_code)]
-    pub(super) fn is_empty(&self) -> bool {
-        self.topics.is_empty()
     }
 }
 

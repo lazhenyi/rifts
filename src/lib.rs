@@ -54,7 +54,6 @@
 //! | [`session`] | Session management — authentication, offset tracking, resume |
 //! | [`storage`] | Persistent storage engine — append log, offset index, dedupe, snapshot |
 //! | [`topic`] | Topic profile — retention policy, ordering policy, storage binding |
-//! | [`trace`] | Lightweight distributed tracing context |
 //! | [`transport`] | Transport-layer abstraction and framework adapters |
 //!
 //! [spec]: https://github.com/rift-proto/rifts
@@ -106,10 +105,6 @@ pub mod protocol;
 #[cfg(feature = "redis")]
 pub mod redis;
 
-/// TCP mesh cluster with auto-discovery and cross-node routing (feature `cluster`).
-#[cfg(feature = "cluster")]
-pub mod cluster;
-
 /// Server entry point — `RiftServer` and its Builder.
 pub mod server;
 
@@ -121,9 +116,6 @@ pub mod storage;
 
 /// Topic profile — retention policy, ordering policy, storage.
 pub mod topic;
-
-/// Lightweight distributed tracing context.
-pub mod trace;
 
 /// Transport-layer abstraction and framework adapters.
 pub mod transport;

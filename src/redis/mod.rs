@@ -39,20 +39,15 @@
 //! | [`fanout`] | Redis Pub/Sub → local fanout bridge |
 //! | [`registry`] | Redis-aware topic registry with Pub/Sub fanout |
 //! | [`broker`] | [`RedisActorBroker`] implementing [`Broker`](crate::broker::Broker) |
-//! | [`messages`] | Cross-instance wire message types |
 
 pub mod broker;
 pub mod connection;
 pub mod fanout;
-pub mod messages;
-pub mod registry;
 pub mod storage;
 
-// Re-export key types.
 pub use broker::RedisActorBroker;
 pub use connection::RedisPool;
 pub use fanout::FanoutBridge;
-pub use registry::RedisTopicRegistry;
 pub use storage::dedupe::RedisDedupeStore;
 pub use storage::log::RedisLogStore;
 pub use storage::offset::RedisOffsetStore;

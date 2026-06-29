@@ -96,6 +96,39 @@ impl SessionStore {
     pub fn is_empty(&self) -> bool {
         self.inner.read().is_empty()
     }
+
+    /// Remove sessions whose idle time exceeds `idle_timeout`.
+    ///
+    /// Sessions in `Closed` or `Draining` state are always considered
+    /// expired and are removed regardless of idle time. Active sessions
+    /// are removed only when their idle duration exceeds the timeout.
+    ///
+    /// Offsets belonging to removed sessions are forgotten. Returns the
+    /// number of sessions removed.
+    pub fn expire_sessions(&self, idle_timeout: std::time::Duration) -> usize {
+        let mut expired = Vec::new();
+        {
+            let guard = self.inner.read();
+            for (id, session) in guard.iter() {
+                let state = session.state();
+                match state {
+                    crate::session::SessionState::Closed
+                    | crate::session::SessionState::Draining => {
+                        expired.push(id.clone());
+                    }
+                    _ => {
+                        if session.idle() > idle_timeout {
+                            expired.push(id.clone());
+                        }
+                    }
+                }
+            }
+        }
+        for id in &expired {
+            self.remove(id);
+        }
+        expired.len()
+    }
 }
 
 impl Default for SessionStore {

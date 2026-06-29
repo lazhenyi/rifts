@@ -142,10 +142,10 @@ mod tests {
 
     #[test]
     fn topic_offsets_from_store() {
-        use crate::broker::offset_store::OffsetStore;
+        use crate::storage::{MemoryOffsetStore, OffsetStore};
         let m = ResumeManager::new();
         let store = TopicStore::new();
-        let offsets = OffsetStore::new();
+        let offsets = MemoryOffsetStore::new();
         let entry = store.get_or_create("t", TopicProfile::default()).unwrap();
         // Use OffsetStore for authoritative offsets.
         let o1 = offsets.alloc("t");

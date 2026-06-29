@@ -296,6 +296,38 @@ impl AckManager {
     pub fn forget(&self, session_id: &str) {
         self.outstanding.lock().remove(session_id);
     }
+
+    /// Reap timed-out messages across all sessions.
+    ///
+    /// Iterates over every tracked session, removes entries whose
+    /// deadline has passed, and then drops any session buckets that
+    /// became empty. Returns the total number of timed-out message
+    /// entries removed.
+    pub fn reap_all_timeouts(&self) -> usize {
+        let now = now_ms();
+        let mut g = self.outstanding.lock();
+        let mut total = 0;
+        // Collect expired entries per session, then clean up.
+        let mut empty_sessions = Vec::new();
+        for (sid, entries) in g.iter_mut() {
+            let expired: Vec<String> = entries
+                .iter()
+                .filter(|(_, deadline)| **deadline <= now)
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in &expired {
+                entries.remove(k);
+            }
+            total += expired.len();
+            if entries.is_empty() {
+                empty_sessions.push(sid.clone());
+            }
+        }
+        for sid in &empty_sessions {
+            g.remove(sid);
+        }
+        total
+    }
 }
 
 /// Type alias for a shared, reference-counted [`AckManager`].

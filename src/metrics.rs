@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 ///
 /// All fields are `AtomicU64` and support concurrent reads and writes.
 /// Increment atomically via [`Metrics::inc`] and [`Metrics::add`].
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub struct Metrics {
     // ── Connection Metrics ─────────────────────────────────────────────────────
     /// Current number of active connections (incremented on open, decremented on close).
@@ -105,37 +105,6 @@ impl Metrics {
     /// Useful for batch counting (e.g., processing multiple messages at once).
     pub fn add(&self, counter: &AtomicU64, n: u64) {
         counter.fetch_add(n, Ordering::Relaxed);
-    }
-}
-
-impl std::fmt::Debug for Metrics {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Metrics")
-            .field(
-                "active_connections",
-                &self.active_connections.load(Ordering::Relaxed),
-            )
-            .field(
-                "connection_open_total",
-                &self.connection_open_total.load(Ordering::Relaxed),
-            )
-            .field(
-                "connection_close_total",
-                &self.connection_close_total.load(Ordering::Relaxed),
-            )
-            .field(
-                "messages_in_total",
-                &self.messages_in_total.load(Ordering::Relaxed),
-            )
-            .field(
-                "messages_out_total",
-                &self.messages_out_total.load(Ordering::Relaxed),
-            )
-            .field(
-                "messages_dropped_total",
-                &self.messages_dropped_total.load(Ordering::Relaxed),
-            )
-            .finish()
     }
 }
 

@@ -137,6 +137,11 @@ pub enum SessionReject {
     /// offset is too far behind.
     #[error("snapshot required for topic: {0}")]
     SnapshotRequired(String),
+
+    /// The connection timed out due to inactivity — no frames were
+    /// received within the configured `idle_timeout` window.
+    #[error("connection idle timeout")]
+    IdleTimeout,
 }
 
 /// Topic operation rejection reasons.

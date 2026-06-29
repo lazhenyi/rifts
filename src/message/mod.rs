@@ -95,24 +95,6 @@ pub enum DeliveryMode {
     DurableOrdered,
 }
 
-impl DeliveryMode {
-    /// Returns the default delivery mode for a given message class (spec section 8.2).
-    ///
-    /// Used as the fallback when no delivery mode is explicitly specified at message creation time.
-    pub fn default_for(class: MessageClass) -> Self {
-        match class {
-            MessageClass::Event => DeliveryMode::AtLeastOnce,
-            MessageClass::Command => DeliveryMode::AtLeastOnce,
-            MessageClass::Reply => DeliveryMode::AtLeastOnce,
-            MessageClass::State => DeliveryMode::LatestOnly,
-            MessageClass::Datagram => DeliveryMode::BestEffort,
-            MessageClass::Stream => DeliveryMode::DurableOrdered,
-            MessageClass::Snapshot => DeliveryMode::AtLeastOnce,
-            MessageClass::System => DeliveryMode::AtLeastOnce,
-        }
-    }
-}
-
 // Re-export SubscribeIntent from the broker layer for convenience.
 pub use crate::broker::fanout::SubscribeIntent;
 

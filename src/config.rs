@@ -142,13 +142,6 @@ pub struct ServerConfig {
     /// constructed from this configuration.
     #[cfg(feature = "redis")]
     pub redis: Option<RedisConfig>,
-
-    /// Cluster configuration (only available with feature `cluster`).
-    ///
-    /// When set, the server can use a [`ClusterBroker`](crate::cluster::ClusterBroker)
-    /// for TCP mesh cluster communication. If `None`, cluster mode is disabled.
-    #[cfg(feature = "cluster")]
-    pub cluster: Option<crate::cluster::config::ClusterConfig>,
 }
 
 /// Redis connection configuration for multi-instance deployments.
@@ -199,8 +192,6 @@ impl Default for ServerConfig {
             default_topic_profile: TopicProfile::default(),
             #[cfg(feature = "redis")]
             redis: None,
-            #[cfg(feature = "cluster")]
-            cluster: None,
         }
     }
 }

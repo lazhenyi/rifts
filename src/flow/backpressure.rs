@@ -24,8 +24,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::frame::Priority;
-
 /// Backpressure strategy applied when the send queue is full.
 ///
 /// The server selects one of these strategies based on the topic profile,
@@ -366,15 +364,6 @@ pub enum BackpressureAction {
     SnapshotLater,
 }
 
-/// Whether a message's priority is eligible to be dropped under the
-/// `DropVolatile` strategy.
-///
-/// Returns `true` for [`Priority::Volatile`] and [`Priority::Background`];
-/// returns `false` for all other priorities and `None`.
-pub fn is_volatile(p: Option<Priority>) -> bool {
-    matches!(p, Some(Priority::Volatile) | Some(Priority::Background))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,13 +407,5 @@ mod tests {
         assert!(bp.is_overloaded());
         bp.release(10);
         assert!(!bp.is_overloaded());
-    }
-
-    #[test]
-    fn volatile_filter() {
-        assert!(is_volatile(Some(Priority::Volatile)));
-        assert!(is_volatile(Some(Priority::Background)));
-        assert!(!is_volatile(Some(Priority::Normal)));
-        assert!(!is_volatile(None));
     }
 }

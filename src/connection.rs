@@ -29,6 +29,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
@@ -344,6 +345,7 @@ impl Connection {
         // leaking publisher slots.
         let published_topics_r = self.published_topics.clone();
         let conn_id = self.conn_id;
+        let idle_timeout = self.config.idle_timeout;
         let reader_handle = tokio::spawn(async move {
             reader_task(
                 transport_slot_r,
@@ -357,6 +359,7 @@ impl Connection {
                 max_bytes_r,
                 published_topics_r,
                 conn_id,
+                idle_timeout,
             )
             .await
         });
@@ -682,21 +685,39 @@ async fn reader_task(
     max_bytes: usize,
     published_topics: Arc<parking_lot::Mutex<HashSet<String>>>,
     conn_id: u64,
+    idle_timeout: Duration,
 ) -> Result<()> {
     loop {
         let frame = {
-            let mut guard = transport_slot.lock().await;
-            let Some(transport) = guard.as_mut() else {
-                // Writer released the transport — connection is done.
-                return Ok(());
+            let read_fut = async {
+                let mut guard = transport_slot.lock().await;
+                let Some(transport) = guard.as_mut() else {
+                    // Writer released the transport — connection is done.
+                    return Err(RiftError::System(SystemReject::Internal(
+                        "transport released".into(),
+                    )));
+                };
+                transport.read_frame().await
             };
-            match transport.read_frame().await {
-                Ok(f) => f,
-                Err(RiftError::Session(crate::error::SessionReject::Expired)) => {
+
+            match tokio::time::timeout(idle_timeout, read_fut).await {
+                Ok(Ok(f)) => f,
+                Ok(Err(RiftError::Session(crate::error::SessionReject::Expired))) => {
                     debug!(conn = conn_id, "peer closed (session expired)");
                     return Ok(());
                 }
-                Err(e) => return Err(e),
+                Ok(Err(e)) => return Err(e),
+                Err(_elapsed) => {
+                    debug!(
+                        conn = conn_id,
+                        timeout_secs = idle_timeout.as_secs(),
+                        "connection idle timeout"
+                    );
+                    metrics.inc(&metrics.connection_close_total);
+                    return Err(RiftError::Session(
+                        crate::error::SessionReject::IdleTimeout,
+                    ));
+                }
             }
         };
         metrics.inc(&metrics.messages_in_total);
@@ -1042,6 +1063,7 @@ fn rift_error_to_code(err: &RiftError) -> &'static str {
             crate::error::SessionReject::SnapshotRequired(_) => {
                 ErrorCode::SnapshotRequired.as_str()
             }
+            crate::error::SessionReject::IdleTimeout => ErrorCode::SessionExpired.as_str(),
         },
         RiftError::Topic(te) => match te {
             crate::error::TopicReject::NotFound(_) => ErrorCode::TopicNotFound.as_str(),

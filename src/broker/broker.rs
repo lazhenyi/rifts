@@ -163,6 +163,21 @@ pub trait Broker: Send + Sync {
     /// Default: no-op. Brokers that do not enforce a per-topic publisher
     /// limit can leave this unimplemented.
     async fn dec_publisher(&self, _topic: &str) {}
+
+    /// Perform periodic maintenance tasks.
+    ///
+    /// Called by the server on a regular interval (e.g. every 30s) to
+    /// allow the broker to run garbage collection: sweeping expired
+    /// deduplication entries, compacting logs, pruning stale state, etc.
+    ///
+    /// Returns the number of items cleaned up (e.g. dedupe entries swept,
+    /// log entries evicted). Implementations that have no background
+    /// maintenance to perform can leave the default (no-op) implementation.
+    ///
+    /// Default: no-op, returns 0.
+    async fn maintain(&self) -> usize {
+        0
+    }
 }
 
 /// Serialize a frame for fanout delivery to subscribers.

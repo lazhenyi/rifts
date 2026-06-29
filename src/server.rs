@@ -258,6 +258,19 @@ impl RiftServerBuilder {
             .resume_manager
             .unwrap_or_else(|| Arc::new(ResumeManager::new()));
 
+        let ack_manager: SharedAckManager = Arc::new(AckManager::new());
+        let gc_shutdown = Arc::new(tokio::sync::Notify::new());
+
+        // Spawn the background maintenance task.
+        let gc_broker = broker.clone();
+        let gc_session_store = session_store.clone();
+        let gc_ack = ack_manager.clone();
+        let gc_idle_timeout = self.config.idle_timeout;
+        let gc_notify = gc_shutdown.clone();
+        tokio::spawn(async move {
+            run_maintenance(gc_broker, gc_session_store, gc_ack, gc_idle_timeout, gc_notify).await;
+        });
+
         Ok(RiftServer {
             config: self.config,
             auth,
@@ -268,6 +281,8 @@ impl RiftServerBuilder {
             next_conn_id: Arc::new(AtomicU64::new(1)),
             session_store,
             resume_manager,
+            ack_manager,
+            gc_shutdown,
         })
     }
 }
@@ -303,6 +318,12 @@ pub struct RiftServer {
     session_store: SessionStore,
     /// Shared resume manager for evaluating session resume requests.
     resume_manager: Arc<ResumeManager>,
+    /// Shared ack manager for tracking outstanding acknowledgements
+    /// across connections and reaping timed-out entries.
+    ack_manager: SharedAckManager,
+    /// Shutdown notifier for the background maintenance task.
+    /// Signalled when the server's `run()` loop exits.
+    gc_shutdown: Arc<tokio::sync::Notify>,
 }
 
 impl RiftServer {
@@ -338,6 +359,7 @@ impl RiftServer {
             tokio::select! {
                 _ = shutdown.notified() => {
                     info!("shutdown signaled");
+                    self.gc_shutdown.notify_waiters();
                     return Ok(());
                 }
                 res = listener.accept() => {
@@ -365,13 +387,22 @@ impl RiftServer {
         self.spawn_connection(transport);
     }
 
+    /// Gracefully shut down the background maintenance task.
+    ///
+    /// Call this before dropping the server in framework mode to ensure
+    /// the maintenance task exits cleanly. In standalone mode this is
+    /// called automatically when `run()` returns.
+    pub fn shutdown(&self) {
+        self.gc_shutdown.notify_waiters();
+    }
+
     /// Internal helper: create and spawn a [`Connection`] for the given
     /// transport.
     fn spawn_connection(&self, transport: Box<dyn TransportConnection>) {
         let id = self
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let ack_manager: SharedAckManager = Arc::new(AckManager::new());
+        let ack_manager = self.ack_manager.clone();
         let offset_tracker = self.session_store.offset_tracker().clone();
         let connection = Connection::new(
             id,
@@ -397,6 +428,12 @@ impl RiftServer {
                 Ok(Ok(())) => {
                     tracing::debug!(conn = id, "connection ended cleanly");
                 }
+                Ok(Err(RiftError::Session(crate::error::SessionReject::IdleTimeout))) => {
+                    tracing::debug!(
+                        conn = id,
+                        "connection closed due to idle timeout"
+                    );
+                }
                 Ok(Err(e)) => {
                     error!(conn = id, "connection ended with error: {}", e);
                 }
@@ -405,5 +442,49 @@ impl RiftServer {
                 }
             }
         });
+    }
+}
+
+/// Interval at which the background maintenance task runs.
+const MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Background maintenance task — periodically sweeps dedupe entries,
+/// reaps ack timeouts, and expires idle sessions.
+///
+/// Runs until `shutdown` is notified, then performs a final sweep and
+/// exits.
+async fn run_maintenance(
+    broker: Arc<dyn Broker>,
+    session_store: SessionStore,
+    ack_manager: SharedAckManager,
+    idle_timeout: std::time::Duration,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    let mut interval = tokio::time::interval(MAINTENANCE_INTERVAL);
+    // Skip the first immediate tick so the server has time to start
+    // accepting connections before we run the first sweep.
+    interval.tick().await;
+
+    loop {
+        tokio::select! {
+            _ = shutdown.notified() => {
+                tracing::info!("maintenance task shutting down");
+                break;
+            }
+            _ = interval.tick() => {}
+        }
+
+        let swept = broker.maintain().await;
+        let sessions_expired = session_store.expire_sessions(idle_timeout);
+        let acks_reaped = ack_manager.reap_all_timeouts();
+
+        if swept > 0 || sessions_expired > 0 || acks_reaped > 0 {
+            tracing::debug!(
+                swept,
+                sessions_expired,
+                acks_reaped,
+                "maintenance sweep"
+            );
+        }
     }
 }

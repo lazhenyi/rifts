@@ -1,6 +1,6 @@
 [package]
 name = "rifts"
-version = "0.3.6"
+version = "0.3.7"
 edition = "2024"
 authors = ["Zhenyi <434836402@qq.com>"]
 description = "Rift Realtime Protocol / 1.0 — server + client implementation"
@@ -35,12 +35,6 @@ ntex = ["dep:ntex"]
 tokio-frameworks = ["axum", "warp"]
 all-frameworks = ["axum", "actix-web", "warp", "ntex"]
 redis = ["dep:redis"]
-
-# TCP mesh cluster with auto-discovery and cross-node message routing.
-cluster = ["dep:rand"]
-
-# All cluster + Redis features enabled.
-all-cluster = ["cluster", "redis"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -77,10 +71,6 @@ tempfile = "3"
 [[example]]
 name = "redis_multi_instance"
 required-features = ["redis"]
-
-[[example]]
-name = "cluster_node"
-required-features = ["cluster"]
 
 [[bench]]
 name = "wire_frame"

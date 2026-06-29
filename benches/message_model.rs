@@ -2,7 +2,7 @@
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rifts::message::event::{Event, decode_event_body, encode_event_body};
-use rifts::{DeliveryMode, Message, MessageClass, SubscribeIntent};
+use rifts::{Message, MessageClass, SubscribeIntent};
 
 mod common;
 
@@ -73,13 +73,6 @@ fn bench_class(c: &mut Criterion) {
         b.iter(|| {
             for c in &classes {
                 black_box(c.as_str());
-            }
-        });
-    });
-    group.bench_function("default_for", |b| {
-        b.iter(|| {
-            for c in &classes {
-                black_box(DeliveryMode::default_for(black_box(*c)));
             }
         });
     });

@@ -1,10 +1,8 @@
-//! Flow control benchmarks — backpressure controller and rate limiter.
+//! Flow control benchmarks — backpressure controller.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use rifts::Priority;
 use rifts::flow::{
-    BackpressureAction, BackpressureController, BackpressureStrategy, RateLimitTable, RateLimiter,
-    is_volatile,
+    BackpressureAction, BackpressureController, BackpressureStrategy,
 };
 
 mod common;
@@ -86,68 +84,11 @@ fn bench_bp_counters(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_rate_limiter(c: &mut Criterion) {
-    let mut group = c.benchmark_group("flow/rate_limiter");
-    group.bench_function("try_take_hit", |b| {
-        let rl = RateLimiter::new(1_000_000, 10);
-        b.iter(|| black_box(rl.try_take()));
-    });
-    group.bench_function("try_take_n", |b| {
-        let rl = RateLimiter::new(1_000_000, 100);
-        b.iter(|| black_box(rl.try_take_n(black_box(5))));
-    });
-    group.bench_function("try_take_exhausted", |b| {
-        let rl = RateLimiter::new(1, 1);
-        let _ = rl.try_take();
-        b.iter(|| black_box(rl.try_take()));
-    });
-    group.finish();
-}
-
-fn bench_rate_limit_table(c: &mut Criterion) {
-    let mut group = c.benchmark_group("flow/rate_limit_table");
-    group.bench_function("get_existing", |b| {
-        let table = RateLimitTable::new();
-        let _ = table.get("conn1/topic1", 100, 10);
-        b.iter(|| black_box(table.get(black_box("conn1/topic1"), 100, 10)));
-    });
-    group.bench_function("get_new", |b| {
-        let table = RateLimitTable::new();
-        let mut i = 0u64;
-        b.iter(|| {
-            i += 1;
-            let key = format!("conn{i}/topic");
-            black_box(table.get(black_box(&key), 100, 10))
-        });
-    });
-    group.finish();
-}
-
-fn bench_is_volatile(c: &mut Criterion) {
-    let mut group = c.benchmark_group("flow/is_volatile");
-    let cases = [
-        ("none", None),
-        ("background", Some(Priority::Background)),
-        ("volatile", Some(Priority::Volatile)),
-        ("normal", Some(Priority::Normal)),
-        ("critical", Some(Priority::Critical)),
-    ];
-    for (name, p) in cases {
-        group.bench_with_input(BenchmarkId::new("check", name), &p, |b, p| {
-            b.iter(|| black_box(is_volatile(black_box(*p))));
-        });
-    }
-    group.finish();
-}
-
 criterion_group!(
     benches,
     bench_bp_enqueue_accept,
     bench_bp_overloaded,
     bench_bp_release,
     bench_bp_counters,
-    bench_rate_limiter,
-    bench_rate_limit_table,
-    bench_is_volatile,
 );
 criterion_main!(benches);
