@@ -48,8 +48,7 @@ layer.
 | Build, configure, and run a Rift/1 server in under ten minutes.
 
 | xref:architecture.adoc[Architecture]
-| Full crate map (72 files), four‑layer model, broker dataflow, actor runtime,
-  RemoteBroker TCP protocol, persistence layer, flow control (backpressure +
+| Full crate map, broker dataflow, persistence layer, flow control (backpressure +
   rate limiting), metrics, trace context.
 
 | xref:protocol/index.adoc[Protocol Reference]
@@ -58,7 +57,7 @@ layer.
 
 | xref:examples.adoc[Examples]
 | Chat server, authenticated pub/sub, direct broker usage, Sled persistence,
-  actor‑based broker, RemoteBroker, custom AuthProvider, custom TopicProfile,
+  custom AuthProvider, custom TopicProfile,
   metrics export, flow control, trace context propagation.
 |===
 
