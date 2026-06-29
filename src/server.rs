@@ -43,7 +43,7 @@ use tracing::info;
 
 use crate::ack::{AckManager, SharedAckManager};
 use crate::broker::{Broker, InMemoryBroker};
-use crate::config::{DefaultTopicProfile, ServerConfig};
+use crate::config::ServerConfig;
 use crate::connection::Connection;
 use crate::error::Result;
 #[cfg(feature = "websocket")]
@@ -232,7 +232,7 @@ impl RiftServerBuilder {
         let config_max_payload = self.config.max_payload_bytes;
         let broker = self.broker.unwrap_or_else(|| {
             let topic_profile: crate::topic::TopicProfile =
-                self.config.default_topic_profile.clone().into();
+                self.config.default_topic_profile.clone();
             Arc::new(InMemoryBroker::new(
                 topic_profile,
                 self.config.dedupe_window,
@@ -405,33 +405,5 @@ impl RiftServer {
                 }
             }
         });
-    }
-}
-
-/// Conversion from the config-level [`DefaultTopicProfile`] to the
-/// topic-layer [`TopicProfile`](crate::topic::TopicProfile).
-///
-/// This conversion is used when the builder creates the default
-/// [`InMemoryBroker`].
-impl From<DefaultTopicProfile> for crate::topic::TopicProfile {
-    fn from(d: DefaultTopicProfile) -> Self {
-        // The `name` field of a TopicProfile acts as a
-        // template default applied to topics that don't
-        // specify their own. The empty string is used to
-        // signal "unset"; the per-topic entry will be
-        // named on creation.
-        Self {
-            name: String::new(),
-            retention: d.retention,
-            ordering: d.ordering,
-            max_subscribers: d.max_subscribers,
-            max_publishers: d.max_publishers,
-            rate_limit_per_publisher: None,
-            rate_limit_total: None,
-            replay_enabled: d.replay_enabled,
-            snapshot_enabled: d.snapshot_enabled,
-            snapshot_ttl: d.snapshot_ttl,
-            replay_window: std::time::Duration::from_secs(300),
-        }
     }
 }
