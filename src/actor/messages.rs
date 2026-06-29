@@ -183,16 +183,26 @@ impl std::fmt::Debug for TopicMsg {
     ///
     /// Prints only the variant name (e.g. `"Publish"`, `"Subscribe"`)
     /// without the fields, since `ConnectionSink` and `oneshot::Sender`
-    /// do not implement `Debug` in a meaningful way.
+    /// do not implement `Debug` in a meaningful way. Useful scalar
+    /// fields (topic / message_id / sink_id / offset range) are
+    /// surfaced for operational visibility.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TopicMsg::Publish { .. } => f.write_str("Publish"),
+            TopicMsg::Publish { frame, .. } => f
+                .debug_struct("Publish")
+                .field("topic", &frame.topic)
+                .field("message_id", &frame.message_id)
+                .finish(),
             TopicMsg::Subscribe { .. } => f.write_str("Subscribe"),
-            TopicMsg::Unsubscribe { .. } => f.write_str("Unsubscribe"),
-            TopicMsg::Replay { .. } => f.write_str("Replay"),
+            TopicMsg::Unsubscribe { id, .. } => write!(f, "Unsubscribe {{ id: {:?} }}", id),
+            TopicMsg::Replay { from, to, .. } => {
+                write!(f, "Replay {{ from: {}, to: {} }}", from, to)
+            }
             TopicMsg::Snapshot { .. } => f.write_str("Snapshot"),
             TopicMsg::HeadOffset { .. } => f.write_str("HeadOffset"),
-            TopicMsg::DropSink { .. } => f.write_str("DropSink"),
+            TopicMsg::DropSink { sink_id, .. } => {
+                write!(f, "DropSink {{ sink_id: {} }}", sink_id)
+            }
             TopicMsg::Shutdown { .. } => f.write_str("Shutdown"),
         }
     }
