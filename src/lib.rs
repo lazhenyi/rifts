@@ -105,6 +105,10 @@ pub mod metrics;
 /// Protocol constants — handshake, heartbeat, error codes, versioning, close codes.
 pub mod protocol;
 
+/// Redis-backed multi-instance broker and storage (feature `redis`).
+#[cfg(feature = "redis")]
+pub mod redis;
+
 /// Server entry point — `RiftServer` and its Builder.
 pub mod server;
 
