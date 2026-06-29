@@ -54,9 +54,7 @@ pub enum ClusterMsg {
     },
 
     /// A node is voluntarily leaving the cluster.
-    Leave {
-        from: crate::cluster::node::NodeId,
-    },
+    Leave { from: crate::cluster::node::NodeId },
 
     // -- Cross-node RPC ------------------------------------------------
     /// Cross-node fanout: deliver a published message to subscribers
@@ -77,10 +75,7 @@ pub enum ClusterMsg {
     },
 
     /// Response to an `ActorForward` request.
-    ActorForwardResult {
-        request_id: u32,
-        result: Bytes,
-    },
+    ActorForwardResult { request_id: u32, result: Bytes },
 }
 
 // -- Tokio codec --------------------------------------------------------

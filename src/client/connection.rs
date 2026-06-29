@@ -9,8 +9,8 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 use crate::ack::AckStatus;
-use crate::frame::{Codec, Frame, FrameType};
 use crate::broker::SubscribeIntent;
+use crate::frame::{Codec, Frame, FrameType};
 use crate::message::command::Reply;
 use crate::protocol::hello::{Ready, Welcome};
 use crate::transport::frame_codec::{

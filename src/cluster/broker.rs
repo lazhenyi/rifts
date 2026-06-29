@@ -26,13 +26,13 @@ use tracing::{info, warn};
 
 use crate::broker::broker::{Broker, PublishOutcome};
 use crate::broker::fanout::{ConnectionSink, FanoutEngine, SubscribeIntent, SubscriptionId};
-use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::connection::{ConnectionPool, MeshConnection};
 use crate::cluster::discovery::{CompositeDiscovery, Discovery, SeedDiscovery};
 use crate::cluster::gossip::ClusterGossip;
 use crate::cluster::node::NodeId;
 use crate::cluster::router::MeshRouter;
+use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::error::{Result, RiftError, SystemReject};
 use crate::frame::Frame;
 use crate::storage::StoredSnapshot;
@@ -46,10 +46,7 @@ type ForwardMap = Arc<dashmap::DashMap<u32, oneshot::Sender<Bytes>>>;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) enum ForwardMsg {
     /// Replay historical messages for a topic.
-    Replay {
-        from: i64,
-        to: i64,
-    },
+    Replay { from: i64, to: i64 },
     /// Fetch the latest snapshot for a topic.
     Snapshot,
     /// Query the head offset for a topic.
@@ -291,10 +288,9 @@ impl ClusterBroker {
         msg: Bytes,
     ) {
         // Deserialize the ForwardMsg.
-        let fwd_msg: Result<ForwardMsg> = ciborium::from_reader(msg.as_ref())
-            .map_err(|e| {
-                RiftError::System(SystemReject::Internal(format!("actor forward decode: {e}")))
-            });
+        let fwd_msg: Result<ForwardMsg> = ciborium::from_reader(msg.as_ref()).map_err(|e| {
+            RiftError::System(SystemReject::Internal(format!("actor forward decode: {e}")))
+        });
         let fwd_msg = match fwd_msg {
             Ok(m) => m,
             Err(e) => {

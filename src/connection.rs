@@ -511,17 +511,17 @@ impl Connection {
                     for topic in last_offsets.keys() {
                         topic_offsets.insert(topic.clone(), self.broker.head_offset(topic).await);
                     }
-                    let outcome = match self.resume.evaluate(
-                        &existing,
-                        &last_offsets,
-                        &topic_offsets,
-                    ) {
-                        Ok(o) => o,
-                        Err(e) => {
-                            self.metrics.inc(&self.metrics.resume_failed_total);
-                            return Err(e);
-                        }
-                    };
+                    let outcome =
+                        match self
+                            .resume
+                            .evaluate(&existing, &last_offsets, &topic_offsets)
+                        {
+                            Ok(o) => o,
+                            Err(e) => {
+                                self.metrics.inc(&self.metrics.resume_failed_total);
+                                return Err(e);
+                            }
+                        };
                     (existing, Some(outcome))
                 }
                 None => {

@@ -17,8 +17,8 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{info, warn};
 
-use crate::cluster::wire::{ClusterCodec as WireCodec, ClusterMsg as WireMsg};
 use crate::cluster::node::NodeId;
+use crate::cluster::wire::{ClusterCodec as WireCodec, ClusterMsg as WireMsg};
 use crate::error::{Result, RiftError, SystemReject};
 
 /// Default channel capacity for inbound message dispatch.

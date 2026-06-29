@@ -25,9 +25,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
-use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::cluster::config::ClusterConfig;
 use crate::cluster::node::{NodeId, NodeInfo, NodeState};
+use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::now_ms;
 
 /// Thread-safe member table.

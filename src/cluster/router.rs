@@ -23,9 +23,9 @@ use tracing::warn;
 
 use crate::broker::broker::serialize_frame_for_fanout;
 use crate::broker::fanout::FanoutEngine;
-use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::cluster::connection::ConnectionPool;
 use crate::cluster::node::NodeId;
+use crate::cluster::wire::ClusterMsg as WireMsg;
 use crate::frame::Frame;
 
 /// The cross-node message router.

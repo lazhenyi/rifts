@@ -58,7 +58,7 @@ pub use events::ClientEvent;
 pub use rift_client::{CommandOpts, PublishOpts, RiftClient, StateOpts};
 
 // Re-export commonly used types for convenience.
-pub use crate::frame::{Codec, Frame, FrameFlags, FrameType, Priority};
 pub use crate::broker::SubscribeIntent;
+pub use crate::frame::{Codec, Frame, FrameFlags, FrameType, Priority};
 pub use crate::message::command::Reply;
 pub use crate::protocol::close::CloseCode;
