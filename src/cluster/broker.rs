@@ -315,19 +315,13 @@ impl ClusterBroker {
                 let entries = local.replay(&topic, from_off, to).await.unwrap_or_default();
                 serialize_vec_bytes(&entries)
             }
-            ForwardMsg::Snapshot { .. } => {
+            ForwardMsg::Snapshot => {
                 let snap = local.snapshot(&topic).await.unwrap_or(None);
                 serialize_option_snapshot(&snap)
             }
-            ForwardMsg::HeadOffset { .. } => {
+            ForwardMsg::HeadOffset => {
                 let off = local.head_offset(&topic).await;
                 serialize_i64(off)
-            }
-            // Unrecognized variants — return an error.
-            _ => {
-                let err =
-                    RiftError::System(SystemReject::Internal("unsupported forward variant".into()));
-                serialize_error(&err)
             }
         };
 

@@ -263,10 +263,10 @@ mod sled_impl {
             let all = self.engine.scan_prefix(&[]);
             let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
             for (k, _) in &all {
-                if let Some(sep_pos) = k.iter().position(|&b| b == encode::SEP) {
-                    if let Ok(t) = std::str::from_utf8(&k[..sep_pos]) {
-                        topics.insert(t.to_string());
-                    }
+                if let Some(sep_pos) = k.iter().position(|&b| b == encode::SEP)
+                    && let Ok(t) = std::str::from_utf8(&k[..sep_pos])
+                {
+                    topics.insert(t.to_string());
                 }
             }
             for topic in topics {

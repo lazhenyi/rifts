@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Update the benchmark results section in README.adoc.
 //!
 //! Scans `target/criterion/** /new/estimates.json` (Criterion 0.5 output) and
@@ -38,12 +39,12 @@ fn collect_estimates(criterion_dir: &Path) -> BTreeMap<String, BenchEstimate> {
         for entry in entries.filter_map(|e| e.ok()) {
             let path = entry.path();
             if path.is_dir() {
-                if path.file_name().map_or(false, |n| n == "new") {
+                if path.file_name().is_some_and(|n| n == "new") {
                     let estimates_path = path.join("estimates.json");
-                    if estimates_path.exists() {
-                        if let Some((name, estimate)) = parse_benchmark(&path) {
-                            results.insert(name, estimate);
-                        }
+                    if estimates_path.exists()
+                        && let Some((name, estimate)) = parse_benchmark(&path)
+                    {
+                        results.insert(name, estimate);
                     }
                 } else {
                     walk(&path, results);
@@ -83,7 +84,7 @@ fn parse_benchmark(new_dir: &Path) -> Option<(String, BenchEstimate)> {
     // Path: target/criterion/<group>/<bench_id>/new
     let grandparent = parent.parent()?;
     // Skip if grandparent is criterion_dir itself (flat bench)
-    let group: PathBuf = if grandparent.file_name().map_or(false, |n| n == "criterion") {
+    let group: PathBuf = if grandparent.file_name().is_some_and(|n| n == "criterion") {
         // Flat: bench_id is actually the group
         // Path: target/criterion/<group>/new
         // So parent is the group, and there's no bench_id
@@ -168,7 +169,7 @@ fn update_readme_section(original: &str, results: &BTreeMap<String, BenchEstimat
         new.push_str(&header);
         new.push('\n');
         new.push_str(&table);
-        new.push_str(&footer);
+        new.push_str(footer);
         new.push('\n');
         return new;
     }
@@ -216,7 +217,6 @@ fn main() {
     }
 
     let mut check_only = false;
-    let readme_path: &str;
 
     let positional: Vec<_> = args
         .iter()
@@ -238,7 +238,7 @@ fn main() {
         eprintln!("error: missing README path argument");
         std::process::exit(1);
     }
-    readme_path = positional[0].as_str();
+    let readme_path: &str = positional[0].as_str();
 
     let criterion_dir = Path::new("target").join("criterion");
     let results = collect_estimates(&criterion_dir);

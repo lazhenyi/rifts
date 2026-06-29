@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Multi-instance Redis integration test.
 //!
 //! This test requires a running Redis instance at
@@ -13,7 +14,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use rifts::broker::broker::{Broker, PublishOutcome};
+    use rifts::broker::broker::Broker;
     use rifts::broker::fanout::{SubscribeIntent, test_sink::CountingSink};
     use rifts::frame::{Codec, Frame, FrameFlags, FrameType};
     use rifts::redis::{

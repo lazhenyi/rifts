@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Session resume benchmarks — SessionStore, OffsetTracker, ResumeManager, decide.
 
 use std::collections::HashMap;
@@ -197,12 +198,7 @@ fn bench_resume_evaluate(c: &mut Criterion) {
             }
             let epoch = session.current_epoch();
             b.iter(|| {
-                black_box(rm.evaluate(
-                    black_box(&session),
-                    black_box(epoch),
-                    black_box(&last),
-                    black_box(&topic),
-                ))
+                black_box(rm.evaluate(black_box(&session), black_box(&last), black_box(&topic)))
             });
         });
     }

@@ -298,10 +298,10 @@ mod sled_impl {
             let mut latest: Option<StoredSnapshot> = None;
             for (_, v) in self.engine.scan_prefix(&prefix) {
                 if let Ok(s) = serde_json::from_slice::<StoredSnapshot>(&v) {
-                    if let Some(expires) = s.expires_at {
-                        if now > expires {
-                            continue;
-                        }
+                    if let Some(expires) = s.expires_at
+                        && now > expires
+                    {
+                        continue;
                     }
                     match &latest {
                         None => latest = Some(s),

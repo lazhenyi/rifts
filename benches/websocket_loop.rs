@@ -21,11 +21,11 @@ mod common;
 
 fn alloc_loopback_addr() -> SocketAddr {
     for _retry in 0..10 {
-        if let Ok(l) = TcpListener::bind("127.0.0.1:0") {
-            if let Ok(addr) = l.local_addr() {
-                drop(l);
-                return addr;
-            }
+        if let Ok(l) = TcpListener::bind("127.0.0.1:0")
+            && let Ok(addr) = l.local_addr()
+        {
+            drop(l);
+            return addr;
         }
         std::thread::sleep(Duration::from_millis(5));
     }

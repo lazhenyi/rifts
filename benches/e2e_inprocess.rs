@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    clippy::all,
+    unused_must_use
+)]
 //! End-to-end in-process benchmarks — full broker publish→fanout→subscriber path.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -53,10 +60,7 @@ fn bench_e2e_subscribe_publish_cycle(c: &mut Criterion) {
     for &n in SUBSCRIBER_COUNTS {
         group.bench_with_input(BenchmarkId::new("cycle", n), &n, |b, &n| {
             b.iter_batched(
-                || {
-                    let broker = default_broker(30_000, 2 * 1024 * 1024).into_arc();
-                    broker
-                },
+                || default_broker(30_000, 2 * 1024 * 1024).into_arc(),
                 |broker| {
                     for i in 0..n {
                         let _ = broker.subscribe(

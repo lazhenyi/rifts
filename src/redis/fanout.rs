@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use dashmap::DashMap;
-use redis::AsyncCommands;
 use tokio::sync::Notify;
 
 use crate::broker::fanout::{ConnectionSink, FanoutEngine, SubscribeIntent};

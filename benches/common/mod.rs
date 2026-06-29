@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Shared fixtures and helpers for the `rifts` benchmark suite.
 //!
 //! All benches compile as external crates, so they can only use the public

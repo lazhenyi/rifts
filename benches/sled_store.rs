@@ -1,15 +1,15 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Sled-backed storage benchmarks (feature `sled`).
 //!
 //! Uses `tempfile` to isolate sled data per benchmark iteration.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use rifts::storage::engine::SledEngine;
 use rifts::storage::{
     DedupeStore, LogStore, OffsetStore, SledDedupeStore, SledLogStore, SledOffsetStore,
-    SledSnapshotStore, SnapshotStore, log_key,
+    SledSnapshotStore, SnapshotStore,
 };
 use rifts::topic::{RetentionPolicy, TopicProfile, TopicStore};
 

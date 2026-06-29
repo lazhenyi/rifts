@@ -33,6 +33,7 @@ pub(crate) struct ConnectionInner {
     pub(crate) writer: Arc<Mutex<WsWriter>>,
     pub(crate) session_id: String,
     pub(crate) epoch: u32,
+    #[allow(dead_code)]
     pub(crate) ready: Ready,
     #[allow(dead_code)]
     pub(crate) pending_replies: Arc<Mutex<HashMap<String, oneshot::Sender<Reply>>>>,

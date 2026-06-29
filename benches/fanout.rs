@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Fanout engine benchmarks — subscribe, deliver, unsubscribe, drop_sink.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
@@ -14,7 +15,7 @@ fn bench_subscribe(c: &mut Criterion) {
     for &n in SUBSCRIBER_COUNTS {
         group.bench_with_input(BenchmarkId::new("live", n), &n, |b, &n| {
             b.iter_batched(
-                || FanoutEngine::new(),
+                FanoutEngine::new,
                 |engine| {
                     for i in 0..n {
                         black_box(engine.subscribe(

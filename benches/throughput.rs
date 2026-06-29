@@ -1,3 +1,4 @@
+#![allow(dead_code, unused_imports, unused_variables, clippy::all)]
 //! Throughput benchmarks — operations per second.
 //!
 //! Covers four dimensions:
@@ -151,7 +152,7 @@ fn bench_fanout_throughput(c: &mut Criterion) {
                         });
                         (broker, topic, build_data_frame(payload.clone(), 0))
                     },
-                    |(broker, topic, mut frame)| {
+                    |(broker, _topic, mut frame)| {
                         rt.block_on(async {
                             for i in 0..msgs {
                                 frame.frame_id = i as u64;

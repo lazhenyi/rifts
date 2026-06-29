@@ -32,6 +32,7 @@
 //!
 //! [`TopicEntry`]: crate::topic::TopicEntry
 
+#[allow(clippy::module_inception)]
 pub mod broker;
 pub mod dedupe;
 pub mod fanout;

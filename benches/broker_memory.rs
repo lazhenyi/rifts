@@ -1,3 +1,10 @@
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    clippy::all,
+    unused_must_use
+)]
 //! In-memory broker benchmarks — publish, dedupe, replay, subscribe, snapshot.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
