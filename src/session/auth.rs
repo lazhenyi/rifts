@@ -148,8 +148,9 @@ pub struct TokenAuth {
 
     /// Reverse index mapping each `ClientId` to the set of active
     /// tokens associated with it. Used to efficiently revoke all
-    /// tokens for a given client.
-    by_client: RwLock<HashMap<String, Vec<String>>>,
+    /// tokens for a given client. Uses `HashSet` so duplicate-token
+    /// registrations do not bloat the index.
+    by_client: RwLock<HashMap<String, std::collections::HashSet<String>>>,
 }
 
 impl TokenAuth {
@@ -182,7 +183,7 @@ impl TokenAuth {
                 .write()
                 .entry(client_id)
                 .or_default()
-                .push(token);
+                .insert(token);
         }
     }
 }
@@ -228,6 +229,11 @@ impl AuthProvider for TokenAuth {
     /// client-to-tokens index. After this call, any previously valid
     /// tokens for this client will fail authentication.
     async fn revoke(&self, client_id: &ClientId) -> Result<()> {
+        // Pop the client's token set atomically; if new tokens
+        // are registered concurrently, they will live past this
+        // revocation, which matches the caller-visible semantics
+        // ("revoke all tokens currently associated with the
+        // client at the time of the call").
         let tokens = {
             let mut bc = self.by_client.write();
             bc.remove(client_id.as_str()).unwrap_or_default()
