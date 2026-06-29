@@ -134,7 +134,8 @@ impl RemoteBroker {
         let stream = TcpStream::connect(addr)
             .await
             .map_err(|e| RiftError::System(SystemReject::Internal(e.to_string())))?;
-        let (framed_writer, mut framed_reader) = Framed::new(stream, WireCodec).split::<WireMsg>();
+        let (framed_writer, mut framed_reader) =
+            Framed::new(stream, WireCodec::default()).split::<WireMsg>();
         let framed = Arc::new(Mutex::new(framed_writer));
         let pending: Arc<DashMap<u32, oneshot::Sender<WireMsg>>> = Arc::new(DashMap::new());
         let sinks: Arc<DashMap<u64, mpsc::Sender<Bytes>>> = Arc::new(DashMap::new());
@@ -151,8 +152,17 @@ impl RemoteBroker {
                     WireMsg::Deliver {
                         sink_id, payload, ..
                     } => {
+                        // Use `try_send` to avoid blocking the reader
+                        // when a downstream sink is slow. A full
+                        // channel means the subscriber is backpressured
+                        // and we drop the payload rather than stall
+                        // all request/response traffic on the same
+                        // connection.
                         if let Some(tx) = sinks_r.get(&sink_id) {
-                            let _ = tx.send(payload).await;
+                            if let Err(e) = tx.try_send(payload) {
+                                tracing::warn!(sink_id, error = %e,
+                                    "dropping deliver payload: sink backpressured");
+                            }
                         }
                     }
                     // All response variants dispatch to pending. The
@@ -291,17 +301,25 @@ impl Broker for RemoteBroker {
         }
     }
 
-    async fn unsubscribe(&self, _id: SubscriptionId) -> Result<bool> {
-        // Remote broker handles subscriber tracking. The local side
-        // does not maintain its own subscription registry for remote
-        // subscriptions.
-        Ok(true)
+    async fn unsubscribe(&self, id: SubscriptionId) -> Result<bool> {
+        let resp = self.request(WireMsg::Unsubscribe { id: id.0 }).await?;
+        match resp {
+            WireMsg::UnsubscribeResult { ok } => Ok(ok),
+            WireMsg::Error { code, message } => Err(RiftError::System(SystemReject::Internal(
+                format!("broker error: {code} — {message}"),
+            ))),
+            _ => Err(RiftError::System(SystemReject::Internal(
+                "unexpected unsubscribe response".into(),
+            ))),
+        }
     }
 
     async fn drop_sink(&self, sink_id: u64) -> usize {
         self.sinks.remove(&sink_id);
-        let _ = self.request(WireMsg::DropSink { sink_id }).await;
-        1
+        match self.request(WireMsg::DropSink { sink_id }).await {
+            Ok(WireMsg::DropSinkResult { count }) => count as usize,
+            Ok(_) | Err(_) => 0,
+        }
     }
 
     async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {

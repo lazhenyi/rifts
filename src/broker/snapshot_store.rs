@@ -230,6 +230,7 @@ mod tests {
             event: Some("e".into()),
             payload: bytes::Bytes::from_static(b"hello"),
             timestamp: 0,
+            appended_at: None,
         });
         let snaps = SnapshotStore::new();
         let s = snaps
@@ -262,6 +263,7 @@ mod tests {
             event: Some("e".into()),
             payload: bytes::Bytes::from_static(b"hello"),
             timestamp: 0,
+            appended_at: None,
         });
         let snaps = SnapshotStore::new();
         // Capture with 0-ms TTL — expires immediately.

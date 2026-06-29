@@ -213,6 +213,11 @@ pub struct FanoutEngine {
     /// Maps subscription_id to (topic, sink). Used for fast
     /// unsubscription and sink-level cleanup.
     by_id: DashMap<SubscriptionId, (String, ConnectionSink)>,
+    /// Reverse index from sink_id to the set of subscription IDs
+    /// belonging to that sink. Lets `drop_sink` clean up in O(N)
+    /// where N is the number of subscriptions for *that* sink, not
+    /// the total number of subscriptions across all sinks.
+    by_sink: DashMap<u64, Vec<SubscriptionId>>,
     /// Monotonically increasing counter for allocating unique
     /// subscription IDs.
     seq: AtomicU64,
@@ -238,6 +243,7 @@ impl FanoutEngine {
         Self {
             by_topic: DashMap::new(),
             by_id: DashMap::new(),
+            by_sink: DashMap::new(),
             seq: AtomicU64::new(0),
         }
     }
@@ -267,11 +273,13 @@ impl FanoutEngine {
         sink: ConnectionSink,
     ) -> SubscriptionId {
         let id = SubscriptionId(self.seq.fetch_add(1, Ordering::Relaxed) + 1);
+        let sink_id = sink.id();
         self.by_topic
             .entry(topic.to_string())
             .or_default()
             .push((id, sink.clone()));
         self.by_id.insert(id, (topic.to_string(), sink));
+        self.by_sink.entry(sink_id).or_default().push(id);
         id
     }
 
@@ -284,9 +292,18 @@ impl FanoutEngine {
     /// `None` if the subscription was not found (already cancelled
     /// or never registered).
     pub fn unsubscribe(&self, id: SubscriptionId) -> Option<String> {
-        if let Some((_, (topic, _sink))) = self.by_id.remove(&id) {
+        if let Some((_, (topic, sink))) = self.by_id.remove(&id) {
             if let Some(mut list) = self.by_topic.get_mut(&topic) {
                 list.retain(|(sid, _)| *sid != id);
+            }
+            // Clean up reverse index.
+            let sink_id = sink.id();
+            if let Some(mut sids) = self.by_sink.get_mut(&sink_id) {
+                sids.retain(|sid| *sid != id);
+                if sids.is_empty() {
+                    drop(sids);
+                    self.by_sink.remove(&sink_id);
+                }
             }
             Some(topic)
         } else {
@@ -296,22 +313,25 @@ impl FanoutEngine {
 
     /// Drop all subscriptions owned by a particular connection sink.
     ///
-    /// Iterates over all registered subscriptions, finds those whose
-    /// sink's [`id`](FanoutSink::id) matches `sink_id`, and removes
-    /// them. Returns a list of topic names that had at least one
-    /// subscription removed, so the caller can decrement per-topic
-    /// subscriber counts.
+    /// Uses the reverse `by_sink` index to look up only this sink's
+    /// subscription IDs in O(N) where N is the number of
+    /// subscriptions for that specific sink, rather than scanning
+    /// every subscription in the engine. Returns a list of topic
+    /// names that had at least one subscription removed, so the
+    /// caller can decrement per-topic subscriber counts.
     ///
     /// This is typically called when a client connection is closed,
     /// to clean up all of its subscriptions in a single operation.
     pub fn drop_sink(&self, sink_id: u64) -> Vec<String> {
         let mut topics = Vec::new();
+        // O(N) over this sink's subscriptions only, not all
+        // subscriptions. We collect the IDs first so we can release
+        // the `by_sink` shard lock before mutating other shards.
         let ids: Vec<SubscriptionId> = self
-            .by_id
-            .iter()
-            .filter(|kv| kv.value().1.id() == sink_id)
-            .map(|kv| *kv.key())
-            .collect();
+            .by_sink
+            .get(&sink_id)
+            .map(|sids| sids.iter().copied().collect())
+            .unwrap_or_default();
         for id in ids {
             if let Some(topic) = self.unsubscribe(id) {
                 topics.push(topic);
@@ -322,31 +342,27 @@ impl FanoutEngine {
 
     /// Deliver a single serialized frame to all subscribers of a topic.
     ///
-    /// Looks up all subscribers registered for the given `topic` and
-    /// calls [`FanoutSink::deliver`] on each one with a clone of the
-    /// `frame`. Returns the number of successful deliveries. Failed
-    /// deliveries (where the sink returned an error) are silently
-    /// skipped; the caller should clean up stale subscriptions
-    /// separately.
-    ///
-    /// # Arguments
-    ///
-    /// * `topic` — The topic name whose subscribers should receive
-    ///   the frame.
-    /// * `frame` — The serialized frame bytes to deliver.
-    ///
-    /// # Returns
-    ///
-    /// The count of sinks that accepted the frame without error. A
-    /// return value of `0` means either the topic has no subscribers
-    /// or all deliveries failed.
+    /// Looks up all subscribers registered for the given `topic`,
+    /// clones the (subscription_id, sink) list while holding the
+    /// `by_topic` shard read lock, and then **releases the lock**
+    /// before invoking `sink.deliver()`. This prevents a slow sink
+    /// from blocking other operations on the same shard, and
+    /// eliminates the deadlock risk that would arise if a sink's
+    /// `deliver` callback re-entered the fanout engine (e.g. to
+    /// subscribe or unsubscribe on a topic that happens to hash to
+    /// the same shard).
     pub fn deliver(&self, topic: &str, frame: bytes::Bytes) -> usize {
+        // Clone the subscriber list while holding the shard read lock
+        // briefly, then drop the lock before calling out to each
+        // sink.
+        let subscribers: Vec<ConnectionSink> = match self.by_topic.get(topic) {
+            Some(list) => list.iter().map(|(_id, sink)| sink.clone()).collect(),
+            None => return 0,
+        };
         let mut ok = 0;
-        if let Some(list) = self.by_topic.get(topic) {
-            for (_id, sink) in list.iter() {
-                if sink.deliver(frame.clone()).is_ok() {
-                    ok += 1;
-                }
+        for sink in subscribers {
+            if sink.deliver(frame.clone()).is_ok() {
+                ok += 1;
             }
         }
         ok

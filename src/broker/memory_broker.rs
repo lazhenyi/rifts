@@ -314,24 +314,31 @@ impl<
             offset,
             publisher_session: frame.session_id.clone(),
             message_id: message_id.to_string(),
-            class: frame
-                .event
-                .clone()
-                .unwrap_or_else(|| MessageClass::Event.as_str().to_string()),
+            // `class` is the message class discriminator ("event" /
+            // "command" / "state" / "system" / "reply"). It is NOT
+            // the event name -- that goes in `event` below. The
+            // current Frame shape does not carry an explicit class
+            // field, so default to Event.
+            class: MessageClass::Event.as_str().to_string(),
             event: frame.event.clone(),
             payload: frame.payload.clone().unwrap_or_default(),
             timestamp: frame.timestamp,
+            // Stamped by `LogStore::append`; the in-memory path
+            // additionally updates it via `TopicEntry::append`.
+            appended_at: None,
         };
 
         // Persist to log store with retention from topic profile.
         let profile = route.entry.profile.read().clone();
         self.log.append(topic, entry.clone(), profile.retention);
 
-        // Record snapshot if enabled.
+        // Record snapshot if enabled. Capture a fresh snapshot through the
+        // configured `SnapshotStore` rather than the previous no-op, so
+        // subscribers can later fetch the topic state via
+        // `Broker::snapshot()`.
         if profile.snapshot_enabled {
-            // We capture a lightweight snapshot via log.latest().
-            // Full snapshots are the responsibility of the caller.
-            let _ = &profile;
+            self.snapshots
+                .capture(topic, &self.store, profile.snapshot_ttl);
         }
 
         // Fan out to subscribers (not duplicates).
@@ -388,7 +395,9 @@ impl<
     }
 
     async fn replay(&self, topic: &str, from: i64, to: i64) -> Result<Vec<Bytes>> {
-        // Use log store for replay.
+        // Use log store for replay. Return just the payloads (as before)
+        // to keep the public Broker contract stable; the per-entry
+        // offset is preserved internally for ordering guarantees.
         Ok(self
             .log
             .range(topic, from, to)
@@ -398,20 +407,11 @@ impl<
     }
 
     async fn snapshot(&self, topic: &str) -> Result<Option<crate::storage::StoredSnapshot>> {
-        // Capture from log store's latest state.
-        if let Some(entry) = self.log.latest(topic) {
-            let now = now_ms();
-            Ok(Some(crate::storage::StoredSnapshot {
-                snapshot_id: uuid::Uuid::new_v4().to_string(),
-                topic: topic.to_string(),
-                base_offset: entry.offset,
-                payload: entry.payload.clone(),
-                created_at: now,
-                expires_at: None,
-            }))
-        } else {
-            Ok(None)
-        }
+        // Delegate to the configured `SnapshotStore` so the returned
+        // snapshot has a stable `snapshot_id` derived from the actual
+        // persisted state, rather than a random UUID synthesized on
+        // every call.
+        Ok(self.snapshots.get(topic))
     }
 
     async fn subscriber_count(&self, topic: &str) -> usize {
