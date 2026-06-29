@@ -26,37 +26,45 @@ use parking_lot::Mutex;
 
 use crate::session::session::SessionId;
 
+/// Per-session cap on tracked topics to prevent unbounded growth
+/// from a single misbehaving session.
+pub const MAX_TOPICS_PER_SESSION: usize = 1024;
+
 /// Per-session offset tracker.
 ///
 /// Maintains a mapping from [`SessionId`] to a set of `(topic, offset)`
 /// pairs. The inner map is protected by a [`Mutex`] for concurrent access.
 ///
-/// This tracker is typically owned by the [`ResumeManager`](crate::session::resume::ResumeManager)
-/// and updated by the broker each time a session acknowledges a message.
+/// Each session is limited to `MAX_TOPICS_PER_SESSION` tracked topics.
 #[derive(Default)]
 pub struct OffsetTracker {
-    /// Maps each session to its topic-to-offset map. The outer key is
-    /// the [`SessionId`]; the inner key is the topic name and the value
-    /// is the highest offset the session has processed for that topic.
+    /// Maps each session to its topic-to-offset map.
     inner: Mutex<HashMap<SessionId, HashMap<String, i64>>>,
 }
 
 impl OffsetTracker {
-    /// Create a new, empty offset tracker.
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Record the latest offset the session has processed for `topic`.
     ///
-    /// If the session has no prior entry, one is created automatically.
-    /// If the session already has an offset for this topic, it is
-    /// overwritten with the new value.
+    /// If the session already has `MAX_TOPICS_PER_SESSION` tracked
+    /// topics, the oldest topic is evicted.
     pub fn record(&self, session: &SessionId, topic: &str, offset: i64) {
         let mut g = self.inner.lock();
-        g.entry(session.clone())
-            .or_default()
-            .insert(topic.to_string(), offset);
+        let topics = g.entry(session.clone()).or_default();
+        if topics.len() >= MAX_TOPICS_PER_SESSION && !topics.contains_key(topic) {
+            // Evict the oldest topic (lowest offset) to make room.
+            if let Some(oldest) = topics
+                .iter()
+                .min_by_key(|(_, v)| *v)
+                .map(|(k, _)| k.clone())
+            {
+                topics.remove(&oldest);
+            }
+        }
+        topics.insert(topic.to_string(), offset);
     }
 
     /// Read the last recorded offset for `(session, topic)`.

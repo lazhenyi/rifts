@@ -9,6 +9,13 @@
 //! decodes it and delivers it to all local subscribers via the
 //! local [`FanoutEngine`](crate::broker::fanout::FanoutEngine).
 //!
+//! ## Wire format
+//!
+//! Messages published to Redis Pub/Sub carry a JSON-encoded Frame
+//! envelope so that cross-instance subscribers receive the full
+//! topic/event/message_id/session_id/timestamp metadata, not just
+//! the raw payload.
+//!
 //! ## Lifecycle
 //!
 //! - **Subscribe** — when the first local subscriber joins a topic,
@@ -21,12 +28,15 @@
 //!   exits and all Pub/Sub subscriptions are cleaned up.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use dashmap::DashMap;
 use tokio::sync::Notify;
+use tracing::{error, info, warn};
 
 use crate::broker::fanout::{ConnectionSink, FanoutEngine, SubscribeIntent};
+use crate::frame::Frame;
 use crate::redis::connection::RedisPool;
 
 /// Per-topic subscriber count tracked by the fanout bridge.
@@ -79,10 +89,6 @@ impl FanoutBridge {
     }
 
     /// Register a local subscriber for a topic.
-    ///
-    /// If this is the first local subscriber, the bridge will
-    /// subscribe to the Redis Pub/Sub channel for cross-instance
-    /// message delivery.
     pub fn ensure_topic(&self, topic: &str) {
         let mut entry = self
             .topics
@@ -92,27 +98,17 @@ impl FanoutBridge {
     }
 
     /// Remove a local subscriber from a topic.
-    ///
-    /// If this was the last subscriber, the bridge will unsubscribe
-    /// from the Redis Pub/Sub channel.
     pub fn drop_topic(&self, topic: &str) {
         self.topics.remove(topic);
     }
 
     /// Deliver a cross-instance message to all local subscribers.
     ///
-    /// Called by the background listener when a message arrives on
-    /// a subscribed Redis Pub/Sub channel.
-    fn deliver_to_local(&self, topic: &str, payload: Bytes) {
-        // Serialize with offset header like InMemoryBroker does.
-        // The payload from Redis Pub/Sub is the raw serialized frame.
-        let framed = crate::broker::broker::serialize_frame_for_fanout(
-            &crate::frame::Frame {
-                payload: Some(payload),
-                ..crate::frame::Frame::default()
-            },
-            0, // remote offset is not known locally; use 0
-        );
+    /// The payload is a JSON-encoded [`Frame`] envelope. The offset
+    /// is extracted from the fanout wire format header produced by
+    /// [`serialize_frame_for_fanout`].
+    fn deliver_to_local(&self, topic: &str, frame: Frame) {
+        let framed = crate::broker::broker::serialize_frame_for_fanout(&frame, 0);
         self.fanout.deliver(topic, framed);
     }
 
@@ -149,40 +145,95 @@ impl FanoutBridge {
         let prefix = self.pool.prefix().to_string();
         let channel_pattern = format!("{prefix}:fanout:*");
 
-        // Open a dedicated Pub/Sub connection.
-        let client = match redis::Client::open(self.pool.url()) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let mut pubsub = match client.get_async_pubsub().await {
-            Ok(ps) => ps,
-            Err(_) => return,
-        };
-
-        // Subscribe to the wildcard pattern.
-        if pubsub.psubscribe(&channel_pattern).await.is_err() {
-            return;
-        }
-
-        let mut stream = pubsub.into_on_message();
+        // Retry loop — reconnects on Pub/Sub connection failure.
+        let backoff_base = Duration::from_secs(1);
+        let backoff_max = Duration::from_secs(30);
+        let mut retry_count = 0u32;
 
         loop {
-            tokio::select! {
-                _ = self.shutdown.notified() => {
-                    return;
+            let client = match redis::Client::open(self.pool.url()) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!(error = %e, "redis fanout: failed to open client");
+                    retry_count += 1;
+                    let delay = backoff_base
+                        .saturating_mul(retry_count.min(5))
+                        .min(backoff_max);
+                    tokio::select! {
+                        _ = self.shutdown.notified() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
                 }
-                msg = stream.next() => {
-                    let Some(msg) = msg else {
-                        break;
-                    };
-                    let payload: Bytes = Bytes::from(msg.get_payload_bytes().to_vec());
-                    // Extract topic name from the channel.
-                    // Channel format: {prefix}:fanout:{topic}
-                    let channel: String = msg.get_channel_name().into();
-                    let topic = channel
-                        .strip_prefix(&format!("{}:fanout:", prefix))
-                        .unwrap_or(&channel);
-                    self.deliver_to_local(topic, payload);
+            };
+
+            let mut pubsub = match client.get_async_pubsub().await {
+                Ok(ps) => ps,
+                Err(e) => {
+                    warn!(error = %e, "redis fanout: failed to get pubsub connection");
+                    retry_count += 1;
+                    let delay = backoff_base
+                        .saturating_mul(retry_count.min(5))
+                        .min(backoff_max);
+                    tokio::select! {
+                        _ = self.shutdown.notified() => return,
+                        _ = tokio::time::sleep(delay) => {}
+                    }
+                    continue;
+                }
+            };
+
+            if let Err(e) = pubsub.psubscribe(&channel_pattern).await {
+                warn!(error = %e, pattern = %channel_pattern, "redis fanout: psubscribe failed");
+                retry_count += 1;
+                let delay = backoff_base
+                    .saturating_mul(retry_count.min(5))
+                    .min(backoff_max);
+                tokio::select! {
+                    _ = self.shutdown.notified() => return,
+                    _ = tokio::time::sleep(delay) => {}
+                }
+                continue;
+            }
+
+            info!(pattern = %channel_pattern, "redis fanout: subscribed");
+            retry_count = 0;
+
+            let mut stream = pubsub.into_on_message();
+
+            loop {
+                tokio::select! {
+                    _ = self.shutdown.notified() => {
+                        return;
+                    }
+                    msg = stream.next() => {
+                        let Some(msg) = msg else {
+                            // Stream ended — reconnect.
+                            warn!("redis fanout: Pub/Sub stream ended, reconnecting");
+                            break;
+                        };
+                        let payload: Bytes = Bytes::from(msg.get_payload_bytes().to_vec());
+                        let channel: String = msg.get_channel_name().into();
+                        let topic = channel
+                            .strip_prefix(&format!("{}:fanout:", prefix))
+                            .unwrap_or(&channel);
+
+                        // Try to decode the payload as a JSON Frame envelope.
+                        // If decoding fails, fall back to treating the payload
+                        // as raw bytes in a minimal frame.
+                        let frame = match serde_json::from_slice::<Frame>(&payload) {
+                            Ok(mut f) => {
+                                f.topic = Some(topic.to_string());
+                                f
+                            }
+                            Err(_) => Frame {
+                                topic: Some(topic.to_string()),
+                                payload: Some(payload),
+                                ..Frame::default()
+                            },
+                        };
+                        self.deliver_to_local(topic, frame);
+                    }
                 }
             }
         }

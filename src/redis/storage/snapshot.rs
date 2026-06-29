@@ -13,6 +13,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use redis::AsyncCommands;
 
 use crate::now_ms;
 use crate::redis::connection::RedisPool;
@@ -21,8 +22,9 @@ use crate::topic::TopicStore;
 
 /// Redis-backed snapshot store.
 ///
-/// Snapshots are stored as Redis Hashes. Serialization uses CBOR
-/// for the payload and string/int representation for metadata fields.
+/// Snapshots are stored as Redis Hashes. Serialization uses hex
+/// encoding for the payload and string/int representation for
+/// metadata fields.
 #[derive(Clone)]
 pub struct RedisSnapshotStore {
     pool: RedisPool,
@@ -37,6 +39,13 @@ impl RedisSnapshotStore {
     fn snapshot_key(&self, topic: &str) -> String {
         self.pool.topic_key("snapshot", topic)
     }
+
+    fn block_on<F>(&self, f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::runtime::Handle::current().block_on(f)
+    }
 }
 
 impl SnapshotStore for RedisSnapshotStore {
@@ -46,7 +55,6 @@ impl SnapshotStore for RedisSnapshotStore {
         store: &TopicStore,
         ttl: Option<Duration>,
     ) -> Option<StoredSnapshot> {
-        // Read the latest log entry from the topic store.
         let entry = store.get(topic)?;
         let latest = entry.log.read().last().cloned()?;
 
@@ -62,51 +70,49 @@ impl SnapshotStore for RedisSnapshotStore {
             expires_at,
         };
 
-        // Serialize to Redis hash.
         let key = self.snapshot_key(topic);
-        let payload_b64 = base64_encode(&snap.payload);
+        let payload_hex = hex_encode(&snap.payload);
         let expires_str = snap.expires_at.map(|e| e.to_string()).unwrap_or_default();
         let snap_id = snap.snapshot_id.clone();
         let snap_topic = snap.topic.clone();
+        let base_offset = snap.base_offset;
+        let created_at = snap.created_at;
 
-        let key2 = key.clone();
-        let payload_b642 = payload_b64.clone();
-        let expires_str2 = expires_str.clone();
-        let _: () = self.pool.sync_cmd(move |c| {
-            redis::cmd("HSET")
-                .arg(&key2)
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            let _: Result<(), _> = redis::cmd("HSET")
+                .arg(&key)
                 .arg("snapshot_id")
                 .arg(&snap_id)
                 .arg("topic")
                 .arg(&snap_topic)
                 .arg("base_offset")
-                .arg(snap.base_offset)
+                .arg(base_offset)
                 .arg("payload")
-                .arg(&payload_b642)
+                .arg(&payload_hex)
                 .arg("created_at")
-                .arg(snap.created_at)
+                .arg(created_at)
                 .arg("expires_at")
-                .arg(&expires_str2)
-                .query::<()>(c)
-        });
+                .arg(&expires_str)
+                .query_async(&mut conn)
+                .await;
 
-        // Set TTL on the key if requested.
-        if let Some(ttl) = ttl {
-            let key3 = key.clone();
-            let _: () = self.pool.sync_cmd(move |c| {
-                redis::cmd("EXPIRE")
-                    .arg(&key3)
+            if let Some(ttl) = ttl {
+                let _: Result<(), _> = redis::cmd("EXPIRE")
+                    .arg(&key)
                     .arg(ttl.as_secs().max(1) as usize)
-                    .query::<()>(c)
-            });
-        }
+                    .query_async(&mut conn)
+                    .await;
+            }
+        });
 
         Some(snap)
     }
 
     fn get(&self, topic: &str) -> Option<StoredSnapshot> {
         let key = self.snapshot_key(topic);
-        let fields: Vec<String> = self.pool.sync_cmd(move |c| {
+        let fields: Vec<String> = self.block_on(async {
+            let mut conn = self.pool.conn().clone();
             redis::cmd("HMGET")
                 .arg(&key)
                 .arg("snapshot_id")
@@ -115,7 +121,9 @@ impl SnapshotStore for RedisSnapshotStore {
                 .arg("payload")
                 .arg("created_at")
                 .arg("expires_at")
-                .query::<Vec<String>>(c)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or_default()
         });
 
         if fields.len() < 6 || fields[0].is_empty() {
@@ -125,7 +133,7 @@ impl SnapshotStore for RedisSnapshotStore {
         let snapshot_id = fields[0].clone();
         let topic_name = fields[1].clone();
         let base_offset: i64 = fields[2].parse().unwrap_or(0);
-        let payload = base64_decode(&fields[3]);
+        let payload = hex_decode(&fields[3]);
         let created_at: i64 = fields[4].parse().unwrap_or(0);
         let expires_at: Option<i64> = if fields[5].is_empty() {
             None
@@ -133,7 +141,6 @@ impl SnapshotStore for RedisSnapshotStore {
             fields[5].parse().ok()
         };
 
-        // Check expiration.
         if let Some(exp) = expires_at
             && now_ms() > exp
         {
@@ -152,19 +159,21 @@ impl SnapshotStore for RedisSnapshotStore {
 
     fn remove(&self, topic: &str) {
         let key = self.snapshot_key(topic);
-        let _: () = self
-            .pool
-            .sync_cmd(move |c| redis::cmd("DEL").arg(&key).query::<()>(c));
+        let _: Result<(), _> = self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            redis::cmd("DEL").arg(&key).query_async(&mut conn).await
+        });
     }
 
     fn list(&self) -> Vec<StoredSnapshot> {
-        // We can't easily list all snapshot keys without SCAN.
-        // Return empty — listing is not a hot-path operation.
+        // Listing all snapshot keys requires SCAN which is not
+        // implemented for this store. Return empty; listing is not
+        // a hot-path operation.
         Vec::new()
     }
 }
 
-fn base64_encode(data: &Bytes) -> String {
+fn hex_encode(data: &Bytes) -> String {
     use std::fmt::Write;
     let mut s = String::new();
     for b in data.as_ref() {
@@ -173,7 +182,7 @@ fn base64_encode(data: &Bytes) -> String {
     s
 }
 
-fn base64_decode(hex: &str) -> Bytes {
+fn hex_decode(hex: &str) -> Bytes {
     let mut bytes = Vec::new();
     for i in (0..hex.len()).step_by(2) {
         if i + 2 <= hex.len()

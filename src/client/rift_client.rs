@@ -170,6 +170,7 @@ impl RiftClient {
         if let Some(inner) = guard.take() {
             let mut writer = inner.writer.lock().await;
             let _ = writer.send(WsMessage::Close(None)).await;
+            let _ = writer.flush().await;
         }
         Ok(())
     }
@@ -431,11 +432,9 @@ impl RiftClient {
         let inner = self.inner.read().await;
         let conn = inner.as_ref().ok_or(ClientError::NotConnected)?;
         let bytes = encode_frame(&frame)?;
-        conn.writer
-            .lock()
-            .await
-            .send(WsMessage::Binary(bytes.to_vec()))
-            .await?;
+        let mut writer = conn.writer.lock().await;
+        writer.send(WsMessage::Binary(bytes.to_vec())).await?;
+        writer.flush().await?;
         Ok(())
     }
 }
@@ -494,12 +493,13 @@ async fn try_reconnect(
         {
             Ok(new_inner) => {
                 tracing::info!(attempt, "reconnected");
-                // Store the new connection back into the shared slot
-                // so subsequent publish / subscribe / command calls
-                // see the reconnected state. Without this, the
-                // client would remain effectively disconnected even
-                // after a successful reconnect.
+                let sid = new_inner.session_id.clone();
+                let ep = new_inner.epoch;
                 *inner_slot.write().await = Some(new_inner);
+                let _ = event_tx.send(ClientEvent::Connected {
+                    session_id: sid,
+                    epoch: ep,
+                });
                 return;
             }
             Err(e) => {

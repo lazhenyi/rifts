@@ -126,7 +126,6 @@ mod sled_impl {
     use crate::storage::encode;
     use crate::storage::engine::SledEngine;
     use crate::storage::engine::StorageEngine;
-    use std::sync::Mutex;
 
     /// Sled-backed offset store. One key per topic: `<topic>\x00head`.
     ///
@@ -146,7 +145,7 @@ mod sled_impl {
         /// The underlying byte-oriented storage engine.
         engine: SledEngine,
         /// In-memory cache to avoid sled reads on every `alloc`.
-        cache: Mutex<std::collections::HashMap<String, i64>>,
+        cache: parking_lot::Mutex<std::collections::HashMap<String, i64>>,
     }
 
     impl SledOffsetStore {
@@ -177,7 +176,7 @@ mod sled_impl {
             }
             Self {
                 engine,
-                cache: Mutex::new(cache),
+                cache: parking_lot::Mutex::new(cache),
             }
         }
     }
@@ -191,7 +190,7 @@ mod sled_impl {
         /// sequence. The new head is then written to both the cache and
         /// the engine.
         fn alloc(&self, topic: &str) -> i64 {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self.cache.lock();
             let next = if let Some(&h) = cache.get(topic) {
                 h + 1
             } else {
@@ -225,30 +224,25 @@ mod sled_impl {
         /// persisted value from the engine. Returns `0` if the topic
         /// has never been allocated.
         fn head(&self, topic: &str) -> i64 {
-            self.cache
-                .lock()
-                .unwrap()
-                .get(topic)
-                .copied()
-                .unwrap_or_else(|| {
-                    let key = encode::offset_key(topic);
-                    self.engine
-                        .get(&key)
-                        .and_then(|v| {
-                            if v.len() >= 8 {
-                                Some(i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])))
-                            } else {
-                                None
-                            }
-                        })
-                        .unwrap_or(0)
-                })
+            self.cache.lock().get(topic).copied().unwrap_or_else(|| {
+                let key = encode::offset_key(topic);
+                self.engine
+                    .get(&key)
+                    .and_then(|v| {
+                        if v.len() >= 8 {
+                            Some(i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(0)
+            })
         }
 
         /// Remove the offset state for `topic` from both the cache and
         /// the engine.
         fn remove(&self, topic: &str) {
-            self.cache.lock().unwrap().remove(topic);
+            self.cache.lock().remove(topic);
             self.engine.delete(&encode::offset_key(topic));
         }
     }

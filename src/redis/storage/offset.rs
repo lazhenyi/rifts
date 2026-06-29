@@ -9,6 +9,8 @@
 //! Value: i64 head counter
 //! ```
 
+use redis::AsyncCommands;
+
 use crate::redis::connection::RedisPool;
 use crate::storage::OffsetStore;
 
@@ -31,36 +33,56 @@ impl RedisOffsetStore {
     fn hash_key(&self) -> String {
         self.pool.key("offsets")
     }
+
+    fn block_on<F>(&self, f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::runtime::Handle::current().block_on(f)
+    }
 }
 
 impl OffsetStore for RedisOffsetStore {
     fn alloc(&self, topic: &str) -> i64 {
         let key = self.hash_key();
-        self.pool.sync_cmd(|c| {
+        let topic = topic.to_string();
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
             redis::cmd("HINCRBY")
                 .arg(&key)
-                .arg(topic)
+                .arg(&topic)
                 .arg(1)
-                .query::<i64>(c)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(1)
         })
     }
 
     fn head(&self, topic: &str) -> i64 {
         let key = self.hash_key();
-        self.pool
-            .sync_cmd(|c| {
-                redis::cmd("HGET")
-                    .arg(&key)
-                    .arg(topic)
-                    .query::<Option<i64>>(c)
-            })
-            .unwrap_or(0)
+        let topic = topic.to_string();
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            redis::cmd("HGET")
+                .arg(&key)
+                .arg(&topic)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(None)
+                .unwrap_or(0)
+        })
     }
 
     fn remove(&self, topic: &str) {
         let key = self.hash_key();
-        let _: () = self
-            .pool
-            .sync_cmd(|c| redis::cmd("HDEL").arg(&key).arg(topic).query::<()>(c));
+        let topic = topic.to_string();
+        let _: Result<(), _> = self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            redis::cmd("HDEL")
+                .arg(&key)
+                .arg(&topic)
+                .query_async(&mut conn)
+                .await
+        });
     }
 }

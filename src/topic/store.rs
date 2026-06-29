@@ -340,7 +340,15 @@ impl TopicEntry {
                 log.retain(|e| e.offset == entry.offset);
             }
             RetentionPolicy::Durable => {
-                // external store — keep all in-memory entries until evicted
+                // External store handles persistence; keep a bounded
+                // in-memory window for fast range queries. Evict
+                // oldest entries when the log grows beyond the cap
+                // to prevent unbounded memory growth.
+                const DURABLE_MEMORY_CAP: usize = 10_000;
+                if log.len() > DURABLE_MEMORY_CAP {
+                    let drop = log.len() - DURABLE_MEMORY_CAP;
+                    log.drain(0..drop);
+                }
             }
         }
         if profile.snapshot_enabled {

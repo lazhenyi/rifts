@@ -1,9 +1,7 @@
 //! Flow control benchmarks — backpressure controller.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
-use rifts::flow::{
-    BackpressureAction, BackpressureController, BackpressureStrategy,
-};
+use rifts::flow::{BackpressureAction, BackpressureController, BackpressureStrategy};
 
 mod common;
 

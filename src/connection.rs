@@ -33,7 +33,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{Mutex as AsyncMutex, mpsc};
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 use crate::ack::{Ack, AckStatus, SharedAckManager};
 use crate::broker::fanout::{FanoutError, FanoutSink};
@@ -94,12 +94,11 @@ impl FanoutSink for ConnSink {
         let len = frame.len();
         // Atomic reserve: compare-and-swap loop so the byte-count
         // check and the increment are performed as a single atomic
-        // operation. Without this, multiple concurrent deliveries
-        // can each see the counter below the limit and all proceed,
-        // collectively exceeding `max_bytes`.
+        // operation.
         let mut prev = self.in_flight_bytes.load(Ordering::Acquire);
         loop {
             if prev + len > self.max_bytes {
+                self.metrics.inc(&self.metrics.flow_pause_total);
                 return Err(FanoutError::Backpressured {
                     queue_bytes: prev,
                     max_bytes: self.max_bytes,
@@ -217,6 +216,12 @@ pub struct Connection {
     /// Topics this connection has published to. Drained on
     /// teardown to release per-topic publisher slots.
     published_topics: Arc<parking_lot::Mutex<HashSet<String>>>,
+
+    /// Subscription sink IDs created via the subscribe control handler.
+    /// Tracked so teardown can clean up per-subscription MpscSink
+    /// entries from the FanoutEngine — without this, every disconnect
+    /// leaks N fanout subscription entries.
+    subscription_sinks: Arc<parking_lot::Mutex<HashSet<u64>>>,
 }
 
 impl Connection {
@@ -256,6 +261,7 @@ impl Connection {
             codec: Arc::new(JsonCodec),
             in_flight_bytes: Arc::new(AtomicUsize::new(0)),
             published_topics: Arc::new(parking_lot::Mutex::new(HashSet::new())),
+            subscription_sinks: Arc::new(parking_lot::Mutex::new(HashSet::new())),
         }
     }
 
@@ -287,6 +293,7 @@ impl Connection {
     /// 5. Closes the transport, releases resources (sink, acks, resume,
     ///    per-topic publisher slots), and decrements connection metrics.
     /// 6. Returns the reader's result.
+    #[instrument(skip(self, transport), fields(conn_id = self.conn_id))]
     pub async fn run(mut self, mut transport: Box<dyn TransportConnection>) -> Result<()> {
         self.metrics.inc(&self.metrics.connection_open_total);
         self.metrics.inc(&self.metrics.active_connections);
@@ -325,7 +332,7 @@ impl Connection {
         let transport_slot_w = transport_slot.clone();
         let in_flight_w = self.in_flight_bytes.clone();
         let writer_handle = tokio::spawn(async move {
-            writer_task(rx, transport_slot_w, in_flight_w).await;
+            writer_task(rx, transport_slot_w, in_flight_w, self.config.write_timeout).await;
         });
 
         // Reader task.
@@ -344,6 +351,7 @@ impl Connection {
         // the reader, leaving the connection's set empty and
         // leaking publisher slots.
         let published_topics_r = self.published_topics.clone();
+        let subscription_sinks_r = self.subscription_sinks.clone();
         let conn_id = self.conn_id;
         let idle_timeout = self.config.idle_timeout;
         let reader_handle = tokio::spawn(async move {
@@ -358,6 +366,7 @@ impl Connection {
                 in_flight_r,
                 max_bytes_r,
                 published_topics_r,
+                subscription_sinks_r,
                 conn_id,
                 idle_timeout,
             )
@@ -377,6 +386,14 @@ impl Connection {
             let _ = t.close(CloseCode::Normal, "bye").await;
         }
         self.broker.drop_sink(self.sink_id).await;
+        // Clean up per-subscription MpscSink entries from the fanout
+        // engine. Without this, every disconnect leaks N subscription
+        // entries (one per topic the connection subscribed to via the
+        // subscribe control handler).
+        let sub_sinks: Vec<u64> = self.subscription_sinks.lock().drain().collect();
+        for sid in sub_sinks {
+            self.broker.drop_sink(sid).await;
+        }
         self.ack_manager.forget(session.id.as_str());
         // Do NOT forget the offset tracker on every disconnect: the
         // SessionStore/OffsetTracker are specifically designed to
@@ -467,12 +484,41 @@ impl Connection {
         // task uses the same encoding for all subsequent frames.
         self.codec = codec.clone();
 
+        // Match the client's offered auth modes against the server's
+        // supported modes. Pick the first mode that appears in both
+        // lists. If no overlap, fall back to Anonymous.
+        let server_modes = self.auth.supported_modes();
         let auth_mode = hello
             .auth_modes
-            .first()
+            .iter()
+            .find(|m| server_modes.contains(m))
             .copied()
             .unwrap_or(AuthMode::Anonymous);
         let auth_ctx = self.auth.authenticate(auth_mode, token.as_deref()).await?;
+
+        // Validate Hello frame fields before proceeding.
+        if hello.codecs.is_empty() {
+            return Err(RiftError::Frame(crate::error::FrameReject::FrameInvalid(
+                "hello must include at least one codec".into(),
+            )));
+        }
+        // Limit token size to 8 KiB to prevent resource exhaustion.
+        if let Some(ref t) = token
+            && t.len() > 8192
+        {
+            return Err(RiftError::Frame(
+                crate::error::FrameReject::PayloadTooLarge {
+                    actual: t.len(),
+                    max: 8192,
+                },
+            ));
+        }
+        // Limit last_offsets to 1024 entries.
+        if hello.last_offsets.len() > 1024 {
+            return Err(RiftError::Frame(crate::error::FrameReject::FrameInvalid(
+                "hello last_offsets exceeds maximum 1024 entries".into(),
+            )));
+        }
         let client_id = auth_ctx.client_id.clone();
 
         // --- Session lookup / creation ----------------------------------
@@ -629,15 +675,29 @@ async fn writer_task(
     mut rx: mpsc::Receiver<Frame>,
     transport_slot: Arc<AsyncMutex<Option<Box<dyn TransportConnection>>>>,
     in_flight_bytes: Arc<AtomicUsize>,
+    write_timeout: Duration,
 ) {
     while let Some(frame) = rx.recv().await {
         let bytes = frame.payload.as_ref().map(|p| p.len()).unwrap_or(0);
         let result = {
-            let mut guard = transport_slot.lock().await;
-            let Some(transport) = guard.as_mut() else {
-                break;
+            let write_fut = async {
+                let mut guard = transport_slot.lock().await;
+                let Some(transport) = guard.as_mut() else {
+                    return Err(RiftError::System(SystemReject::Internal(
+                        "transport released".into(),
+                    )));
+                };
+                transport.write_frame(&frame).await
             };
-            transport.write_frame(&frame).await
+
+            match tokio::time::timeout(write_timeout, write_fut).await {
+                Ok(r) => r,
+                Err(_elapsed) => {
+                    warn!(timeout_secs = write_timeout.as_secs(), "write timeout");
+                    *transport_slot.lock().await = None;
+                    break;
+                }
+            }
         };
         match result {
             Ok(()) => {
@@ -684,6 +744,7 @@ async fn reader_task(
     in_flight_bytes: Arc<AtomicUsize>,
     max_bytes: usize,
     published_topics: Arc<parking_lot::Mutex<HashSet<String>>>,
+    subscription_sinks: Arc<parking_lot::Mutex<HashSet<u64>>>,
     conn_id: u64,
     idle_timeout: Duration,
 ) -> Result<()> {
@@ -714,9 +775,7 @@ async fn reader_task(
                         "connection idle timeout"
                     );
                     metrics.inc(&metrics.connection_close_total);
-                    return Err(RiftError::Session(
-                        crate::error::SessionReject::IdleTimeout,
-                    ));
+                    return Err(RiftError::Session(crate::error::SessionReject::IdleTimeout));
                 }
             }
         };
@@ -734,6 +793,7 @@ async fn reader_task(
                     &metrics,
                     &in_flight_bytes,
                     max_bytes,
+                    &subscription_sinks,
                 )
                 .await
                 {
@@ -808,6 +868,7 @@ async fn handle_control(
     _metrics: &Arc<Metrics>,
     in_flight_bytes: &Arc<AtomicUsize>,
     max_bytes: usize,
+    subscription_sinks: &Arc<parking_lot::Mutex<HashSet<u64>>>,
 ) -> Result<()> {
     let body = frame
         .payload
@@ -861,14 +922,18 @@ async fn handle_control(
                     )));
                 }
             };
+            let sink_id = crate::broker::fanout::new_sink_id();
             let sink: Arc<dyn FanoutSink> = Arc::new(MpscSink {
                 tx: out_tx.clone(),
                 in_flight_bytes: in_flight_bytes.clone(),
                 max_bytes,
-                id: crate::broker::fanout::new_sink_id(),
+                id: sink_id,
                 codec: codec.frame_codec(),
             });
             let id = broker.subscribe(&topic, intent, sink).await?;
+            // Track this per-subscription sink so teardown can clean
+            // it up and prevent the FanoutEngine subscription leak.
+            subscription_sinks.lock().insert(sink_id);
             let reply = serde_json::json!({
                 "type": "subscribe_ack",
                 "topic": topic,

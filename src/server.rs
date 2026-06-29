@@ -268,7 +268,14 @@ impl RiftServerBuilder {
         let gc_idle_timeout = self.config.idle_timeout;
         let gc_notify = gc_shutdown.clone();
         tokio::spawn(async move {
-            run_maintenance(gc_broker, gc_session_store, gc_ack, gc_idle_timeout, gc_notify).await;
+            run_maintenance(
+                gc_broker,
+                gc_session_store,
+                gc_ack,
+                gc_idle_timeout,
+                gc_notify,
+            )
+            .await;
         });
 
         Ok(RiftServer {
@@ -398,7 +405,29 @@ impl RiftServer {
 
     /// Internal helper: create and spawn a [`Connection`] for the given
     /// transport.
-    fn spawn_connection(&self, transport: Box<dyn TransportConnection>) {
+    fn spawn_connection(&self, mut transport: Box<dyn TransportConnection>) {
+        // Enforce connection limit.
+        let max = self.config.max_connections;
+        if max > 0 {
+            let current = self
+                .metrics
+                .active_connections
+                .load(std::sync::atomic::Ordering::SeqCst);
+            if current as usize >= max {
+                tracing::warn!(max, "connection limit reached, rejecting new connection");
+                // Spawn a fire-and-forget task to close the transport.
+                tokio::spawn(async move {
+                    let _ = transport
+                        .close(
+                            crate::protocol::close::CloseCode::ServerOverloaded,
+                            "server at connection limit",
+                        )
+                        .await;
+                });
+                return;
+            }
+        }
+
         let id = self
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -429,10 +458,7 @@ impl RiftServer {
                     tracing::debug!(conn = id, "connection ended cleanly");
                 }
                 Ok(Err(RiftError::Session(crate::error::SessionReject::IdleTimeout))) => {
-                    tracing::debug!(
-                        conn = id,
-                        "connection closed due to idle timeout"
-                    );
+                    tracing::debug!(conn = id, "connection closed due to idle timeout");
                 }
                 Ok(Err(e)) => {
                     error!(conn = id, "connection ended with error: {}", e);
@@ -479,12 +505,7 @@ async fn run_maintenance(
         let acks_reaped = ack_manager.reap_all_timeouts();
 
         if swept > 0 || sessions_expired > 0 || acks_reaped > 0 {
-            tracing::debug!(
-                swept,
-                sessions_expired,
-                acks_reaped,
-                "maintenance sweep"
-            );
+            tracing::debug!(swept, sessions_expired, acks_reaped, "maintenance sweep");
         }
     }
 }

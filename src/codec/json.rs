@@ -66,11 +66,22 @@ impl Codec for JsonCodec {
 
     /// Decode JSON text bytes into a [`serde_json::Value`].
     ///
+    /// Rejects input larger than `max_bytes` to mitigate DoS attacks
+    /// via deeply-nested or excessively large JSON documents.
+    ///
     /// # Errors
     ///
     /// Returns an error if the input is not valid JSON or if
     /// `serde_json::from_slice` encounters a deserialization failure.
     fn decode_value(&self, bytes: &[u8]) -> Result<serde_json::Value> {
+        const MAX_JSON_BYTES: usize = 1_048_576; // 1 MiB
+        if bytes.len() > MAX_JSON_BYTES {
+            return Err(crate::error::FrameReject::PayloadTooLarge {
+                actual: bytes.len(),
+                max: MAX_JSON_BYTES,
+            }
+            .into());
+        }
         Ok(serde_json::from_slice(bytes)?)
     }
 }

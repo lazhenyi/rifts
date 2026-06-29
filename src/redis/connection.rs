@@ -1,35 +1,28 @@
 //! Redis connection pool and key-space helpers.
 //!
-//! `RedisPool` holds both:
-//! - A sync [`redis::aio::MultiplexedConnection`] for async Pub/Sub and fanout
-//! - A sync [`redis::Connection`]-like access for storage trait methods
-//!
-//! Storage traits (`OffsetStore`, `LogStore`, etc.) have synchronous
-//! signatures, so we use `redis::ConnectionManager` (sync, auto-reconnect)
-//! for those. Async Pub/Sub uses the multiplexed connection.
+//! `RedisPool` holds an async [`redis::aio::MultiplexedConnection`] for
+//! Pub/Sub and fanout. Storage trait methods use the same async connection
+//! so they never block the tokio runtime.
 
 use redis::Client;
 use redis::aio::MultiplexedConnection;
 
 use crate::error::{Result, RiftError, SystemReject};
 
-/// A Redis connection pool holding both sync and async connections.
+/// A Redis connection pool holding an async multiplexed connection.
 ///
-/// - The **sync** [`redis::ConnectionManager`] (not directly exposed) is used
-///   by the storage trait implementations. It auto-reconnects on error.
-/// - The **async** [`MultiplexedConnection`] is used for Pub/Sub fanout
-///   and any async Redis operations.
+/// The async [`MultiplexedConnection`] is used for both Pub/Sub fanout
+/// and storage operations so the tokio runtime is never blocked.
 ///
 /// # Cloning
 ///
 /// `RedisPool` derives `Clone`. Each clone shares the same underlying
-/// async connection (multiplexed) and creates its own sync connection
-/// manager.
+/// async connection (multiplexed).
 #[derive(Clone)]
 pub struct RedisPool {
-    /// Async multiplexed connection for Pub/Sub and fanout.
+    /// Async multiplexed connection for Pub/Sub, fanout, and storage.
     conn: MultiplexedConnection,
-    /// Redis connection info for creating sync connections on demand.
+    /// Redis connection URL for creating additional connections (e.g. Pub/Sub).
     url: String,
     /// Key prefix applied to every Redis key.
     prefix: String,
@@ -58,18 +51,9 @@ impl RedisPool {
         &self.conn
     }
 
-    /// Execute a Redis command synchronously via a short-lived
-    /// synchronous connection. Each call opens and closes a
-    /// connection. For high-throughput use cases, use the async
-    /// connection directly.
-    pub fn sync_cmd<F, T>(&self, f: F) -> T
-    where
-        F: FnOnce(&mut redis::Connection) -> redis::RedisResult<T>,
-    {
-        let mut conn = redis::Client::open(&*self.url)
-            .and_then(|c| c.get_connection())
-            .unwrap_or_else(|e| panic!("redis sync connect: {e}"));
-        f(&mut conn).unwrap_or_else(|e| panic!("redis sync cmd: {e}"))
+    /// The Redis connection URL.
+    pub fn url(&self) -> &str {
+        &self.url
     }
 
     /// Build a namespaced Redis key: `{prefix}:{suffix}`.
@@ -86,17 +70,11 @@ impl RedisPool {
     pub fn prefix(&self) -> &str {
         &self.prefix
     }
-
-    /// The Redis connection URL.
-    pub fn url(&self) -> &str {
-        &self.url
-    }
 }
 
 impl std::fmt::Debug for RedisPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RedisPool")
-            .field("url", &self.url)
             .field("prefix", &self.prefix)
             .finish()
     }

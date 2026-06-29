@@ -159,9 +159,12 @@ pub fn decode_text_frame(buf: &[u8]) -> Result<Frame> {
     let frame_id = obj.get("frame_id").and_then(|v| v.as_u64()).unwrap_or(0);
     let timestamp = obj.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0);
     let flags = obj.get("flags").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
-    let payload = obj
-        .get("payload")
-        .map(|v| Bytes::from(serde_json::to_vec(v).unwrap_or_default()));
+    let payload = obj.get("payload").map(|v| {
+        serde_json::to_vec(v).map(Bytes::from).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "text frame payload serialization failed");
+            Bytes::new()
+        })
+    });
     Ok(Frame {
         version: 0x0100,
         frame_id,

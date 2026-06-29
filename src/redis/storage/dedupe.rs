@@ -1,27 +1,28 @@
 //! Redis-backed message deduplication.
 //!
-//! Uses a Redis Set per topic with TTL-based eviction:
+//! Uses a Redis Set per topic with per-member TTL via separate keys:
 //!
 //! ```text
-//! Key:    rift:dedupe:{topic}   (Set)
-//! Member: {message_id}
+//! Key:    rift:dedupe:{topic}:{message_id}   (String)
+//! Value:  "1"
 //! TTL:    {dedupe_window} seconds
 //! ```
 //!
-//! `SADD` returns the number of newly-added members; a return of
-//! `0` means the member already existed → duplicate.
+//! Per-member keys (instead of a Set with `EXPIRE` on the whole set)
+//! ensure each message ID expires independently. `SET NX` returns
+//! `true` when the key did not exist → fresh message.
 
 use std::time::Duration;
+
+use redis::AsyncCommands;
 
 use crate::redis::connection::RedisPool;
 use crate::storage::DedupeStore;
 
 /// Redis-backed deduplication store.
 ///
-/// Each topic has its own Set. When a message ID is first seen,
-/// `SADD` returns 1 and a TTL is set via `EXPIRE`.  When the same
-/// ID arrives within the TTL, `SADD` returns 0 → duplicate.
-/// Redis handles eviction automatically when the TTL expires.
+/// Each message ID is stored as a separate key with its own TTL so
+/// entries expire independently regardless of topic activity level.
 #[derive(Clone)]
 pub struct RedisDedupeStore {
     pool: RedisPool,
@@ -33,42 +34,42 @@ impl RedisDedupeStore {
         Self { pool }
     }
 
-    fn set_key(&self, topic: &str) -> String {
-        self.pool.topic_key("dedupe", topic)
+    fn member_key(&self, topic: &str, message_id: &str) -> String {
+        format!("{}:dedupe:{topic}:{message_id}", self.pool.prefix())
+    }
+
+    fn block_on<F>(&self, f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::runtime::Handle::current().block_on(f)
     }
 }
 
 impl DedupeStore for RedisDedupeStore {
     fn check_and_record(&self, topic: &str, key: &str, window: Duration) -> bool {
-        let set_key = self.set_key(topic);
-        let msg_id = key.to_string();
+        let member_key = self.member_key(topic, key);
         let window_secs = window.as_secs().max(1) as usize;
 
-        // SADD returns the number of elements added. 1 = new, 0 = already exists.
-        let (set_key2, msg_id2) = (set_key.clone(), msg_id.clone());
-        let added: i32 = self.pool.sync_cmd(move |c| {
-            redis::cmd("SADD")
-                .arg(&set_key2)
-                .arg(&msg_id2)
-                .query::<i32>(c)
-        });
-
-        // Set or refresh TTL.
-        let (set_key3, window_secs2) = (set_key.clone(), window_secs);
-        let _: () = self.pool.sync_cmd(move |c| {
-            redis::cmd("EXPIRE")
-                .arg(&set_key3)
-                .arg(window_secs2)
-                .query::<()>(c)
-        });
-
-        added > 0
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            // SET key "1" NX EX window_secs
+            // Returns OK if set (fresh), nil if already exists (duplicate).
+            let result: Option<String> = redis::cmd("SET")
+                .arg(&member_key)
+                .arg("1")
+                .arg("NX")
+                .arg("EX")
+                .arg(window_secs)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(None);
+            result.is_some()
+        })
     }
 
     fn sweep(&self) -> usize {
-        // Redis TTL handles cleanup automatically; no explicit sweep
-        // needed. We scan for keys with no TTL as a safety measure
-        // but return 0 as this is a no-op for Redis.
+        // Redis TTL handles cleanup automatically; no explicit sweep needed.
         0
     }
 }

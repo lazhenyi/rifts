@@ -47,6 +47,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use parking_lot::Mutex;
+use tracing::instrument;
 
 use crate::broker::broker::{Broker, PublishOutcome};
 use crate::broker::fanout::{ConnectionSink, FanoutEngine, SubscribeIntent, SubscriptionId};
@@ -278,6 +279,7 @@ impl<
     S: SnapshotStore + 'static,
 > Broker for InMemoryBroker<O, L, D, S>
 {
+    #[instrument(skip(self, frame), fields(topic))]
     async fn publish(&self, frame: &Frame) -> Result<PublishOutcome> {
         let (topic, message_id) = self.validate_publish(frame)?;
         crate::topic::store::validate_name(topic)?;

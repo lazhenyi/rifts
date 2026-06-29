@@ -79,6 +79,21 @@ pub struct ServerConfig {
     /// See [`HeartbeatPolicy`] for details.
     pub heartbeat: HeartbeatPolicy,
 
+    /// Maximum number of concurrent connections the server will accept.
+    ///
+    /// When this limit is reached, new connections are rejected immediately
+    /// with the close code [`CloseCode::ServerBusy`].
+    /// `0` means unlimited (the default for backwards compatibility).
+    /// A reasonable production default is 10,000.
+    pub max_connections: usize,
+
+    /// Write timeout for sending a frame to the transport.
+    ///
+    /// If a `write_frame` call exceeds this duration, the writer task
+    /// releases the transport and the connection is torn down.
+    /// Default: 30 seconds.
+    pub write_timeout: Duration,
+
     /// Connection idle timeout.
     ///
     /// If no frames (including heartbeats) are received within this time window,
@@ -181,8 +196,10 @@ impl Default for ServerConfig {
             max_payload_bytes: 65_536,
             max_topics_per_connection: 128,
             max_send_queue_bytes: 1_048_576,
+            max_connections: 0, // unlimited
             heartbeat: HeartbeatPolicy::default(),
             idle_timeout: Duration::from_secs(300),
+            write_timeout: Duration::from_secs(30),
             reconnect_base_ms: 500,
             reconnect_max_ms: 15_000,
             replay_window: Duration::from_secs(300),

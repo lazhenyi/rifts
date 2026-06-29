@@ -189,6 +189,10 @@ impl Ack {
 /// single misbehaving session.
 pub const DEFAULT_MAX_OUTSTANDING_PER_SESSION: usize = 10_000;
 
+/// Maximum number of sessions the ack manager will track simultaneously.
+/// Beyond this limit, new sessions are rejected (track returns false).
+pub const DEFAULT_MAX_SESSIONS: usize = 100_000;
+
 /// Tracks outstanding (sent-but-not-acked) frames per session.
 ///
 /// The `AckManager` is shared across all connections via
@@ -240,11 +244,13 @@ impl AckManager {
     /// should treat this as backpressure and either drop the
     /// message or close the connection.
     pub fn track(&self, session_id: &str, message_id: &str, timeout: Duration) -> bool {
-        // Use `saturating_add` so a pathologically large `timeout`
-        // (e.g. `Duration::MAX`) does not produce a negative
-        // deadline via `as i64` truncation.
         let deadline = now_ms().saturating_add(timeout.as_millis().try_into().unwrap_or(i64::MAX));
         let mut g = self.outstanding.lock();
+        // Enforce per-process session count limit to prevent unbounded
+        // growth from session floods.
+        if !g.contains_key(session_id) && g.len() >= DEFAULT_MAX_SESSIONS {
+            return false;
+        }
         let entry = g.entry(session_id.to_string()).or_default();
         if entry.len() >= self.max_outstanding_per_session {
             return false;

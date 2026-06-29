@@ -134,6 +134,16 @@ pub trait AuthProvider: Send + Sync {
     /// Returns an error if the revocation could not be completed (e.g.,
     /// the identity provider is unreachable).
     async fn revoke(&self, client_id: &ClientId) -> Result<()>;
+
+    /// Return the list of [`AuthMode`] values this provider supports.
+    ///
+    /// Used during the Hello handshake to match the client's offered
+    /// auth modes against the server's capabilities. The first mode in
+    /// the client's list that also appears in the server's list wins.
+    /// Default: `[Bearer, Anonymous]`.
+    fn supported_modes(&self) -> Vec<AuthMode> {
+        vec![AuthMode::Bearer, AuthMode::Anonymous]
+    }
 }
 
 /// A trivial in-memory token store.

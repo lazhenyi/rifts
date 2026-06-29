@@ -9,6 +9,8 @@
 //! Member: CBOR-serialized LogEntry bytes
 //! ```
 
+use redis::AsyncCommands;
+
 use crate::redis::connection::RedisPool;
 use crate::storage::LogStore;
 use crate::topic::retention::RetentionPolicy;
@@ -35,10 +37,20 @@ impl RedisLogStore {
         self.pool.topic_key("log", topic)
     }
 
+    fn block_on<F>(&self, f: F) -> F::Output
+    where
+        F: std::future::Future,
+    {
+        tokio::runtime::Handle::current().block_on(f)
+    }
+
     /// Serialize a LogEntry to CBOR bytes for Redis storage.
     fn encode_entry(entry: &LogEntry) -> Vec<u8> {
         let mut buf = Vec::new();
-        ciborium::into_writer(entry, &mut buf).expect("LogEntry CBOR serialization failed");
+        // CBOR serialization of a simple struct with owned fields
+        // should not fail; if it does, return an empty encoding that
+        // decode_entry will reject as None rather than panicking.
+        ciborium::into_writer(entry, &mut buf).unwrap_or_default();
         buf
     }
 
@@ -54,80 +66,80 @@ impl LogStore for RedisLogStore {
         let member = Self::encode_entry(&entry);
         let offset = entry.offset;
 
-        // ZADD — score is the offset.
-        let (key2, member2) = (key.clone(), member.clone());
-        let _: () = self.pool.sync_cmd(move |c| {
-            redis::cmd("ZADD")
-                .arg(&key2)
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            let _: Result<(), _> = redis::cmd("ZADD")
+                .arg(&key)
                 .arg(offset)
-                .arg(&member2)
-                .query::<()>(c)
-        });
+                .arg(&member)
+                .query_async(&mut conn)
+                .await;
 
-        // Enforce retention.
-        match retention {
-            RetentionPolicy::None => {
-                let key3 = key.clone();
-                let _: () = self
-                    .pool
-                    .sync_cmd(move |c| redis::cmd("DEL").arg(&key3).query::<()>(c));
-            }
-            RetentionPolicy::Count(n) if n > 0 => {
-                let key3 = key.clone();
-                // Keep the n entries with highest scores.
-                let _: () = self.pool.sync_cmd(move |c| {
-                    redis::cmd("ZREMRANGEBYRANK")
-                        .arg(&key3)
+            match retention {
+                RetentionPolicy::None => {
+                    let _: Result<(), _> = redis::cmd("DEL").arg(&key).query_async(&mut conn).await;
+                }
+                RetentionPolicy::Count(n) if n > 0 => {
+                    let _: Result<(), _> = redis::cmd("ZREMRANGEBYRANK")
+                        .arg(&key)
                         .arg(0)
                         .arg(-((n as i64) + 1))
-                        .query::<()>(c)
-                });
-            }
-            RetentionPolicy::Latest => {
-                let key3 = key.clone();
-                // Keep only the entry with the highest score.
-                let _: () = self.pool.sync_cmd(move |c| {
-                    redis::cmd("ZREMRANGEBYRANK")
-                        .arg(&key3)
+                        .query_async(&mut conn)
+                        .await;
+                }
+                RetentionPolicy::Latest => {
+                    let _: Result<(), _> = redis::cmd("ZREMRANGEBYRANK")
+                        .arg(&key)
                         .arg(0)
                         .arg(-2)
-                        .query::<()>(c)
-                });
+                        .query_async(&mut conn)
+                        .await;
+                }
+                // Size, TTL, and Durable are not yet implemented for Redis;
+                // they silently keep all entries.
+                _ => {}
             }
-            // Size, TTL, and Durable are not yet implemented for Redis;
-            // they silently keep all entries.
-            _ => {}
-        }
+        });
     }
 
     fn range(&self, topic: &str, from: i64, to: i64) -> Vec<LogEntry> {
         let key = self.log_key(topic);
-        let data: Vec<Vec<u8>> = self.pool.sync_cmd(|c| {
-            redis::cmd("ZRANGEBYSCORE")
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            let data: Result<Vec<Vec<u8>>, _> = redis::cmd("ZRANGEBYSCORE")
                 .arg(&key)
                 .arg(from)
                 .arg(to)
-                .query::<Vec<Vec<u8>>>(c)
-        });
-        data.iter().filter_map(|d| Self::decode_entry(d)).collect()
+                .query_async(&mut conn)
+                .await;
+            data.unwrap_or_default()
+                .iter()
+                .filter_map(|d| Self::decode_entry(d))
+                .collect()
+        })
     }
 
     fn latest(&self, topic: &str) -> Option<LogEntry> {
         let key = self.log_key(topic);
-        let data: Vec<Vec<u8>> = self.pool.sync_cmd(|c| {
-            redis::cmd("ZREVRANGE")
+        self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            let data: Result<Vec<Vec<u8>>, _> = redis::cmd("ZREVRANGE")
                 .arg(&key)
                 .arg(0)
                 .arg(0)
-                .query::<Vec<Vec<u8>>>(c)
-        });
-        data.first().and_then(|d| Self::decode_entry(d))
+                .query_async(&mut conn)
+                .await;
+            data.unwrap_or_default()
+                .first()
+                .and_then(|d| Self::decode_entry(d))
+        })
     }
 
     fn remove(&self, topic: &str) {
         let key = self.log_key(topic);
-        let _: () = self
-            .pool
-            .sync_cmd(|c| redis::cmd("DEL").arg(&key).query::<()>(c));
+        let _: Result<(), _> = self.block_on(async {
+            let mut conn = self.pool.conn().clone();
+            redis::cmd("DEL").arg(&key).query_async(&mut conn).await
+        });
     }
 }

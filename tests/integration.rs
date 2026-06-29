@@ -84,7 +84,10 @@ async fn e2e_publish_subscribe_fanout() {
     assert_eq!(sink.count(), 2);
 
     // Unsubscribe and publish again — no more deliveries.
-    let removed = broker.unsubscribe(sub_id).await.expect("unsubscribe should succeed");
+    let removed = broker
+        .unsubscribe(sub_id)
+        .await
+        .expect("unsubscribe should succeed");
     assert!(removed);
     broker
         .publish(&publish_frame("chat/general", "msg-3", b"nope"))
@@ -554,9 +557,11 @@ fn frame_binary_round_trip_with_payload() {
     };
 
     let encoded = rifts::transport::frame_codec::encode_frame(&frame).unwrap();
-    let decoded =
-        rifts::transport::frame_codec::decode_binary_frame(&encoded, rifts::DEFAULT_MAX_BINARY_PAYLOAD)
-            .unwrap();
+    let decoded = rifts::transport::frame_codec::decode_binary_frame(
+        &encoded,
+        rifts::DEFAULT_MAX_BINARY_PAYLOAD,
+    )
+    .unwrap();
 
     assert_eq!(decoded.frame_type, FrameType::Data);
     assert_eq!(decoded.frame_id, 1);
@@ -577,8 +582,7 @@ fn frame_decode_rejects_oversized_payload() {
     };
     let encoded = rifts::transport::frame_codec::encode_frame(&frame).unwrap();
     // Try to decode with a limit smaller than the payload.
-    let result =
-        rifts::transport::frame_codec::decode_binary_frame(&encoded, 0);
+    let result = rifts::transport::frame_codec::decode_binary_frame(&encoded, 0);
     assert!(result.is_err());
 }
 
@@ -598,10 +602,7 @@ fn backpressure_rejects_when_full() {
     let bp = rifts::flow::BackpressureController::new(100);
     bp.set_strategy(rifts::flow::BackpressureStrategy::Pause);
     bp.try_enqueue(80);
-    assert_eq!(
-        bp.try_enqueue(50),
-        rifts::flow::BackpressureAction::Pause
-    );
+    assert_eq!(bp.try_enqueue(50), rifts::flow::BackpressureAction::Pause);
 }
 
 #[test]

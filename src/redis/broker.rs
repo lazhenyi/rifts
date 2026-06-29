@@ -165,15 +165,14 @@ impl<
             self.bridge.fanout().deliver(topic, serialized);
 
             // Publish to Redis Pub/Sub for cross-instance delivery.
+            // Serialize the full Frame as JSON so other instances
+            // receive topic/event/message_id/session_id metadata.
             let channel = self.pool.topic_key("fanout", topic);
-            let payload_data = frame.payload.clone().unwrap_or_default();
+            let envelope = serde_json::to_vec(frame).unwrap_or_default();
             let mut conn = self.pool.conn().clone();
-            let _: Result<()> = conn
-                .publish(&channel, payload_data.as_ref())
-                .await
-                .map_err(|e| {
-                    RiftError::System(SystemReject::Internal(format!("redis publish: {e}")))
-                });
+            let _: Result<()> = conn.publish(&channel, &envelope).await.map_err(|e| {
+                RiftError::System(SystemReject::Internal(format!("redis publish: {e}")))
+            });
         }
 
         Ok(PublishOutcome { offset, duplicate })
