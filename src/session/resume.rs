@@ -10,7 +10,7 @@
 //! ## Resume Flow
 //!
 //! 1. Client reconnects and sends its `SessionId`, epoch, and offsets.
-//! 2. The server locates the existing [`Session`](crate::session::session::Session).
+//! 2. The server locates the existing [`Session`].
 //! 3. [`ResumeManager::evaluate`] checks:
 //!    - Is the session still alive (not closed/expired)?
 //!    - Does the client's epoch match the server's current epoch?
@@ -22,7 +22,7 @@
 //! Each session has a monotonically increasing epoch counter. The epoch is
 //! bumped every time the session goes through a resume cycle. If the client
 //! presents an epoch that does not match the server's current value, the
-//! resume is rejected with a [`SessionReject::Conflict`](crate::error::SessionReject::Conflict)
+//! resume is rejected with a [`SessionReject::Conflict`]
 //! error, forcing the client to establish a new session.
 
 use std::collections::HashMap;
@@ -57,10 +57,10 @@ impl ResumeManager {
     /// This method performs two checks in order:
     ///
     /// 1. **Liveness** -- Is the session still alive (not in `Closed`
-    ///    state)? Returns [`SessionReject::Expired`](crate::error::SessionReject::Expired)
+    ///    state)? Returns [`SessionReject::Expired`]
     ///    if not.
     /// 2. **Offset analysis** -- Delegates to
-    ///    [`decide`](crate::session::offset_tracker::decide) to compare
+    ///    [`decide`] to compare
     ///    the client's offsets against the server's head offsets.
     ///
     /// **Note**: epoch validation is performed by the caller

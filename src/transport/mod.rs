@@ -10,7 +10,7 @@
 //! - [`Transport`] — a transport binding that can listen on a socket address.
 //! - [`TransportListener`] — a bound listener that accepts incoming connections.
 //! - [`TransportConnection`] — a single bidirectional connection that can read
-//!   and write [`Frame`](crate::frame::Frame)s.
+//!   and write [`Frame`]s.
 //!
 //! # Built-in adapters
 //!
@@ -94,9 +94,9 @@ pub trait TransportListener: Send {
 
 /// A single bidirectional transport connection.
 ///
-/// Implementations read and write [`Frame`](crate::frame::Frame)s using
+/// Implementations read and write [`Frame`]s using
 /// the binary or text wire format defined in
-/// [`frame_codec`](crate::transport::frame_codec). The connection is
+/// [`frame_codec`]. The connection is
 /// consumed by [`Connection::run`](crate::connection::Connection::run).
 #[async_trait]
 pub trait TransportConnection: Send {

@@ -1,6 +1,6 @@
 //! # JSON Codec
 //!
-//! Implements the [`Codec`](crate::codec::Codec) trait for the JSON
+//! Implements the [`Codec`] trait for the JSON
 //! wire format.
 //!
 //! The protocol specification (section 7) lists JSON as the

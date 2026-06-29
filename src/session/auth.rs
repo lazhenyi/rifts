@@ -118,7 +118,7 @@ pub trait AuthProvider: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns [`RiftError::Auth`](crate::error::RiftError::Auth) if the
+    /// Returns [`RiftError::Auth`] if the
     /// credentials are missing, invalid, or if the backend itself
     /// encounters an error.
     async fn authenticate(&self, mode: AuthMode, token: Option<&str>) -> Result<AuthContext>;

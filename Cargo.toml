@@ -74,6 +74,14 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 tempfile = "3"
 
+[[example]]
+name = "redis_multi_instance"
+required-features = ["redis"]
+
+[[example]]
+name = "cluster_node"
+required-features = ["cluster"]
+
 [[bench]]
 name = "wire_frame"
 path = "benches/wire_frame.rs"

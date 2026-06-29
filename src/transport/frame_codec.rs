@@ -1,7 +1,7 @@
 //! Wire-format frame encoder and decoder shared by all transports.
 //!
 //! This module handles the lowest-level serialization: converting between
-//! [`Frame`](crate::frame::Frame) values and the byte sequences that travel
+//! [`Frame`] values and the byte sequences that travel
 //! over the network. Every transport adapter (WebSocket, bridge, etc.)
 //! delegates to the functions in this module.
 //!

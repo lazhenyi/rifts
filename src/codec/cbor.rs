@@ -1,6 +1,6 @@
 //! # CBOR Codec
 //!
-//! Implements the [`Codec`](crate::codec::Codec) trait for the
+//! Implements the [`Codec`] trait for the
 //! [CBOR (Concise Binary Object Representation)](https://cbor.io/) wire format.
 //!
 //! The protocol specification (section 7) designates CBOR as the default
