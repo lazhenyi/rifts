@@ -1,3 +1,4 @@
+#![allow(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links)]
 //! # Rifts — Rift Realtime Protocol / 1.0 Server Implementation
 //!
 //! This crate implements the server-side of the [Rift Realtime Protocol v1.0][spec],
