@@ -144,7 +144,10 @@ impl SnapshotStore {
         let snap = entry.snapshot()?;
         let now = now_ms();
         let stored = StoredSnapshot {
-            snapshot_id: Uuid::new_v4().to_string(),
+            // Deterministic id derived from the entry's offset
+            // so repeated captures of the same log state produce
+            // the same snapshot_id.
+            snapshot_id: format!("snap-{}", snap.offset),
             topic: topic.to_string(),
             base_offset: snap.offset,
             payload: snap.payload,
