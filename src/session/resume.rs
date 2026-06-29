@@ -83,14 +83,10 @@ impl From<ResumeDecision> for ResumeOutcome {
 
 /// Resume manager that coordinates session resumption.
 ///
-/// Wraps an [`OffsetTracker`] and exposes methods to evaluate a resume
-/// attempt and to compute current topic head offsets from a
-/// [`TopicStore`].
-pub struct ResumeManager {
-    /// The offset tracker used to record and retrieve per-session
-    /// offset data during the resume evaluation process.
-    pub tracker: OffsetTracker,
-}
+/// The offset tracker used during resume evaluation is owned by the
+/// `SessionStore` (not duplicated here); this manager only orchestrates
+/// the resume flow.
+pub struct ResumeManager {}
 
 impl Default for ResumeManager {
     fn default() -> Self {
@@ -99,11 +95,9 @@ impl Default for ResumeManager {
 }
 
 impl ResumeManager {
-    /// Create a new resume manager with an empty offset tracker.
+    /// Create a new resume manager.
     pub fn new() -> Self {
-        Self {
-            tracker: OffsetTracker::new(),
-        }
+        Self {}
     }
 
     /// Evaluate a resume attempt and return the appropriate outcome.
