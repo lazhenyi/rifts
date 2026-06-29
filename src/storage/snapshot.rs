@@ -244,7 +244,9 @@ mod sled_impl {
         ///
         /// After writing the new snapshot, all older snapshots for the
         /// same topic are deleted from the engine, keeping only the
-        /// latest one.
+        /// latest one. The new snapshot is only deleted-along if its
+        /// serialization actually succeeded; otherwise we keep the
+        /// existing snapshot to avoid silent data loss.
         fn capture(
             &self,
             topic: &str,
@@ -263,14 +265,22 @@ mod sled_impl {
                 expires_at: ttl.map(|t| now + t.as_millis() as i64),
             };
             let key = encode::snapshot_key(topic, &stored.snapshot_id);
-            if let Ok(value) = serde_json::to_vec(&stored) {
-                self.engine.put(&key, &value);
-            }
-            // Remove old snapshots for this topic (keep only latest).
-            let prefix = encode::snapshot_prefix(topic);
-            for (k, _) in self.engine.scan_prefix(&prefix) {
-                if k != key {
-                    self.engine.delete(&k);
+            // Only evict older snapshots after we know the new one is
+            // durably written; otherwise a serialization failure would
+            // wipe the previous good snapshot.
+            match serde_json::to_vec(&stored) {
+                Ok(value) => {
+                    self.engine.put(&key, &value);
+                    let prefix = encode::snapshot_prefix(topic);
+                    for (k, _) in self.engine.scan_prefix(&prefix) {
+                        if k != key {
+                            self.engine.delete(&k);
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "snapshot serialization failed; keeping previous snapshot");
+                    return None;
                 }
             }
             Some(stored)
@@ -279,23 +289,28 @@ mod sled_impl {
         /// Retrieve the latest non-expired snapshot for a topic.
         ///
         /// Scans all snapshot entries under the topic's prefix, filters
-        /// out expired ones, and returns the first remaining match.
-        /// Returns `None` if no valid snapshot exists.
+        /// out expired ones, sorts by `created_at` descending, and
+        /// returns the most recent. Returns `None` if no valid snapshot
+        /// exists.
         fn get(&self, topic: &str) -> Option<StoredSnapshot> {
             let prefix = encode::snapshot_prefix(topic);
-            let snaps: Vec<StoredSnapshot> = self
-                .engine
-                .scan_prefix(&prefix)
-                .into_iter()
-                .filter_map(|(_, v)| serde_json::from_slice::<StoredSnapshot>(&v).ok())
-                .collect();
-            snaps.into_iter().find(|s| {
-                if let Some(expires) = s.expires_at {
-                    now_ms() <= expires
-                } else {
-                    true
+            let now = now_ms();
+            let mut latest: Option<StoredSnapshot> = None;
+            for (_, v) in self.engine.scan_prefix(&prefix) {
+                if let Ok(s) = serde_json::from_slice::<StoredSnapshot>(&v) {
+                    if let Some(expires) = s.expires_at {
+                        if now > expires {
+                            continue;
+                        }
+                    }
+                    match &latest {
+                        None => latest = Some(s),
+                        Some(prev) if s.created_at > prev.created_at => latest = Some(s),
+                        _ => {}
+                    }
                 }
-            })
+            }
+            latest
         }
 
         /// Delete all snapshot entries for the given topic.
@@ -354,6 +369,7 @@ mod tests {
             event: Some("e".into()),
             payload: Bytes::from_static(b"hello"),
             timestamp: 0,
+            appended_at: None,
         });
         let snaps = MemorySnapshotStore::new();
         let s = snaps

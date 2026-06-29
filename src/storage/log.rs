@@ -264,7 +264,17 @@ mod sled_impl {
         ///   supported or deferred).
         fn append(&self, topic: &str, entry: LogEntry, retention: RetentionPolicy) {
             let key = encode::log_key(topic, entry.offset);
-            let value = { serde_json::to_vec(&entry).unwrap_or_default() };
+            // Propagate serialization failures as logs rather than
+            // writing an empty Vec (which would corrupt the entry on
+            // later read and be silently filtered out).
+            let value = match serde_json::to_vec(&entry) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::error!(error = %e, topic, offset = entry.offset,
+                        "log entry serialization failed; skipping write");
+                    return;
+                }
+            };
             self.engine.put(&key, &value);
 
             match retention {
@@ -279,10 +289,15 @@ mod sled_impl {
                 }
                 RetentionPolicy::Ttl(ttl) => {
                     let now = now_ms();
+                    let ttl_ms = ttl.as_millis() as i64;
                     let all = self.engine.scan_prefix(&encode::log_prefix(topic));
                     for (k, _) in all.iter().filter(|(_, v)| {
                         if let Ok(e) = serde_json::from_slice::<LogEntry>(v) {
-                            now - e.timestamp > ttl.as_millis() as i64
+                            // Use append time when present, falling back
+                            // to the message timestamp for legacy entries
+                            // that lack an `appended_at` field.
+                            let ts = e.appended_at.unwrap_or(e.timestamp);
+                            now - ts > ttl_ms
                         } else {
                             false
                         }
@@ -304,7 +319,9 @@ mod sled_impl {
                         self.engine.delete(k);
                     }
                 }
-                _ => {}
+                // `Size` and `Durable` are not enforced on the sled
+                // backend (deferred); see `LogStore` docstring.
+                RetentionPolicy::Size(_) | RetentionPolicy::Durable => {}
             }
         }
 
@@ -372,6 +389,7 @@ mod tests {
             event: Some("e".into()),
             payload: Bytes::from("x"),
             timestamp: 0,
+            appended_at: None,
         }
     }
 

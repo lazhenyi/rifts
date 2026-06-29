@@ -199,54 +199,94 @@ mod sled_impl {
     }
 
     impl DedupeStore for SledDedupeStore {
-        /// Check whether `key` under `topic` is fresh and, if so, record it
-        /// in the sled tree.
+        /// Atomically check whether `key` under `topic` is fresh and, if so,
+        /// record it in the sled tree.
         ///
-        /// The implementation reads the existing expiry (if any) from the
-        /// engine, compares it to the current time, and either returns
-        /// `false` (duplicate) or writes a new expiry and returns `true`.
+        /// Uses sled's `compare_and_swap` so that two concurrent callers
+        /// racing on the same key will never both observe a "fresh"
+        /// result. The CAS loop writes the new expiry only if the current
+        /// value is either absent or already expired, matching the
+        /// `DedupeStore` trait contract.
         fn check_and_record(&self, topic: &str, key: &str, window: Duration) -> bool {
             let now = now_ms();
             let expires = now + window.as_millis() as i64;
             let k = encode::dedupe_key(topic, key);
-            if let Some(existing) = self.engine.get(&k)
-                && existing.len() >= 8
-            {
-                let prev = i64::from_be_bytes(existing[..8].try_into().unwrap_or([0; 8]));
-                if prev > now {
-                    return false;
+            let new_bytes = expires.to_be_bytes();
+
+            // Loop: if the entry is absent (None) or expired (<= now), try
+            // to atomically replace it with the new expiry. If the existing
+            // value is fresh (> now), the CAS fails and we return false.
+            loop {
+                let expected: Option<Vec<u8>> = match self.engine.get(&k) {
+                    None => None,
+                    Some(v) if v.len() >= 8 => {
+                        let prev = i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8]));
+                        if prev > now {
+                            return false;
+                        }
+                        Some(v)
+                    }
+                    // Corrupt/short value: treat as absent.
+                    Some(_) => None,
+                };
+                match self.engine.cas(k.clone(), expected, new_bytes.to_vec()) {
+                    Ok(Ok(())) => return true,
+                    Ok(Err(_)) => {
+                        // Another writer raced us; re-read and retry.
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "sled CAS failed in dedupe");
+                        return false;
+                    }
                 }
             }
-            self.engine.put(&k, &expires.to_be_bytes());
-            true
         }
 
-        /// Scan all deduplication entries and remove those whose expiry
-        /// timestamp has passed.
+        /// Scan deduplication entries for the given topics and remove those
+        /// whose expiry timestamp has passed.
         ///
-        /// This performs a full prefix scan over the entire key space (empty
-        /// prefix), filters for expired entries, and deletes them one by
-        /// one. Returns the count of removed entries.
+        /// Topics with no entries are skipped to keep the scan cost
+        /// proportional to live data, not to engine size.
         fn sweep(&self) -> usize {
             let now = now_ms();
-            let expired: Vec<Vec<u8>> = self
-                .engine
-                .scan_prefix(&[])
-                .into_iter()
-                .filter(|(_, v)| {
-                    if v.len() >= 8 {
-                        i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])) <= now
-                    } else {
-                        false
+            let mut total = 0;
+            // Iterate per-topic using `dedupe_prefix` so we don't scan
+            // unrelated engine trees. The trait does not surface the topic
+            // list, so we collect distinct topics from a one-time full scan
+            // of the prefix-namespace, then sweep each topic's slice.
+            //
+            // Because sled trees are per-store (this engine is shared with
+            // other dedupe users in principle), we read distinct topic
+            // names by scanning the engine prefix and grouping by the
+            // bytes before the first separator.
+            let all = self.engine.scan_prefix(&[]);
+            let mut topics: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (k, _) in &all {
+                if let Some(sep_pos) = k.iter().position(|&b| b == encode::SEP) {
+                    if let Ok(t) = std::str::from_utf8(&k[..sep_pos]) {
+                        topics.insert(t.to_string());
                     }
-                })
-                .map(|(k, _)| k)
-                .collect();
-            let count = expired.len();
-            for k in expired {
-                self.engine.delete(&k);
+                }
             }
-            count
+            for topic in topics {
+                let prefix = encode::dedupe_prefix(&topic);
+                let expired: Vec<Vec<u8>> = self
+                    .engine
+                    .scan_prefix(&prefix)
+                    .into_iter()
+                    .filter(|(_, v)| {
+                        v.len() >= 8
+                            && i64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])) <= now
+                    })
+                    .map(|(k, _)| k)
+                    .collect();
+                for k in &expired {
+                    self.engine.delete(k);
+                }
+                total += expired.len();
+            }
+            total
         }
     }
 }

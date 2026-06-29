@@ -176,6 +176,28 @@ pub mod sled_engine {
         pub fn flush(&self) -> Result<usize, sled::Error> {
             self.tree.flush()
         }
+
+        /// Atomically compare-and-swap: replace the current value at
+        /// `key` with `new_value` only if the existing value equals
+        /// `expected`.
+        ///
+        /// - `expected == None` means "key is absent" (insert path).
+        /// - `expected == Some(_)` means "key is present with this value".
+        ///
+        /// On success returns `Ok(Ok(()))`. On a value mismatch
+        /// returns `Ok(Err(sled::CompareAndSwapError))` and the caller
+        /// should re-read and retry. On a sled I/O error returns
+        /// `Err(sled::Error)`. This is the primitive used by
+        /// [`SledDedupeStore`](crate::storage::SledDedupeStore) to
+        /// eliminate the read-then-write race in deduplication.
+        pub fn cas(
+            &self,
+            key: Vec<u8>,
+            expected: Option<Vec<u8>>,
+            new_value: Vec<u8>,
+        ) -> Result<Result<(), sled::CompareAndSwapError>, sled::Error> {
+            self.tree.compare_and_swap(key, expected, Some(new_value))
+        }
     }
 
     impl StorageEngine for SledEngine {
@@ -184,18 +206,27 @@ pub mod sled_engine {
         }
 
         fn put(&self, key: &[u8], value: &[u8]) {
-            let _ = self.tree.insert(key, value);
+            if let Err(e) = self.tree.insert(key, value) {
+                tracing::error!(error = %e, "sled put failed");
+            }
         }
 
         fn delete(&self, key: &[u8]) {
-            let _ = self.tree.remove(key);
+            if let Err(e) = self.tree.remove(key) {
+                tracing::error!(error = %e, "sled delete failed");
+            }
         }
 
         fn scan_prefix(&self, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
             self.tree
                 .scan_prefix(prefix)
-                .filter_map(|r| r.ok())
-                .map(|(k, v)| (k.to_vec(), v.to_vec()))
+                .filter_map(|r| match r {
+                    Ok(kv) => Some((kv.0.to_vec(), kv.1.to_vec())),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "sled scan_prefix entry error");
+                        None
+                    }
+                })
                 .collect()
         }
     }
