@@ -121,6 +121,32 @@ impl Default for HeartbeatPolicy {
     }
 }
 
+impl HeartbeatPolicy {
+    /// Reject nonsensical values that would break connection
+    /// health-monitoring. Returns `Err` with a human-readable
+    /// message identifying the offending field. Callers should
+    /// invoke this from `ServerConfig::validate` (or equivalent)
+    /// before the policy is handed to the connection layer.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.ping_interval.is_zero() {
+            return Err("ping_interval must be > 0");
+        }
+        if self.pong_timeout.is_zero() {
+            return Err("pong_timeout must be > 0");
+        }
+        if self.max_missed_pongs == 0 {
+            return Err("max_missed_pongs must be > 0");
+        }
+        if self.idle_timeout.is_zero() {
+            return Err("idle_timeout must be > 0");
+        }
+        if self.jitter > self.ping_interval {
+            return Err("jitter must be <= ping_interval");
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
