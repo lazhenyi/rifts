@@ -116,7 +116,7 @@ Contributions are welcome! Please open an issue or pull request.
 The `benches/` directory contains a Criterion-based benchmark suite covering the
 full crate surface: wire codec, serialization, frame/message models, flow
 control, fanout engine, topic store, storage backends (memory and optional sled),
-both `InMemoryBroker` and `ActorBroker`, session/resume, ack/metrics, in-process
+`InMemoryBroker`, session/resume, ack/metrics, in-process
 E2E, loopback WebSocket, and throughput.
 
 [source,sh]
