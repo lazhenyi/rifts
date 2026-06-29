@@ -7,7 +7,7 @@
 //!
 //! - **Broker** — the message routing core responsible for publishing,
 //!   subscribing, fan-out delivery, and replay. Ships with
-//!   [`InMemoryBroker`] (in-process) and [`RemoteBroker`] (remote TCP).
+//!   [`InMemoryBroker`] (in-process, all storage in memory).
 //! - **Frame / Message** — a [`Frame`] is the wire-level transport unit
 //!   (JSON or CBOR encoded); a [`Message`] is the business-semantic layer
 //!   carried inside a frame (commands, events, datagrams, snapshots, etc.).
@@ -40,7 +40,6 @@
 //! | Module | Responsibility |
 //! |--------|----------------|
 //! | [`ack`] | Message acknowledgement (ack / nack) semantics and tracking |
-//! | [`actor`] | Actor model — each topic is managed by an independent actor |
 //! | [`broker`] | Message routing core — publish, subscribe, fan-out, dedupe |
 //! | [`codec`] | Serialization codecs (JSON / CBOR) |
 //! | [`config`] | Server configuration (payload limits, heartbeat policy, etc.) |
@@ -72,10 +71,7 @@ pub mod ack;
 #[cfg(feature = "client")]
 pub mod client;
 
-/// Actor model abstraction — ActorRef, TopicActor, ActorRegistry.
-pub mod actor;
-
-/// Message routing core — Broker trait and implementations (InMemory, Remote).
+/// Message routing core — Broker trait and implementations.
 pub mod broker;
 
 /// Serialization codecs (JSON, CBOR).
@@ -109,6 +105,10 @@ pub mod protocol;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+/// TCP mesh cluster with auto-discovery and cross-node routing (feature `cluster`).
+#[cfg(feature = "cluster")]
+pub mod cluster;
+
 /// Server entry point — `RiftServer` and its Builder.
 pub mod server;
 
@@ -130,10 +130,10 @@ pub mod transport;
 // ── Public API re-exports ────────────────────────────────────────────────────
 
 pub use broker::{Broker, InMemoryBroker, PublishOutcome, SubscribeIntent};
-pub use config::{CodecOffer, DefaultTopicProfile, ServerConfig};
+pub use config::ServerConfig;
 pub use error::{BoxedStdError, ConfigError, Result, RiftError};
 pub use frame::{Codec, Frame, FrameFlags, FrameType, Priority};
-pub use message::{DeliveryMode, Message, MessageClass, SubscribeMode, SubscribeResult};
+pub use message::{DeliveryMode, Message, MessageClass, SubscribeResult};
 pub use metrics::Metrics;
 pub use protocol::close::CloseCode;
 pub use protocol::error_code::ErrorCode;
