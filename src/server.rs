@@ -45,9 +45,8 @@ use crate::ack::{AckManager, SharedAckManager};
 use crate::broker::{Broker, InMemoryBroker};
 use crate::config::ServerConfig;
 use crate::connection::Connection;
-use crate::error::Result;
-#[cfg(feature = "websocket")]
 use crate::error::ConfigError;
+use crate::error::Result;
 use crate::error::RiftError;
 use crate::metrics::Metrics;
 use crate::session::AuthProvider;
